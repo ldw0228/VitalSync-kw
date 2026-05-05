@@ -1,0 +1,31 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Local data and large experiment files
+data/
+datasets/
+*.mat
+*.dat
+*.h5
+*.hdf5
+
+# Experiment outputs
+results/
+outputs/
+checkpoints/
+*.pt
+*.pth
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
