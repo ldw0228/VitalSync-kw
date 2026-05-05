@@ -1,8 +1,25 @@
 # Python version: 3.11.x recommended
 # Install with: pip install -r requirements.txt
 
+# Numerical arrays and matrix operations for sensor data.
 numpy
+
+# Tabular data handling, especially CSV label files and experiment logs.
 pandas
+
+# Signal processing utilities such as filtering, resampling, and peak detection.
 scipy
+
+# Plotting UWB heatmaps, BIOPAC respiration signals, and training curves.
 matplotlib
+
+# Spiking neural network library built on top of PyTorch.
 snntorch
+
+# Optional packages we may add later:
+# torch          # Deep learning backend required by snntorch; install separately if needed.
+# scikit-learn   # Train/test split, preprocessing, baseline models, and metrics.
+# h5py           # Reading MATLAB v7.3 / HDF5-based .mat files.
+# tqdm           # Progress bars for dataset preprocessing and training loops.
+# jupyter        # Notebook-based exploration and visualization.
+# seaborn        # Cleaner statistical plots and metric visualizations.
