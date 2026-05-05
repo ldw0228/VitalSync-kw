@@ -1,53 +1,52 @@
-# UWB Spike Encoding Direction Check
+# UWB 스파이크 인코딩 방향성 확인
 
-Date: 2026-05-05
+날짜: 2026-05-05
 
-This is an early direction-finding experiment, not a final graduation-project result.
-The goal was to see whether a MobiVital-style UWB I/Q signal can be converted into
-spike inputs and compared against a normal CNN baseline.
+이 문서는 최종 졸업작품 결과가 아니라, 앞으로 어떤 방식으로 진행할지 보기 위한 초기 방향성 실험 정리입니다.
+목표는 MobiVital 형태의 UWB I/Q 신호를 스파이크 입력으로 변환할 수 있는지, 그리고 일반 CNN baseline과 비교했을 때 어떤 특징이 나오는지 확인하는 것입니다.
 
-## Data
+## 데이터
 
-- Dataset sample: MobiVital `sample.csv`
-- Shape: 1500 rows x 254 columns
-- Sampling rate: 50 Hz
-- Duration: 30 seconds
-- UWB I: columns 13-132
-- UWB Q: columns 133-252
-- Label: respiration waveform, column 253
+- 데이터 샘플: MobiVital `sample.csv`
+- 크기: 1500행 x 254열
+- 샘플링 주파수: 50 Hz
+- 길이: 30초
+- UWB I 데이터: 13-132열
+- UWB Q 데이터: 133-252열
+- 정답 라벨: respiration waveform, 253열
 
-Feature construction:
+특징 생성 과정:
 
 ```text
 I/Q -> magnitude = sqrt(I^2 + Q^2)
-best range bin selected by correlation with respiration
-10-second windows, 2-second stride
+respiration 라벨과 상관계수가 가장 높은 range bin 선택
+10초 window, 2초 stride
 ```
 
-Best bin in this sample:
+이번 샘플에서 가장 잘 맞은 bin:
 
 ```text
 bin 51
-distance estimate: about 2.87 m
-correlation with respiration: about 0.936
+거리 추정: 약 2.87 m
+respiration과의 상관계수: 약 0.936
 ```
 
-## Compared Methods
+## 비교한 방법
 
 1. CNN baseline
-   - Input: continuous UWB magnitude
-   - Model: small 1D CNN
-   - Meaning: normal deep-learning upper baseline
+   - 입력: 연속형 UWB magnitude 신호
+   - 모델: 작은 1D CNN
+   - 의미: 일반 딥러닝 방식의 성능 기준선
 
 2. Delta-SNN
-   - Input: delta spike encoded UWB magnitude
-   - Spike channels: positive / negative events
-   - Model: small LIF-based spiking CNN with surrogate gradient
-   - Meaning: event-driven, low-activity SNN baseline
+   - 입력: delta spike encoding을 적용한 UWB magnitude 신호
+   - 스파이크 채널: positive event / negative event
+   - 모델: surrogate gradient를 사용한 간단한 LIF 기반 spiking CNN
+   - 의미: event-driven, low-activity SNN baseline
 
-## Results
+## 결과
 
-| Method | Bins | Threshold scale | Input spike rate | Hidden spike rate | RMSE | MAE | Corr |
+| 방법 | Bin 수 | Threshold scale | 입력 spike rate | hidden spike rate | RMSE | MAE | Corr |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | CNN | 1 | - | - | - | 0.3195 | 0.2725 | 0.9785 |
 | CNN | 5 | - | - | - | 0.3467 | 0.3032 | 0.9806 |
@@ -56,51 +55,42 @@ correlation with respiration: about 0.936
 | Delta-SNN | 1 | 1.00 | 0.1517 | 0.0775 | 0.7512 | 0.6279 | 0.7332 |
 | Delta-SNN | 5 | 0.75 | 0.1487 | 0.0959 | 0.8092 | 0.6712 | 0.6705 |
 
-## Current Interpretation
+## 현재 해석
 
-The CNN baseline is much stronger on clean continuous input. That is expected.
-It gives us a useful upper reference.
+clean continuous input에서는 CNN baseline이 훨씬 강합니다. 이건 예상 가능한 결과이고, CNN을 정확도 기준선으로 두는 것이 좋습니다.
 
-The Delta-SNN is weaker in direct reconstruction accuracy, but it uses sparse
-event-style inputs and low hidden spike activity. This makes it a reasonable
-candidate for the graduation-project angle if we compare not only clean accuracy
-but also robustness and efficiency.
+Delta-SNN은 직접적인 waveform reconstruction 정확도는 낮지만, sparse event-style 입력과 낮은 hidden spike activity를 보입니다.
+따라서 졸업작품 방향은 clean 데이터에서 CNN을 바로 이기는 것이 아니라, spike-friendly 전처리를 통해 강건성과 효율성을 함께 비교하는 쪽이 더 타당합니다.
 
-Early observation:
+초기 관찰:
 
 ```text
-threshold 0.75 looks like a good starting point.
-threshold 0.5 creates more spikes but does not improve much.
-threshold 1.0 creates fewer spikes but loses a little accuracy.
-5-bin input did not help in this tiny sample.
+threshold 0.75가 시작점으로 좋아 보입니다.
+threshold 0.5는 spike가 많아지지만 성능 이득은 크지 않았습니다.
+threshold 1.0은 spike가 줄어드는 대신 정확도가 조금 떨어졌습니다.
+이번 작은 샘플에서는 5-bin 입력이 도움이 되지 않았습니다.
 ```
 
-## Recommended Direction
+## 추천 방향
 
-For the project direction, frame it like this:
+프로젝트 방향은 아래처럼 잡는 것이 좋습니다.
 
 ```text
-CNN baseline = high-accuracy continuous-signal reference
-Delta-SNN = low-activity event-based representation baseline
-Proposed work = improve spike encoding and test robustness/noise defense
+CNN baseline = 연속 신호 기반 고정확도 기준선
+Delta-SNN = 저활성 event-based representation 기준선
+제안 방법 = spike encoding을 개선하고 noise/artifact 상황에서 성능 방어율을 검증
 ```
 
-Next experiments should focus on:
+다음 실험에서 봐야 할 것:
 
-1. More data, preferably multiple subjects/sessions.
-2. Noise and artifact tests.
-3. Adaptive thresholding instead of fixed delta threshold.
-4. Compare delta encoding, rate encoding, and delta-rate hybrid encoding.
-5. Use spike rate and robustness drop together with RMSE/correlation.
+1. 더 많은 데이터, 가능하면 여러 subject/session 사용
+2. noise와 motion artifact 상황에서 성능 비교
+3. 고정 threshold 대신 adaptive thresholding 적용
+4. delta encoding, rate encoding, delta-rate hybrid encoding 비교
+5. RMSE/correlation뿐 아니라 spike rate와 성능 저하율을 함께 평가
 
-## Suggested Team Message
+## 팀 공유용 요약
 
-We tested a small MobiVital UWB sample to check the project direction. A normal
-1D CNN on continuous UWB magnitude reconstructs respiration very well, so it can
-serve as the accuracy baseline. A simple Delta Spike + LIF-SNN model is less
-accurate on clean data, but it runs with sparse spike activity, which supports
-the idea of studying spike-friendly preprocessing. The direction should not be
-"SNN beats CNN on clean data immediately"; it should be "spike encoding can offer
-event-driven, low-activity processing, and we compare its robustness and efficiency
-against CNN baselines."
+MobiVital UWB 샘플로 방향성 실험을 해봤습니다. 일반 1D CNN은 연속형 UWB magnitude 입력에서 respiration waveform을 매우 잘 따라가므로 정확도 baseline으로 사용할 수 있습니다. 반면 단순 Delta Spike + LIF-SNN은 clean 데이터 정확도는 낮지만 sparse spike activity를 보여주기 때문에, spike-friendly 전처리를 연구하는 방향성은 있습니다.
 
+따라서 방향은 "SNN이 clean accuracy에서 CNN을 바로 이긴다"가 아니라, "UWB 신호를 spike encoding으로 event-driven 저활성 표현으로 바꾸고, CNN baseline과 강건성/효율을 함께 비교한다"로 잡는 것이 좋아 보입니다.
