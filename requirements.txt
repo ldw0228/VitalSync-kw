@@ -1,25 +1,25 @@
-# Python version: 3.11.x recommended
-# Install with: pip install -r requirements.txt
+# 권장 Python 버전: 3.11.x
+# 설치 명령어: pip install -r requirements.txt
 
-# Numerical arrays and matrix operations for sensor data.
+# 센서 데이터를 배열/행렬 형태로 다루기 위한 기본 수치 계산 라이브러리.
 numpy
 
-# Tabular data handling, especially CSV label files and experiment logs.
+# CSV 라벨 파일, 실험 기록 등 표 형태 데이터를 다루기 위한 라이브러리.
 pandas
 
-# Signal processing utilities such as filtering, resampling, and peak detection.
+# 필터링, 리샘플링, 피크 검출 등 생체신호/센서 신호처리에 사용.
 scipy
 
-# Plotting UWB heatmaps, BIOPAC respiration signals, and training curves.
+# UWB heatmap, BIOPAC 호흡 신호, 학습 loss 그래프 등을 시각화하는 데 사용.
 matplotlib
 
-# Spiking neural network library built on top of PyTorch.
+# PyTorch 기반 Spiking Neural Network(SNN) 모델 구현에 사용.
 snntorch
 
-# Optional packages we may add later:
-# torch          # Deep learning backend required by snntorch; install separately if needed.
-# scikit-learn   # Train/test split, preprocessing, baseline models, and metrics.
-# h5py           # Reading MATLAB v7.3 / HDF5-based .mat files.
-# tqdm           # Progress bars for dataset preprocessing and training loops.
-# jupyter        # Notebook-based exploration and visualization.
-# seaborn        # Cleaner statistical plots and metric visualizations.
+# 추후 필요할 수 있는 패키지:
+# torch          # snntorch 실행에 필요한 딥러닝 백엔드. 환경에 맞게 별도 설치할 수 있음.
+# scikit-learn   # train/test split, 전처리, baseline 모델, 평가 지표 계산에 사용.
+# h5py           # MATLAB v7.3 또는 HDF5 기반 .mat 파일을 읽을 때 사용.
+# tqdm           # 데이터 전처리나 학습 루프의 진행률 표시용.
+# jupyter        # 노트북 기반 데이터 탐색, 실험, 시각화에 사용.
+# seaborn        # 통계 그래프와 평가 결과 시각화를 더 깔끔하게 만들 때 사용.
