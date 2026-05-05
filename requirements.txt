@@ -13,11 +13,13 @@ scipy
 # UWB heatmap, BIOPAC 호흡 신호, 학습 loss 그래프 등을 시각화하는 데 사용.
 matplotlib
 
+# snntorch 실행에 필요한 딥러닝 백엔드.
+torch
+
 # PyTorch 기반 Spiking Neural Network(SNN) 모델 구현에 사용.
 snntorch
 
 # 추후 필요할 수 있는 패키지:
-# torch          # snntorch 실행에 필요한 딥러닝 백엔드. 환경에 맞게 별도 설치할 수 있음.
 # scikit-learn   # train/test split, 전처리, baseline 모델, 평가 지표 계산에 사용.
 # h5py           # MATLAB v7.3 또는 HDF5 기반 .mat 파일을 읽을 때 사용.
 # tqdm           # 데이터 전처리나 학습 루프의 진행률 표시용.
