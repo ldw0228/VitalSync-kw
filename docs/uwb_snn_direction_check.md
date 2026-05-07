@@ -68,6 +68,31 @@ respiration과의 상관계수: 약 0.936
 | Delta-SNN | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
 | Delta-SNN | fft_bandpass | 0.5836 | 0.4684 | 0.8334 | 0.3135 | 0.1349 |
 
+## Delta vs Delta-Rate Hybrid 추가 비교
+
+최근 SNN 시계열 처리에서는 delta event 정보와 rate/amplitude 정보를 같이 쓰는 hybrid encoding도 많이 사용됩니다. 그래서 가장 좋았던 SNN 조건인 `moving_average + threshold-scale 0.75`에서 delta-only와 delta-rate hybrid를 비교했습니다.
+
+| 모델 | 인코딩 | 전처리 | RMSE | MAE | Corr | 입력 spike rate | hidden spike rate |
+|---|---|---|---:|---:|---:|---:|---:|
+| SNN | delta | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
+| SNN | delta-rate hybrid | moving_average | 0.4986 | 0.4261 | 0.9223 | 0.2555 | 0.1389 |
+
+이번 샘플에서는 hybrid가 정확도를 꽤 올렸습니다.
+
+```text
+delta-only corr: 0.8470
+hybrid corr:     0.9223
+```
+
+다만 spike activity도 증가했습니다.
+
+```text
+input spike rate:  0.2119 -> 0.2555
+hidden spike rate: 0.1136 -> 0.1389
+```
+
+따라서 hybrid는 "정확도 향상 vs spike activity 증가" trade-off가 있는 후보로 보는 것이 좋습니다.
+
 해석:
 
 ```text
@@ -79,7 +104,8 @@ SNN은 moving average 전처리 후 delta spike encoding을 적용했을 때 가
 
 ```text
 CNN baseline: preprocess none
-SNN baseline: preprocess moving_average + threshold-scale 0.75
+SNN baseline: preprocess moving_average + delta + threshold-scale 0.75
+SNN 제안 후보: preprocess moving_average + delta-rate hybrid + threshold-scale 0.75
 ```
 
 ## 현재 해석

@@ -60,3 +60,46 @@ def rate_encode(
     rng = np.random.default_rng(seed)
     return (rng.random((steps, *x.shape)) < prob).astype(np.float32)
 
+
+def rate_spike_encode(
+    x: np.ndarray,
+    seed: int = 0,
+) -> np.ndarray:
+    """Encode signal amplitude into one binary spike channel.
+
+    This keeps the same [channels, time] layout used by the 1D SNN starter.
+    Values are min-max normalized per window and sampled once with a fixed seed.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    x_min = np.min(x, axis=-1, keepdims=True)
+    x_max = np.max(x, axis=-1, keepdims=True)
+    prob = (x - x_min) / (x_max - x_min + 1e-8)
+    rng = np.random.default_rng(seed)
+    return (rng.random(x.shape) < prob).astype(np.float32)
+
+
+def delta_rate_hybrid_encode(
+    x: np.ndarray,
+    threshold: float | None = None,
+    threshold_scale: float = 0.75,
+    seed: int = 0,
+) -> np.ndarray:
+    """Concatenate delta-event channels and rate/amplitude spike channels.
+
+    For each input channel, output channels are:
+    - positive delta spikes
+    - negative delta spikes
+    - rate/amplitude spikes
+
+    Shape:
+        input [channels, time] -> output [channels * 3, time]
+    """
+    delta = delta_spike_encode(
+        x,
+        threshold=threshold,
+        threshold_scale=threshold_scale,
+        bipolar=True,
+    )
+    delta = delta.reshape(-1, delta.shape[-1])
+    rate = rate_spike_encode(x, seed=seed)
+    return np.concatenate([delta, rate], axis=0).astype(np.float32)

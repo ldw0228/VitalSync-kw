@@ -183,6 +183,7 @@ def main() -> None:
     parser.add_argument("--bin-radius", type=int, default=0)
     parser.add_argument("--preprocess", choices=["none", "moving_average", "fft_bandpass"], default="none")
     parser.add_argument("--threshold-scale", type=float, default=0.75)
+    parser.add_argument("--encode", choices=["delta", "delta_rate_hybrid"], default="delta")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--rate-reg", type=float, default=1e-3, help="Penalty for hidden spike activity")
     parser.add_argument("--out-dir", default=None)
@@ -200,7 +201,7 @@ def main() -> None:
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
         bin_radius=args.bin_radius,
-        encode="delta",
+        encode=args.encode,
         threshold_scale=args.threshold_scale,
         preprocess=args.preprocess,
     )
@@ -264,6 +265,7 @@ def main() -> None:
         "device": str(device),
         "bin_radius": args.bin_radius,
         "preprocess": args.preprocess,
+        "encode": args.encode,
         "input_channels": in_channels,
         "threshold_scale": args.threshold_scale,
         "input_spike_rate": input_spike_rate,

@@ -66,7 +66,7 @@ respiration label과의 상관계수: 약 0.936
 | 파일 | 역할 |
 |---|---|
 | `mobivital_dataset.py` | MobiVital CSV loader, I/Q 분리, magnitude/phase 생성, window dataset 생성 |
-| `spike_encoding.py` | delta spike encoding, rate encoding 함수 |
+| `spike_encoding.py` | delta spike encoding, rate encoding, delta-rate hybrid encoding 함수 |
 | `quick_inspect.py` | 샘플 CSV 구조 확인, best bin 탐색, delta spike plot 생성 |
 | `train_baseline_cnn.py` | continuous UWB magnitude 입력으로 1D CNN baseline 학습 |
 | `train_delta_snn.py` | delta spike 입력으로 LIF 기반 SNN 학습 |
@@ -128,6 +128,26 @@ x[t] - x[t-1] < -threshold -> negative spike
 
 UWB 생체신호는 절대값보다 미세한 시간 변화가 중요하므로, delta 기반 event representation이 SNN 방향성과 잘 맞습니다.
 
+### 3. Delta-Rate Hybrid SNN
+
+```text
+입력: moving_average 적용 UWB magnitude
+인코딩: delta spike + rate/amplitude spike
+모델: 같은 LIF 기반 spiking CNN
+출력: respiration waveform reconstruction
+```
+
+Delta-only는 변화량 정보에 강하지만, 현재 신호가 어느 정도 크기인지에 대한 amplitude 정보가 약할 수 있습니다.
+Hybrid 방식은 각 입력 bin에 대해 아래 3개 채널을 함께 사용합니다.
+
+```text
+positive delta spike
+negative delta spike
+rate/amplitude spike
+```
+
+즉, 변화 정보와 크기 정보를 같이 주는 방식입니다.
+
 ## 실험 결과
 
 아래 결과는 MobiVital `sample.csv` 하나에서 나온 초기 방향성 실험입니다. 최종 성능이 아니라 방법 선택을 위한 참고값으로 봐야 합니다.
@@ -168,6 +188,39 @@ fft_bandpass
 | Delta-SNN | none | 0.7284 | 0.6063 | 0.7433 | 0.2152 | 0.0885 |
 | Delta-SNN | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
 | Delta-SNN | fft_bandpass | 0.5836 | 0.4684 | 0.8334 | 0.3135 | 0.1349 |
+
+## Delta vs Delta-Rate Hybrid 비교
+
+최근 SNN 시계열 처리에서는 변화량 기반 event 정보와 amplitude/rate 정보를 함께 쓰는 hybrid encoding이 자주 후보로 올라옵니다. 이를 확인하기 위해 가장 좋았던 SNN 조건인 `moving_average + threshold-scale 0.75`에서 delta-only와 delta-rate hybrid를 비교했습니다.
+
+| 모델 | 인코딩 | 전처리 | RMSE | MAE | Corr | 입력 spike rate | hidden spike rate |
+|---|---|---|---:|---:|---:|---:|---:|
+| SNN | delta | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
+| SNN | delta-rate hybrid | moving_average | 0.4986 | 0.4261 | 0.9223 | 0.2555 | 0.1389 |
+
+이번 샘플에서는 hybrid encoding이 correlation을 크게 올렸습니다.
+
+```text
+delta-only corr: 0.8470
+hybrid corr:     0.9223
+```
+
+대신 입력 spike rate와 hidden spike rate도 증가했습니다.
+
+```text
+input spike rate:  0.2119 -> 0.2555
+hidden spike rate: 0.1136 -> 0.1389
+```
+
+따라서 hybrid는 정확도는 더 좋지만 activity 비용이 조금 더 드는 방식으로 볼 수 있습니다.
+
+현 시점 추천:
+
+```text
+SNN 기본 baseline: moving_average + delta
+SNN 제안 후보: moving_average + delta-rate hybrid
+최종 비교: 정확도와 spike activity를 함께 평가
+```
 
 ### 디노이징 비교 해석
 
@@ -215,6 +268,7 @@ threshold별 결과를 보면:
 ```text
 CNN baseline: preprocess none
 SNN baseline: preprocess moving_average + threshold-scale 0.75
+SNN improved candidate: preprocess moving_average + delta-rate hybrid + threshold-scale 0.75
 ```
 
 ### 5-bin 입력은 이번 샘플에서는 도움이 되지 않았음
