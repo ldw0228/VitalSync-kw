@@ -148,22 +148,25 @@ def save_prediction_plot(
 
     plt.figure(figsize=(12, 7))
     plt.subplot(3, 1, 1)
-    plt.eventplot(
-        [
-            np.where(spikes[0] > 0)[0] / dataset.fs,
-            np.where(spikes[1] > 0)[0] / dataset.fs,
-        ],
-        colors=["tab:blue", "tab:orange"],
-        lineoffsets=[1, 0],
-    )
-    plt.yticks([1, 0], ["positive", "negative"])
-    plt.title("Delta spike input")
+    spike_events = [np.where(channel > 0)[0] / dataset.fs for channel in spikes]
+    lineoffsets = np.arange(spikes.shape[0] - 1, -1, -1)
+    plt.eventplot(spike_events, lineoffsets=lineoffsets)
+    if spikes.shape[0] == 1:
+        labels = ["rate"]
+    elif spikes.shape[0] == 2:
+        labels = ["positive", "negative"]
+    elif spikes.shape[0] == 3:
+        labels = ["delta+", "delta-", "rate"]
+    else:
+        labels = [f"ch{i}" for i in range(spikes.shape[0])]
+    plt.yticks(lineoffsets, labels)
+    plt.title("Spike input")
 
     plt.subplot(3, 1, 2)
     plt.plot(t, target, label="respiration target")
     plt.plot(t, pred_np, label="SNN prediction", alpha=0.85)
     plt.legend(loc="upper right")
-    plt.title("Delta-SNN respiration reconstruction")
+    plt.title("SNN respiration reconstruction")
 
     plt.subplot(3, 1, 3)
     plt.plot(t, target - pred_np)
@@ -183,7 +186,7 @@ def main() -> None:
     parser.add_argument("--bin-radius", type=int, default=0)
     parser.add_argument("--preprocess", choices=["none", "moving_average", "fft_bandpass"], default="none")
     parser.add_argument("--threshold-scale", type=float, default=0.75)
-    parser.add_argument("--encode", choices=["delta", "delta_rate_hybrid"], default="delta")
+    parser.add_argument("--encode", choices=["rate", "delta", "delta_rate_hybrid"], default="delta")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--rate-reg", type=float, default=1e-3, help="Penalty for hidden spike activity")
     parser.add_argument("--out-dir", default=None)

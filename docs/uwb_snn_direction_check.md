@@ -68,43 +68,48 @@ respiration과의 상관계수: 약 0.936
 | Delta-SNN | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
 | Delta-SNN | fft_bandpass | 0.5836 | 0.4684 | 0.8334 | 0.3135 | 0.1349 |
 
-## Delta vs Delta-Rate Hybrid 추가 비교
+## Rate vs Delta vs Delta-Rate Hybrid 추가 비교
 
-최근 SNN 시계열 처리에서는 delta event 정보와 rate/amplitude 정보를 같이 쓰는 hybrid encoding도 많이 사용됩니다. 그래서 가장 좋았던 SNN 조건인 `moving_average + threshold-scale 0.75`에서 delta-only와 delta-rate hybrid를 비교했습니다.
+최근 SNN 시계열 처리에서는 기본 rate encoding, 변화량 중심 delta event encoding, 그리고 둘을 합친 hybrid encoding을 함께 비교하는 흐름이 많습니다. 그래서 가장 좋았던 SNN 조건인 `moving_average + threshold-scale 0.75`에서 rate-only, delta-only, delta-rate hybrid를 비교했습니다.
 
 | 모델 | 인코딩 | 전처리 | RMSE | MAE | Corr | 입력 spike rate | hidden spike rate |
 |---|---|---|---:|---:|---:|---:|---:|
+| SNN | rate | moving_average | 0.5105 | 0.4339 | 0.9016 | 0.3425 | 0.1701 |
 | SNN | delta | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
 | SNN | delta-rate hybrid | moving_average | 0.4986 | 0.4261 | 0.9223 | 0.2555 | 0.1389 |
 
-이번 샘플에서는 hybrid가 정확도를 꽤 올렸습니다.
+이번 샘플에서는 hybrid가 가장 높은 correlation을 보였고, rate-only도 delta-only보다 정확도는 좋았습니다.
 
 ```text
 delta-only corr: 0.8470
+rate-only corr:  0.9016
 hybrid corr:     0.9223
 ```
 
-다만 spike activity도 증가했습니다.
+다만 rate-only는 입력 spike rate가 가장 높았습니다. 즉, 정확도만 보면 rate 계열이 유리하지만, event-driven 효율까지 보면 delta와 hybrid를 함께 봐야 합니다.
 
 ```text
-input spike rate:  0.2119 -> 0.2555
-hidden spike rate: 0.1136 -> 0.1389
+input spike rate:  delta 0.2119 / hybrid 0.2555 / rate 0.3425
+hidden spike rate: delta 0.1136 / hybrid 0.1389 / rate 0.1701
 ```
 
-따라서 hybrid는 "정확도 향상 vs spike activity 증가" trade-off가 있는 후보로 보는 것이 좋습니다.
+따라서 hybrid는 rate-only보다 sparse하면서 delta-only보다 정확도가 높은 중간 후보로 보는 것이 좋습니다.
+
+참고: 현재 delta threshold는 window별 `std(diff(signal))` 기반으로 정해지므로, 이미 간단한 adaptive threshold 방식입니다.
 
 해석:
 
 ```text
 CNN은 no denoising이 가장 좋았습니다.
-SNN은 moving average 전처리 후 delta spike encoding을 적용했을 때 가장 좋아졌습니다.
+SNN은 moving average 전처리 후 hybrid encoding을 적용했을 때 가장 좋아졌습니다.
 ```
 
 따라서 다음 실험의 시작점은 아래 조합이 좋아 보입니다.
 
 ```text
 CNN baseline: preprocess none
-SNN baseline: preprocess moving_average + delta + threshold-scale 0.75
+SNN 기본 baseline: preprocess moving_average + rate
+SNN event baseline: preprocess moving_average + delta + threshold-scale 0.75
 SNN 제안 후보: preprocess moving_average + delta-rate hybrid + threshold-scale 0.75
 ```
 
@@ -141,6 +146,19 @@ Delta-SNN = 저활성 event-based representation 기준선
 3. 고정 threshold 대신 adaptive thresholding 적용
 4. delta encoding, rate encoding, delta-rate hybrid encoding 비교
 5. RMSE/correlation뿐 아니라 spike rate와 성능 저하율을 함께 평가
+
+## 추가 SNN 트렌드 확장 후보
+
+| 후보 | 적용 의미 | 장점 | 단점 | 현재 우선순위 |
+|---|---|---|---|---|
+| Rate encoding | 신호 크기를 spike 빈도로 표현 | 구현이 쉽고 성능이 안정적 | spike 수가 많아질 수 있음 | baseline |
+| Delta/event encoding | 변화량이 threshold를 넘을 때만 spike 발생 | sparse하고 event-driven 명분이 강함 | 절대 amplitude 정보가 약함 | baseline |
+| Delta-rate hybrid | 변화 정보와 amplitude 정보를 함께 사용 | 이번 샘플에서 정확도와 효율 균형이 좋음 | 채널 수와 spike activity 증가 | 1순위 제안 |
+| Adaptive threshold | window/subject별 threshold 자동 조정 | subject 차이와 신호 크기 차이에 대응 | threshold 설계에 따라 결과가 흔들림 | 이미 일부 적용 |
+| Spiking TCN | 시간축 convolution을 SNN으로 확장 | 호흡처럼 긴 temporal pattern에 유리 | 현재 LIF-SNN보다 구현/튜닝 부담 증가 | 다음 단계 |
+| Learnable encoder | spike 변환 파라미터를 학습 | 데이터가 늘면 성능 향상 가능 | 데이터가 적으면 과적합 위험 | 실제 데이터 확보 후 |
+
+현재 결론은 `moving_average + delta-rate hybrid`를 제안 후보로 두고, `rate`, `delta`, `CNN`을 baseline으로 같이 가져가는 것입니다.
 
 ## 팀 공유용 요약
 

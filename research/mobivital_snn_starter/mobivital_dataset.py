@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from preprocessing import apply_preprocess
-from spike_encoding import delta_rate_hybrid_encode, delta_spike_encode, zscore
+from spike_encoding import delta_rate_hybrid_encode, delta_spike_encode, rate_spike_encode, zscore
 
 try:
     import torch
@@ -119,6 +119,8 @@ class MobiVitalWindowDataset(Dataset):
                         threshold_scale=threshold_scale,
                         seed=start,
                     )
+                elif encode == "rate":
+                    x_encoded = rate_spike_encode(x_win, seed=start)
                 elif encode == "none":
                     x_encoded = x_win
                 else:
