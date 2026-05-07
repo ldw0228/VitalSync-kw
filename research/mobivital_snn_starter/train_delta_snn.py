@@ -83,6 +83,54 @@ class DeltaSNN(nn.Module):
         return out, (rate1 + rate2) / 2.0
 
 
+class SpikingTCNBlock(nn.Module):
+    """Dilated temporal convolution followed by LIF spiking dynamics."""
+
+    def __init__(self, channels: int, dilation: int, kernel_size: int = 5) -> None:
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding, dilation=dilation)
+        self.norm = nn.BatchNorm1d(channels)
+        self.lif = LIF1d(decay=0.90, threshold=0.7, beta=8.0)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self.norm(self.conv(x))
+        spikes, rate = self.lif(current)
+        return spikes, rate
+
+
+class SpikingTCN(nn.Module):
+    """Spiking temporal convolution network for longer respiration patterns."""
+
+    def __init__(self, in_channels: int = 2, hidden: int = 32) -> None:
+        super().__init__()
+        self.input_current = nn.Conv1d(in_channels, hidden, kernel_size=1)
+        self.input_lif = LIF1d(decay=0.88, threshold=0.6, beta=8.0)
+        self.blocks = nn.ModuleList(
+            [
+                SpikingTCNBlock(hidden, dilation=1),
+                SpikingTCNBlock(hidden, dilation=2),
+                SpikingTCNBlock(hidden, dilation=4),
+                SpikingTCNBlock(hidden, dilation=8),
+            ]
+        )
+        self.readout = nn.Sequential(
+            nn.Conv1d(hidden, hidden, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(hidden, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        spikes, rate = self.input_lif(self.input_current(x))
+        rates = [rate]
+        for block in self.blocks:
+            next_spikes, block_rate = block(spikes)
+            spikes = torch.clamp(spikes + next_spikes, 0.0, 1.0)
+            rates.append(block_rate)
+        out = self.readout(spikes)
+        return out, torch.stack(rates).mean()
+
+
 def corrcoef(pred: torch.Tensor, target: torch.Tensor) -> float:
     pred = pred.detach().flatten().cpu()
     target = target.detach().flatten().cpu()
@@ -101,7 +149,7 @@ def split_indices(n: int, train_ratio: float = 0.7, val_ratio: float = 0.15) -> 
     return list(range(0, train_end)), list(range(train_end, val_end)), list(range(val_end, n))
 
 
-def evaluate(model: DeltaSNN, loader: DataLoader, device: torch.device) -> dict[str, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict[str, float]:
     model.eval()
     losses: list[float] = []
     rates: list[float] = []
@@ -131,7 +179,7 @@ def evaluate(model: DeltaSNN, loader: DataLoader, device: torch.device) -> dict[
 
 
 def save_prediction_plot(
-    model: DeltaSNN,
+    model: nn.Module,
     dataset: MobiVitalWindowDataset,
     index: int,
     out_path: Path,
@@ -186,7 +234,12 @@ def main() -> None:
     parser.add_argument("--bin-radius", type=int, default=0)
     parser.add_argument("--preprocess", choices=["none", "moving_average", "fft_bandpass"], default="none")
     parser.add_argument("--threshold-scale", type=float, default=0.75)
-    parser.add_argument("--encode", choices=["rate", "delta", "delta_rate_hybrid"], default="delta")
+    parser.add_argument("--threshold-mode", choices=["std", "mad", "percentile", "target_rate"], default="std")
+    parser.add_argument("--threshold-percentile", type=float, default=75.0)
+    parser.add_argument("--target-spike-rate", type=float, default=0.2)
+    parser.add_argument("--levels", type=int, default=5, help="Number of level-crossing thresholds")
+    parser.add_argument("--encode", choices=["rate", "delta", "delta_rate_hybrid", "level_crossing"], default="delta")
+    parser.add_argument("--model", choices=["lif_cnn", "spiking_tcn"], default="lif_cnn")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--rate-reg", type=float, default=1e-3, help="Penalty for hidden spike activity")
     parser.add_argument("--out-dir", default=None)
@@ -206,6 +259,10 @@ def main() -> None:
         bin_radius=args.bin_radius,
         encode=args.encode,
         threshold_scale=args.threshold_scale,
+        threshold_mode=args.threshold_mode,
+        threshold_percentile=args.threshold_percentile,
+        target_spike_rate=args.target_spike_rate,
+        levels=args.levels,
         preprocess=args.preprocess,
     )
     if len(dataset) < 4:
@@ -217,12 +274,17 @@ def main() -> None:
     test_loader = DataLoader(Subset(dataset, test_idx), batch_size=8)
 
     in_channels = int(dataset[0][0].shape[0])
-    model = DeltaSNN(in_channels=in_channels).to(device)
+    if args.model == "lif_cnn":
+        model = DeltaSNN(in_channels=in_channels).to(device)
+    elif args.model == "spiking_tcn":
+        model = SpikingTCN(in_channels=in_channels).to(device)
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
 
     best_val = float("inf")
-    best_path = out_dir / "delta_snn.pt"
+    best_path = out_dir / "snn.pt"
     history: list[dict[str, float]] = []
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -259,7 +321,9 @@ def main() -> None:
 
     model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
     test_metrics = evaluate(model, test_loader, device)
-    input_spike_rate = float(torch.stack([dataset[i][0].mean() for i in range(len(dataset))]).mean())
+    input_spike_density = float(torch.stack([dataset[i][0].mean() for i in range(len(dataset))]).mean())
+    input_spikes_per_window = float(torch.stack([dataset[i][0].sum() for i in range(len(dataset))]).mean())
+    input_spikes_per_second = input_spikes_per_window / args.window_sec
     metrics = {
         "dataset_windows": len(dataset),
         "train_windows": len(train_idx),
@@ -269,9 +333,17 @@ def main() -> None:
         "bin_radius": args.bin_radius,
         "preprocess": args.preprocess,
         "encode": args.encode,
+        "model": args.model,
         "input_channels": in_channels,
         "threshold_scale": args.threshold_scale,
-        "input_spike_rate": input_spike_rate,
+        "threshold_mode": args.threshold_mode,
+        "threshold_percentile": args.threshold_percentile,
+        "target_spike_rate": args.target_spike_rate,
+        "levels": args.levels,
+        "input_spike_rate": input_spike_density,
+        "input_spike_density": input_spike_density,
+        "input_spikes_per_window": input_spikes_per_window,
+        "input_spikes_per_second": input_spikes_per_second,
         "test": test_metrics,
         "history": history,
     }
@@ -280,7 +352,9 @@ def main() -> None:
 
     print("test metrics:")
     print(json.dumps(test_metrics, indent=2))
-    print(f"input spike rate: {input_spike_rate:.4f}")
+    print(f"input spike density: {input_spike_density:.4f}")
+    print(f"input spikes/window: {input_spikes_per_window:.1f}")
+    print(f"input spikes/second: {input_spikes_per_second:.1f}")
     print(f"saved model: {best_path}")
     print(f"saved plot: {out_dir / 'prediction.png'}")
     print(f"saved metrics: {out_dir / 'metrics.json'}")

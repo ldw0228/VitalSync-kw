@@ -6,7 +6,13 @@ from pathlib import Path
 import numpy as np
 
 from preprocessing import apply_preprocess
-from spike_encoding import delta_rate_hybrid_encode, delta_spike_encode, rate_spike_encode, zscore
+from spike_encoding import (
+    delta_rate_hybrid_encode,
+    delta_spike_encode,
+    level_crossing_encode,
+    rate_spike_encode,
+    zscore,
+)
 
 try:
     import torch
@@ -76,6 +82,10 @@ class MobiVitalWindowDataset(Dataset):
         bin_radius: int = 0,
         encode: str = "delta",
         threshold_scale: float = 0.75,
+        threshold_mode: str = "std",
+        threshold_percentile: float = 75.0,
+        target_spike_rate: float = 0.2,
+        levels: int = 5,
         preprocess: str = "none",
     ) -> None:
         self.fs = 50
@@ -86,6 +96,10 @@ class MobiVitalWindowDataset(Dataset):
         self.bin_radius = bin_radius
         self.encode = encode
         self.threshold_scale = threshold_scale
+        self.threshold_mode = threshold_mode
+        self.threshold_percentile = threshold_percentile
+        self.target_spike_rate = target_spike_rate
+        self.levels = levels
         self.preprocess = preprocess
         self.items: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -110,6 +124,9 @@ class MobiVitalWindowDataset(Dataset):
                     x_encoded = delta_spike_encode(
                         x_win,
                         threshold_scale=threshold_scale,
+                        threshold_mode=threshold_mode,
+                        threshold_percentile=threshold_percentile,
+                        target_spike_rate=target_spike_rate,
                         bipolar=True,
                     )
                     x_encoded = x_encoded.reshape(-1, x_encoded.shape[-1])
@@ -117,10 +134,15 @@ class MobiVitalWindowDataset(Dataset):
                     x_encoded = delta_rate_hybrid_encode(
                         x_win,
                         threshold_scale=threshold_scale,
+                        threshold_mode=threshold_mode,
+                        threshold_percentile=threshold_percentile,
+                        target_spike_rate=target_spike_rate,
                         seed=start,
                     )
                 elif encode == "rate":
                     x_encoded = rate_spike_encode(x_win, seed=start)
+                elif encode == "level_crossing":
+                    x_encoded = level_crossing_encode(x_win, levels=levels)
                 elif encode == "none":
                     x_encoded = x_win
                 else:

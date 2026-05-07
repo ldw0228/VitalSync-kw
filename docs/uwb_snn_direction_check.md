@@ -93,7 +93,7 @@ input spike rate:  delta 0.2119 / hybrid 0.2555 / rate 0.3425
 hidden spike rate: delta 0.1136 / hybrid 0.1389 / rate 0.1701
 ```
 
-따라서 hybrid는 rate-only보다 sparse하면서 delta-only보다 정확도가 높은 중간 후보로 보는 것이 좋습니다.
+주의할 점은 표의 `입력 spike rate`가 채널 전체 평균 density라는 것입니다. 총 입력 spike 수는 채널 수까지 곱해서 봐야 하므로, hybrid는 rate-only보다 총 activity가 적은 방식이 아닙니다. 정확한 해석은 "hybrid는 총 spike activity를 더 쓰는 대신 변화 정보와 amplitude 정보를 함께 제공해 성능을 올리는 방식"입니다.
 
 참고: 현재 delta threshold는 window별 `std(diff(signal))` 기반으로 정해지므로, 이미 간단한 adaptive threshold 방식입니다.
 
@@ -112,6 +112,18 @@ SNN 기본 baseline: preprocess moving_average + rate
 SNN event baseline: preprocess moving_average + delta + threshold-scale 0.75
 SNN 제안 후보: preprocess moving_average + delta-rate hybrid + threshold-scale 0.75
 ```
+
+## 추가 트렌드 후보 실험
+
+위 비교 이후 최신 SNN 흐름을 반영하기 위해 세 가지 축을 추가했습니다.
+
+| 영역 | 조건 | RMSE | MAE | Corr | 입력 spike density | 예상 입력 spikes/sec | hidden spike rate | 해석 |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Level-crossing encoding | `lif_cnn + level_crossing`, 5 levels | 0.8786 | 0.7503 | 0.6206 | 0.0058 | 약 2.9 | 0.0369 | 매우 sparse하지만 현재 설정은 정보 손실이 큼 |
+| Adaptive threshold | `lif_cnn + hybrid`, target spike rate 0.2 | 0.5820 | 0.5037 | 0.8748 | 0.1808 | 약 27.1 | 0.1275 | activity를 줄이는 knob로 유용하지만 성능 trade-off 존재 |
+| Spiking TCN | `spiking_tcn + hybrid` | 0.5056 | 0.4322 | 0.9582 | 0.2555 | 약 38.3 | 0.2216 | temporal pattern을 더 잘 잡지만 hidden activity가 증가 |
+
+현재 샘플 기준으로는 `delta-rate hybrid + Spiking TCN`이 correlation이 가장 좋았습니다. 다만 hidden spike rate가 올라가기 때문에 최종 졸업작품에서는 정확도뿐 아니라 총 입력 spike 수, hidden spike rate, noise/artifact 상황의 성능 방어율을 함께 봐야 합니다.
 
 ## 현재 해석
 
