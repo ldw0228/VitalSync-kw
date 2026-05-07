@@ -2,6 +2,8 @@
 
 이 문서는 AAL raw UWB 샘플을 대학원생 코드의 `UWB_Biopac_SyncData.mat`와 비슷한 중간 산출물로 변환한 뒤, CNN/SNN 방법론을 비교한 결과입니다.
 
+MobiVital 결과까지 포함한 전체 비교와 실제 raw 수집 후 추천 방법론은 `docs/experiment_summary_and_recommendation.md`에 통합 정리했습니다.
+
 주의: AAL에는 실제 BIOPAC이 없으므로 `biopac_resp`는 AAL의 lidar/reference respiration을 호환용으로 넣은 필드입니다. 현재 AAL 샘플에서는 radar breath와 lidar/reference의 직접 정렬 상관이 낮았습니다. 따라서 아래 비교는 `target-field=radar_resp`, 즉 raw UWB에서 추출한 radar breathing signal을 target으로 둔 raw pipeline 검증용 결과입니다.
 
 ## 전체 프로세스

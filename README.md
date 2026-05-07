@@ -2,6 +2,12 @@
 
 UWB 레이더 데이터와 BIOPAC 호흡 신호를 활용한 생체신호 분석 프로젝트입니다.
 
+## 현재 실험 정리
+
+- 전체 비교 결과와 추천 방법론: [docs/experiment_summary_and_recommendation.md](docs/experiment_summary_and_recommendation.md)
+- MobiVital SNN 방향성 실험: [docs/uwb_snn_direction_check.md](docs/uwb_snn_direction_check.md)
+- AAL SyncData-like CNN/SNN 비교: [docs/aal_syncdata_cnn_snn_comparison.md](docs/aal_syncdata_cnn_snn_comparison.md)
+
 ## 개발 환경 설정
 
 팀원 간 환경 차이를 줄이기 위해 Python 3.11.x 사용을 권장합니다.

@@ -5,6 +5,8 @@
 이 문서는 최종 졸업작품 결과가 아니라, 앞으로 어떤 방식으로 진행할지 보기 위한 초기 방향성 실험 정리입니다.
 목표는 MobiVital 형태의 UWB I/Q 신호를 스파이크 입력으로 변환할 수 있는지, 그리고 일반 CNN baseline과 비교했을 때 어떤 특징이 나오는지 확인하는 것입니다.
 
+전체 비교 결과와 실제 raw 수집 후 추천 방법론은 `docs/experiment_summary_and_recommendation.md`에 통합 정리했습니다.
+
 ## 데이터
 
 - 데이터 샘플: MobiVital `sample.csv`
