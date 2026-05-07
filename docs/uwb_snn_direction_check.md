@@ -164,6 +164,8 @@ C:\Users\hai\Desktop\uwb_aal_raw\syncdata_like\AAL_UWB_Biopac_SyncData_like.mat
 
 따라서 AAL은 최종 BIOPAC supervised 성능 검증용이라기보다, 실제 데이터 수집 전 `raw UWB -> 대학원생식 중간 산출물 -> SNN 방법론 적용` 과정을 미리 맞춰보는 용도로 사용하는 것이 좋습니다.
 
+CNN/SNN 전체 비교표와 실제 raw 수집 후 추천 방법론은 `docs/aal_syncdata_cnn_snn_comparison.md`에 따로 정리했습니다.
+
 ## 현재 해석
 
 clean continuous input에서는 CNN baseline이 훨씬 강합니다. 이건 예상 가능한 결과이고, CNN을 정확도 기준선으로 두는 것이 좋습니다.

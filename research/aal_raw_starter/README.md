@@ -205,7 +205,26 @@ AAL sample에서는 lidar/reference와 radar breath의 직접 정렬 상관이 �
 "raw UWB -> 대학원생식 SyncData-like 산출물 -> spike/SNN 방법론 적용"을 연습하는 용도에 더 적합합니다.
 ```
 
-3. 실제 데이터 수집 전 저장 포맷 확정
+3. CNN/SNN 전체 비교
+
+SyncData-like 파일을 기준으로 CNN baseline과 SNN 후보를 같은 target에서 비교했습니다. 자세한 표와 추천 방법론은 아래 문서에 정리했습니다.
+
+```text
+docs/aal_syncdata_cnn_snn_comparison.md
+```
+
+요약:
+
+| 역할 | 현재 추천 |
+|---|---|
+| 정확도 baseline | continuous CNN + none |
+| SNN baseline | rate, delta |
+| SNN 효율 비교군 | level-crossing |
+| SNN 제안 방법 | delta-rate hybrid + Spiking TCN |
+
+현재 AAL `radar_resp` target에서는 CNN이 가장 정확하고, SNN 내부에서는 `delta-rate hybrid + Spiking TCN`이 가장 좋았습니다. 실제 BIOPAC raw가 들어오면 target을 `biopac_resp`로 바꿔 같은 비교를 반복하면 됩니다.
+
+4. 실제 데이터 수집 전 저장 포맷 확정
 
 ```text
 UWB raw frame
