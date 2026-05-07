@@ -55,6 +55,33 @@ respiration과의 상관계수: 약 0.936
 | Delta-SNN | 1 | 1.00 | 0.1517 | 0.0775 | 0.7512 | 0.6279 | 0.7332 |
 | Delta-SNN | 5 | 0.75 | 0.1487 | 0.0959 | 0.8092 | 0.6712 | 0.6705 |
 
+## 전처리/디노이징 추가 비교
+
+추가로 `none`, `moving_average`, `fft_bandpass` 전처리를 비교했습니다.
+
+| 모델 | 전처리 | RMSE | MAE | Corr | 입력 spike rate | hidden spike rate |
+|---|---|---:|---:|---:|---:|---:|
+| CNN | none | 0.3195 | 0.2725 | 0.9785 | - | - |
+| CNN | moving_average | 0.3732 | 0.3232 | 0.9737 | - | - |
+| CNN | fft_bandpass | 0.3927 | 0.2923 | 0.9474 | - | - |
+| Delta-SNN | none | 0.7284 | 0.6063 | 0.7433 | 0.2152 | 0.0885 |
+| Delta-SNN | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
+| Delta-SNN | fft_bandpass | 0.5836 | 0.4684 | 0.8334 | 0.3135 | 0.1349 |
+
+해석:
+
+```text
+CNN은 no denoising이 가장 좋았습니다.
+SNN은 moving average 전처리 후 delta spike encoding을 적용했을 때 가장 좋아졌습니다.
+```
+
+따라서 다음 실험의 시작점은 아래 조합이 좋아 보입니다.
+
+```text
+CNN baseline: preprocess none
+SNN baseline: preprocess moving_average + threshold-scale 0.75
+```
+
 ## 현재 해석
 
 clean continuous input에서는 CNN baseline이 훨씬 강합니다. 이건 예상 가능한 결과이고, CNN을 정확도 기준선으로 두는 것이 좋습니다.

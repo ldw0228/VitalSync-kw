@@ -141,6 +141,49 @@ UWB 생체신호는 절대값보다 미세한 시간 변화가 중요하므로, 
 | Delta-SNN | 1 | 1.00 | 0.1517 | 0.0775 | 0.7512 | 0.6279 | 0.7332 |
 | Delta-SNN | 5 | 0.75 | 0.1487 | 0.0959 | 0.8092 | 0.6712 | 0.6705 |
 
+## 전처리/디노이징 비교
+
+추가로 `none`, `moving_average`, `fft_bandpass` 세 가지 전처리를 비교했습니다.
+
+전처리 방식:
+
+```text
+none
+-> I/Q magnitude를 그대로 z-score 후 사용
+
+moving_average
+-> time axis 방향 5-sample causal moving average
+
+fft_bandpass
+-> FFT 기반 0.1~0.5 Hz respiration 대역만 통과
+```
+
+결과는 다음과 같습니다.
+
+| 모델 | 전처리 | RMSE | MAE | Corr | 입력 spike rate | hidden spike rate |
+|---|---|---:|---:|---:|---:|---:|
+| CNN | none | 0.3195 | 0.2725 | 0.9785 | - | - |
+| CNN | moving_average | 0.3732 | 0.3232 | 0.9737 | - | - |
+| CNN | fft_bandpass | 0.3927 | 0.2923 | 0.9474 | - | - |
+| Delta-SNN | none | 0.7284 | 0.6063 | 0.7433 | 0.2152 | 0.0885 |
+| Delta-SNN | moving_average | 0.5702 | 0.4245 | 0.8470 | 0.2119 | 0.1136 |
+| Delta-SNN | fft_bandpass | 0.5836 | 0.4684 | 0.8334 | 0.3135 | 0.1349 |
+
+### 디노이징 비교 해석
+
+CNN은 디노이징을 하지 않은 `none`이 가장 좋았습니다. 이는 CNN이 clean sample에서는 원 신호의 세부 변화를 잘 활용한다는 뜻으로 볼 수 있습니다.
+
+반대로 Delta-SNN은 `moving_average` 전처리에서 성능이 크게 좋아졌습니다.
+
+```text
+Delta-SNN none           -> RMSE 0.7284, Corr 0.7433
+Delta-SNN moving_average -> RMSE 0.5702, Corr 0.8470
+```
+
+즉, SNN에는 연속 신호를 바로 spike로 바꾸는 것보다, 작은 고주파 변동을 약간 줄인 뒤 delta spike encoding을 적용하는 편이 더 좋아 보입니다.
+
+FFT band-pass도 SNN 성능을 올리긴 했지만, 입력 spike rate와 hidden spike rate가 같이 증가했습니다. 따라서 현 시점에서는 `moving_average + delta spike`가 더 좋은 출발점으로 보입니다.
+
 ## 결과 해석
 
 ### CNN은 clean 데이터에서 확실히 강함
@@ -166,6 +209,13 @@ threshold별 결과를 보면:
 ```
 
 따라서 다음 실험의 기본값은 `threshold-scale 0.75`로 두는 것이 좋습니다.
+
+전처리까지 포함하면 다음 기본 조합을 우선 추천합니다.
+
+```text
+CNN baseline: preprocess none
+SNN baseline: preprocess moving_average + threshold-scale 0.75
+```
 
 ### 5-bin 입력은 이번 샘플에서는 도움이 되지 않았음
 

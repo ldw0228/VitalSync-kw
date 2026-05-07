@@ -119,6 +119,7 @@ def main() -> None:
     parser.add_argument("--window-sec", type=float, default=10.0)
     parser.add_argument("--stride-sec", type=float, default=2.0)
     parser.add_argument("--bin-radius", type=int, default=0)
+    parser.add_argument("--preprocess", choices=["none", "moving_average", "fft_bandpass"], default="none")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--out-dir", default=None)
     args = parser.parse_args()
@@ -136,6 +137,7 @@ def main() -> None:
         stride_sec=args.stride_sec,
         bin_radius=args.bin_radius,
         encode="none",
+        preprocess=args.preprocess,
     )
     if len(dataset) < 4:
         raise RuntimeError("Not enough windows. Use a shorter window or more CSV files.")
@@ -191,6 +193,7 @@ def main() -> None:
         "test_windows": len(test_idx),
         "device": str(device),
         "bin_radius": args.bin_radius,
+        "preprocess": args.preprocess,
         "input_channels": in_channels,
         "test": test_metrics,
         "history": history,

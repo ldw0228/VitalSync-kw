@@ -181,6 +181,7 @@ def main() -> None:
     parser.add_argument("--window-sec", type=float, default=10.0)
     parser.add_argument("--stride-sec", type=float, default=2.0)
     parser.add_argument("--bin-radius", type=int, default=0)
+    parser.add_argument("--preprocess", choices=["none", "moving_average", "fft_bandpass"], default="none")
     parser.add_argument("--threshold-scale", type=float, default=0.75)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--rate-reg", type=float, default=1e-3, help="Penalty for hidden spike activity")
@@ -201,6 +202,7 @@ def main() -> None:
         bin_radius=args.bin_radius,
         encode="delta",
         threshold_scale=args.threshold_scale,
+        preprocess=args.preprocess,
     )
     if len(dataset) < 4:
         raise RuntimeError("Not enough windows. Use a shorter window or more CSV files.")
@@ -261,6 +263,7 @@ def main() -> None:
         "test_windows": len(test_idx),
         "device": str(device),
         "bin_radius": args.bin_radius,
+        "preprocess": args.preprocess,
         "input_channels": in_channels,
         "threshold_scale": args.threshold_scale,
         "input_spike_rate": input_spike_rate,

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from preprocessing import apply_preprocess
 from spike_encoding import delta_spike_encode, zscore
 
 try:
@@ -75,6 +76,7 @@ class MobiVitalWindowDataset(Dataset):
         bin_radius: int = 0,
         encode: str = "delta",
         threshold_scale: float = 0.75,
+        preprocess: str = "none",
     ) -> None:
         self.fs = 50
         self.window = int(window_sec * self.fs)
@@ -84,11 +86,13 @@ class MobiVitalWindowDataset(Dataset):
         self.bin_radius = bin_radius
         self.encode = encode
         self.threshold_scale = threshold_scale
+        self.preprocess = preprocess
         self.items: list[tuple[np.ndarray, np.ndarray]] = []
 
         for csv_path in csv_paths:
             arr = load_mobivital_csv(csv_path)
             feat = getattr(arr, feature)
+            feat = apply_preprocess(feat, mode=preprocess, fs=self.fs)
             target = zscore(arr.respiration).astype(np.float32)
             use_bin = bin_index
             if use_bin is None:
