@@ -125,6 +125,45 @@ SNN 제안 후보: preprocess moving_average + delta-rate hybrid + threshold-sca
 
 현재 샘플 기준으로는 `delta-rate hybrid + Spiking TCN`이 correlation이 가장 좋았습니다. 다만 hidden spike rate가 올라가기 때문에 최종 졸업작품에서는 정확도뿐 아니라 총 입력 spike 수, hidden spike rate, noise/artifact 상황의 성능 방어율을 함께 봐야 합니다.
 
+## AAL을 대학원생 코드 스타일로 맞춘 결과
+
+대학원생 코드의 최종 산출물은 `UWB_Biopac_SyncData.mat` 안에 `Fs_uwb`, `Fs_biopac`, `biopac_resp`, `tv_row`, `com_row`, `tv_col`, `com_col`을 저장하는 구조였습니다. AAL은 BIOPAC과 2개 radar가 없으므로 완전히 동일하지는 않지만, 아래처럼 호환 구조를 만들었습니다.
+
+```text
+AAL raw bScan
+-> detrend 기반 background subtraction
+-> row/column normalization
+-> UWB_Biopac_SyncData-like .mat 저장
+-> 동일한 rate/delta/hybrid/Spiking TCN 방법론 적용
+```
+
+생성 파일:
+
+```text
+C:\Users\hai\Desktop\uwb_aal_raw\syncdata_like\AAL_UWB_Biopac_SyncData_like.mat
+```
+
+필드 매핑:
+
+| 대학원생 코드 필드 | AAL 매핑 |
+|---|---|
+| `Fs_uwb` | AAL radar frame rate, 약 18.76 Hz |
+| `Fs_biopac` | AAL reference rate, 약 3.08 Hz |
+| `biopac_resp` | 실제 BIOPAC이 아니라 AAL lidar/reference respiration |
+| `com_row`, `com_col` | AAL radar matrix |
+| `tv_row`, `tv_col` | AAL은 radar가 하나라 `com_*`를 호환용으로 복사 |
+| `radar_resp` | 추가 필드. AAL raw에서 추출한 radar breathing signal |
+
+초기 실험 결과:
+
+| Target | Model | Encoding | RMSE | MAE | Corr | 해석 |
+|---|---|---|---:|---:|---:|---|
+| `biopac_resp` | LIF-CNN | hybrid | 0.8999 | 0.7604 | -0.0876 | AAL reference와 radar breath 정렬/센서 차이가 있어 직접 target으로 부적합 |
+| `radar_resp` | LIF-CNN | hybrid | 0.3046 | 0.2468 | 0.9618 | raw UWB matrix에서 radar breath 재구성 가능 |
+| `radar_resp` | Spiking TCN | hybrid | 0.2770 | 0.2206 | 0.9645 | 현재 AAL SyncData-like 실험에서 가장 좋음 |
+
+따라서 AAL은 최종 BIOPAC supervised 성능 검증용이라기보다, 실제 데이터 수집 전 `raw UWB -> 대학원생식 중간 산출물 -> SNN 방법론 적용` 과정을 미리 맞춰보는 용도로 사용하는 것이 좋습니다.
+
 ## 현재 해석
 
 clean continuous input에서는 CNN baseline이 훨씬 강합니다. 이건 예상 가능한 결과이고, CNN을 정확도 기준선으로 두는 것이 좋습니다.

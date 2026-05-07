@@ -138,13 +138,71 @@ reference_breath_signal
 condition metadata
 ```
 
-2. AAL radar breathing signal에도 기존 MobiVital SNN pipeline 적용
+현재는 이 단계를 `export_aal_syncdata_like.py`로 구현했습니다.
+
+```bash
+python export_aal_syncdata_like.py --root C:\Users\hai\Desktop\uwb_aal_raw
+```
+
+생성 산출물:
+
+```text
+C:\Users\hai\Desktop\uwb_aal_raw\syncdata_like\AAL_UWB_Biopac_SyncData_like.mat
+C:\Users\hai\Desktop\uwb_aal_raw\syncdata_like\AAL_UWB_Biopac_SyncData_like_summary.json
+```
+
+MATLAB 구조는 대학원생 코드의 최종 산출물과 비슷하게 맞췄습니다.
+
+| 필드 | 의미 |
+|---|---|
+| `Fs_uwb` | AAL radar frame rate |
+| `Fs_biopac` | AAL reference sampling rate. 실제 BIOPAC은 아니지만 호환을 위해 reference를 매핑 |
+| `biopac_resp` | AAL filtered lidar/reference respiration |
+| `radar_resp` | raw bScan에서 추출한 radar breathing signal |
+| `com_row` | background-subtracted UWB matrix를 row 방향 z-score 정규화 |
+| `com_col` | background-subtracted UWB matrix를 column 방향 z-score 정규화 |
+| `tv_row`, `tv_col` | AAL은 radar가 하나뿐이라 `com_*`를 호환용으로 복사 |
+
+주의할 점:
+
+```text
+AAL에는 실제 BIOPAC이 없습니다.
+따라서 biopac_resp는 AAL의 lidar/reference respiration을 대학원생 코드 구조에 맞춰 넣은 것입니다.
+우리 실제 실험에서는 이 자리에 BIOPAC respiration raw/filter 결과가 들어갑니다.
+```
+
+2. AAL SyncData-like 파일에 기존 SNN 방법론 적용
 
 ```text
 radar_breath_signal
 -> moving_average
 -> adaptive delta spike encoding
 -> SNN
+```
+
+현재는 `train_syncdata_snn.py`로 구현했습니다.
+
+```bash
+python train_syncdata_snn.py --mat C:\Users\hai\Desktop\uwb_aal_raw\syncdata_like\AAL_UWB_Biopac_SyncData_like.mat --target-field radar_resp --bin-index 184 --preprocess moving_average --encode delta_rate_hybrid --model lif_cnn
+
+python train_syncdata_snn.py --mat C:\Users\hai\Desktop\uwb_aal_raw\syncdata_like\AAL_UWB_Biopac_SyncData_like.mat --target-field radar_resp --bin-index 184 --preprocess moving_average --encode delta_rate_hybrid --model spiking_tcn
+```
+
+초기 결과:
+
+| Target | Model | Encoding | RMSE | MAE | Corr | input spikes/sec | hidden spike rate |
+|---|---|---|---:|---:|---:|---:|---:|
+| `biopac_resp` | LIF-CNN | delta-rate hybrid | 0.8999 | 0.7604 | -0.0876 | 16.9 | 0.0866 |
+| `radar_resp` | LIF-CNN | delta-rate hybrid | 0.3046 | 0.2468 | 0.9618 | 21.5 | 0.2523 |
+| `radar_resp` | Spiking TCN | delta-rate hybrid | 0.2770 | 0.2206 | 0.9645 | 21.5 | 0.1825 |
+
+해석:
+
+```text
+AAL sample에서는 lidar/reference와 radar breath의 직접 정렬 상관이 낮아 biopac_resp target 학습은 좋지 않았습니다.
+반면 raw UWB matrix에서 추출한 radar_resp target은 hybrid SNN으로 잘 재구성됩니다.
+즉 AAL은 BIOPAC supervised 최종 검증용이라기보다,
+"raw UWB -> 대학원생식 SyncData-like 산출물 -> spike/SNN 방법론 적용"을 연습하는 용도에 더 적합합니다.
 ```
 
 3. 실제 데이터 수집 전 저장 포맷 확정
@@ -157,4 +215,3 @@ condition metadata
 processed intermediate
 final window dataset
 ```
-
