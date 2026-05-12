@@ -178,3 +178,66 @@ subject 1 결과만 기준으로는 아래처럼 말하는 것이 안전합니�
 현재 subject 1에서는 CNN fft_bandpass가 가장 높은 Corr를 보였고, SNN 중에서는 delta LIF가 가장 높았다.
 level-crossing은 정확도는 조금 낮지만 spike 효율이 매우 좋아 효율 baseline으로 유지할 가치가 있다.
 ```
+
+## 선별 기준 적용 후 재실험
+
+전체 49개 quick scan에서 가장 높은 직접 상관을 보인 세션을 선별해 다시 전체 방법론을 돌렸습니다.
+
+선별 기준:
+
+```text
+1. com_row / tv_row / com_col / tv_col 중 BIOPAC과 직접 abs(corr)가 가장 높은 field 선택
+2. 해당 field에서 abs(corr)가 가장 높은 range bin 선택
+3. 전체 파일 중 abs(corr)가 가장 높은 세션 선택
+```
+
+선별된 세션:
+
+| 항목 | 값 |
+|---|---|
+| 파일 | `44/UWB_Biopac_SyncData.mat` |
+| field | `tv_row` |
+| selected bin | 183 |
+| direct corr | 0.2754 |
+| lag-corrected abs corr preview | 0.3456 |
+
+재실험 결과:
+
+| 방법 | RMSE | MAE | Corr | input spikes/sec | hidden spike rate |
+|---|---:|---:|---:|---:|---:|
+| CNN none | 0.9155 | 0.7284 | 0.1238 | - | - |
+| CNN moving_average | 0.9170 | 0.7260 | 0.1052 | - | - |
+| CNN fft_bandpass | 0.8687 | 0.6866 | 0.2525 | - | - |
+| SNN rate LIF | 0.8885 | 0.7211 | 0.0837 | 8.2 | 0.1194 |
+| SNN delta LIF | 0.9054 | 0.7008 | 0.2217 | 6.3 | 0.1300 |
+| SNN hybrid LIF | 0.8953 | 0.7112 | 0.1861 | 14.5 | 0.1410 |
+| SNN adaptive hybrid LIF | 0.9086 | 0.7162 | 0.1642 | 11.6 | 0.1310 |
+| SNN level LIF | 0.9414 | 0.7461 | 0.0799 | 1.0 | 0.0471 |
+| SNN hybrid Spiking TCN | 0.9140 | 0.7147 | 0.1985 | 14.5 | 0.1949 |
+
+해석:
+
+```text
+선별된 best 세션에서도 성능은 크게 살아나지 않았습니다.
+최고 Corr는 CNN fft_bandpass의 0.2525였고, SNN 중에서는 delta LIF의 0.2217이 가장 높았습니다.
+따라서 단순히 좋은 파일/field/bin을 고르는 것만으로는 해결되지 않았습니다.
+```
+
+현재 판단:
+
+```text
+1. 전체 세션 단위 학습이 아니라, 세션 내부에서 좋은 구간만 잘라내야 할 가능성이 큼.
+2. 시작/종료 sync event 또는 움직임 구간이 섞여 있으면 waveform 학습 target이 흐려질 수 있음.
+3. 고정 range bin 하나보다 시간에 따라 target bin을 추적하는 방식이 필요할 수 있음.
+4. BIOPAC respiration filtering/normalization과 UWB 전처리 대역을 다시 맞춰야 함.
+```
+
+다음 해결 순서:
+
+```text
+1. quality_preview plot 생성: UWB best bin, BIOPAC, lag-corrected overlay 확인
+2. 세션 앞/뒤 sync event와 bad segment 제거
+3. 30초 단위 window별 corr scan으로 좋은 구간만 선별
+4. 선별 구간만 사용해 CNN/SNN 재학습
+5. 그래도 낮으면 raw 단계 또는 SyncData 생성 코드의 alignment를 재검토
+```
