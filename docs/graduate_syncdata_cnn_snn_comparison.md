@@ -149,6 +149,14 @@ subject 1의 BIOPAC target과 UWB matrix 사이의 정렬/구간/레이더 선�
 6. 그 다음 CNN/SNN 전체 비교를 다시 수행
 ```
 
+이 과정을 자동으로 확인하기 위해 `scan_syncdata_quality.py`를 추가했습니다.
+
+```bash
+python research/aal_raw_starter/scan_syncdata_quality.py --root C:\Users\hai\Desktop\UWB_BIOPAC_MODEL_DATA\UWB_BIOPAC_MODEL_DATA --out-dir C:\Users\hai\Desktop\UWB_BIOPAC_MODEL_DATA\quality_scan
+```
+
+현재 전체 49개 파일 quick scan 결과, 가장 높은 직접 Corr도 약 0.275 수준이었습니다. 상위 파일에 lag correction을 적용해도 최고 약 0.35 수준이라, 단순 시간 지연만으로 해결되는 문제는 아닌 것으로 보입니다.
+
 권장 quick scan 출력:
 
 | 항목 | 의미 |
