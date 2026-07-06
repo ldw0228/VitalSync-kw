@@ -4,6 +4,8 @@
 
 원본 `.mat` 데이터, subject별 상세 window CSV, 학습된 모델 weight는 포함하지 않았습니다. 이 폴더에는 재현용 코드와 aggregate 그래프만 있습니다.
 
+전체 aggregate 평가표는 [metrics](metrics/README.md)에 따로 모아두었습니다.
+
 ## 한 줄 요약
 
 UWB 신호를 spike feature로 변환하면 label 분류는 가능했고, RR 추정도 BIOPAC과 어느 정도 맞출 수 있었습니다. 다만 "시간에 따른 변화 추적"은 아직 약해서, 다음 단계는 ROI 안정화와 움직임 rejection입니다.

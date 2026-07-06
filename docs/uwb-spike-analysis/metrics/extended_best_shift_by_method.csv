@@ -1,0 +1,4 @@
+method,best_shift_sec,best_mae_bpm,best_rmse_bpm,corr,trend_acc,zero_shift_mae_bpm,mae_delta_vs_zero,within_3bpm,within_5bpm,best_lag_sec,best_lag_corr
+bpf_com,-1,4.8971,6.0615,0.01177,0.15422,4.8979,-0.0008,0.36233,0.56396,-5,0.018765
+bpf_tv,-10,4.9176,6.0031,-0.0064891,0.15187,4.9661,-0.0485,0.34915,0.55789,-2,-0.0020503
+bpf_mean,-10,4.7604,5.8529,-0.003357,0.16371,4.8324,-0.072,0.36628,0.5901,-5,0.0059774
