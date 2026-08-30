@@ -16,9 +16,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
+import hashlib
+import io
 from pathlib import Path
 import math
+import os
 import re
+import stat
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -53,6 +57,65 @@ class ProtocolConfigError(ValueError):
 
 class ProtocolDecodeError(ValueError):
     """Raised when ordered boundaries cannot satisfy manual timing anchors."""
+
+
+def _source_snapshot(
+    path: str | Path, *, label: str, expected_sha256: str | None = None
+) -> tuple[bytes, str]:
+    """Capture the exact regular-file bytes parsed by protocol consumers."""
+
+    source = Path(path).expanduser().absolute()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        before_path = os.stat(source, follow_symlinks=False)
+        descriptor = os.open(source, flags)
+        before_fd = os.fstat(descriptor)
+        if not (
+            stat.S_ISREG(before_path.st_mode)
+            and stat.S_ISREG(before_fd.st_mode)
+            and before_path.st_nlink == before_fd.st_nlink == 1
+            and (before_path.st_dev, before_path.st_ino)
+            == (before_fd.st_dev, before_fd.st_ino)
+        ):
+            raise ValueError(f"{label} must be an unaliased regular file: {source}")
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+        payload = b"".join(chunks)
+        after_fd = os.fstat(descriptor)
+        after_path = os.stat(source, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"cannot snapshot {label}: {source} ({error})") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    signature = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if not (
+        signature(before_fd) == signature(after_fd) == signature(after_path)
+        and before_fd.st_size == len(payload)
+    ):
+        raise ValueError(f"{label} changed while being snapshotted: {source}")
+    observed_sha256 = digest.hexdigest()
+    if expected_sha256 is not None and observed_sha256 != expected_sha256:
+        raise ValueError(
+            f"{label} consumed-byte SHA-256 mismatch: "
+            f"expected {expected_sha256}, observed {observed_sha256}"
+        )
+    return payload, observed_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,24 +334,85 @@ class WindowStageAssignment:
     phase7_assignment: str | None
 
 
+def _require_exact_keys(
+    value: Mapping[Any, Any], expected: set[str], label: str
+) -> None:
+    """Reject missing, unknown, or mistyped keys in a versioned contract."""
+
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted((repr(item) for item in actual - expected))
+        raise ProtocolConfigError(
+            f"{label} keys mismatch; missing={missing}, unknown={unknown}"
+        )
+
+
+def _as_yaml_number(value: Any, field_name: str) -> float:
+    """Return one finite YAML number without coercing strings or booleans."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolConfigError(f"{field_name} must be a finite YAML number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ProtocolConfigError(f"{field_name} must be finite")
+    return result
+
+
 def _as_float_pair(value: Any, field_name: str) -> tuple[float, float]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 2:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 2
+    ):
         raise ProtocolConfigError(f"{field_name} must contain exactly two numbers")
-    pair = (float(value[0]), float(value[1]))
-    if not (math.isfinite(pair[0]) and math.isfinite(pair[1]) and 0 <= pair[0] <= pair[1]):
+    pair = (
+        _as_yaml_number(value[0], f"{field_name}[0]"),
+        _as_yaml_number(value[1], f"{field_name}[1]"),
+    )
+    if not 0 <= pair[0] <= pair[1]:
         raise ProtocolConfigError(f"invalid {field_name}: {pair}")
     return pair
 
 
-def load_protocol_config(path: str | Path) -> AcquisitionProtocolConfig:
+def load_protocol_config(
+    path: str | Path, *, expected_sha256: str | None = None
+) -> AcquisitionProtocolConfig:
     """Load and validate the versioned seven-stage protocol contract."""
 
     config_path = Path(path)
-    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    try:
+        payload, _ = _source_snapshot(
+            config_path,
+            label="protocol configuration",
+            expected_sha256=expected_sha256,
+        )
+        document = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeError, yaml.YAMLError, ValueError) as error:
+        raise ProtocolConfigError(
+            f"cannot load protocol configuration: {error}"
+        ) from error
     if not isinstance(document, Mapping):
         raise ProtocolConfigError("protocol config must be a mapping")
+    _require_exact_keys(
+        document,
+        {
+            "schema_version",
+            "time_basis",
+            "annotation_contract",
+            "stages",
+            "fall_protocol",
+            "decoder",
+            "window_assignment",
+        },
+        "protocol config",
+    )
     if document.get("schema_version") != SCHEMA_VERSION:
         raise ProtocolConfigError(f"expected schema_version={SCHEMA_VERSION!r}")
+    if document.get("time_basis") != "seconds_from_biopac_start":
+        raise ProtocolConfigError(
+            "time_basis must equal 'seconds_from_biopac_start'"
+        )
 
     stage_documents = document.get("stages")
     if not isinstance(stage_documents, list) or len(stage_documents) != 7:
@@ -297,24 +421,66 @@ def load_protocol_config(path: str | Path) -> AcquisitionProtocolConfig:
     for item in stage_documents:
         if not isinstance(item, Mapping):
             raise ProtocolConfigError("each stage must be a mapping")
+        _require_exact_keys(
+            item,
+            {
+                "id",
+                "order",
+                "name",
+                "nominal_duration_s",
+                "duration_scale_s",
+                "plausible_duration_s",
+                "nominal_gap_before_s",
+                "gap_scale_s",
+                "plausible_gap_before_s",
+            },
+            "stage",
+        )
+        stage_id = item.get("id")
+        stage_name = item.get("name")
+        if not isinstance(stage_id, str) or not stage_id:
+            raise ProtocolConfigError("stage id must be a non-empty YAML string")
+        if not isinstance(stage_name, str) or not stage_name:
+            raise ProtocolConfigError("stage name must be a non-empty YAML string")
+        raw_order = item.get("order")
+        if type(raw_order) is not int:
+            raise ProtocolConfigError("stage order must be a YAML integer")
         stage = StageSpec(
-            stage_id=str(item["id"]),
-            order=int(item["order"]),
-            name=str(item["name"]),
-            nominal_duration_s=float(item["nominal_duration_s"]),
-            duration_scale_s=float(item["duration_scale_s"]),
-            plausible_duration_s=_as_float_pair(
-                item["plausible_duration_s"], "plausible_duration_s"
+            stage_id=stage_id,
+            order=raw_order,
+            name=stage_name,
+            nominal_duration_s=_as_yaml_number(
+                item.get("nominal_duration_s"), "nominal_duration_s"
             ),
-            nominal_gap_before_s=float(item["nominal_gap_before_s"]),
-            gap_scale_s=float(item["gap_scale_s"]),
+            duration_scale_s=_as_yaml_number(
+                item.get("duration_scale_s"), "duration_scale_s"
+            ),
+            plausible_duration_s=_as_float_pair(
+                item.get("plausible_duration_s"), "plausible_duration_s"
+            ),
+            nominal_gap_before_s=_as_yaml_number(
+                item.get("nominal_gap_before_s"), "nominal_gap_before_s"
+            ),
+            gap_scale_s=_as_yaml_number(
+                item.get("gap_scale_s"), "gap_scale_s"
+            ),
             plausible_gap_before_s=_as_float_pair(
-                item["plausible_gap_before_s"], "plausible_gap_before_s"
+                item.get("plausible_gap_before_s"), "plausible_gap_before_s"
             ),
         )
-        if stage.nominal_duration_s <= 0 or stage.duration_scale_s <= 0:
+        if (
+            not math.isfinite(stage.nominal_duration_s)
+            or not math.isfinite(stage.duration_scale_s)
+            or stage.nominal_duration_s <= 0
+            or stage.duration_scale_s <= 0
+        ):
             raise ProtocolConfigError(f"invalid duration prior for {stage.stage_id}")
-        if stage.nominal_gap_before_s < 0 or stage.gap_scale_s <= 0:
+        if (
+            not math.isfinite(stage.nominal_gap_before_s)
+            or not math.isfinite(stage.gap_scale_s)
+            or stage.nominal_gap_before_s < 0
+            or stage.gap_scale_s <= 0
+        ):
             raise ProtocolConfigError(f"invalid gap prior for {stage.stage_id}")
         stages.append(stage)
     stages.sort(key=lambda stage: stage.order)
@@ -323,56 +489,257 @@ def load_protocol_config(path: str | Path) -> AcquisitionProtocolConfig:
     if tuple(stage.order for stage in stages) != tuple(range(1, 8)):
         raise ProtocolConfigError("stage order values must be 1 through 7")
 
-    decoder_doc = document.get("decoder", {})
-    confidence_doc = decoder_doc.get("confidence", {})
-    source_weights = {
-        str(key): float(value) for key, value in decoder_doc.get("source_weights", {}).items()
-    }
+    decoder_doc = document.get("decoder")
+    if not isinstance(decoder_doc, Mapping):
+        raise ProtocolConfigError("decoder must be a mapping")
+    _require_exact_keys(
+        decoder_doc,
+        {
+            "candidate_grid_step_s",
+            "marker_match_sigma_s",
+            "duration_penalty_weight",
+            "gap_penalty_weight",
+            "plausible_range_penalty_weight",
+            "manual_boundaries_are_locked",
+            "minimum_stage_duration_s",
+            "confidence",
+            "source_weights",
+        },
+        "decoder",
+    )
+    confidence_doc = decoder_doc.get("confidence")
+    if not isinstance(confidence_doc, Mapping):
+        raise ProtocolConfigError("decoder.confidence must be a mapping")
+    _require_exact_keys(
+        confidence_doc,
+        {
+            "auto_threshold",
+            "review_threshold",
+            "manual_boundary",
+            "prior_only_boundary",
+        },
+        "decoder.confidence",
+    )
+    source_weights_doc = decoder_doc.get("source_weights")
+    if not isinstance(source_weights_doc, Mapping) or not source_weights_doc:
+        raise ProtocolConfigError("decoder.source_weights must be a non-empty mapping")
+    _require_exact_keys(
+        source_weights_doc,
+        {
+            "radar_marker",
+            "radar_motion",
+            "biopac_marker",
+            "fused_marker",
+            "unknown",
+        },
+        "decoder.source_weights",
+    )
+    source_weights: dict[str, float] = {}
+    for key, value in source_weights_doc.items():
+        if not isinstance(key, str) or not key:
+            raise ProtocolConfigError(
+                "decoder.source_weights keys must be non-empty YAML strings"
+            )
+        source_weights[key] = _as_yaml_number(
+            value, f"decoder.source_weights.{key}"
+        )
+    manual_locked = decoder_doc.get("manual_boundaries_are_locked")
+    if type(manual_locked) is not bool:
+        raise ProtocolConfigError(
+            "manual_boundaries_are_locked must be a YAML boolean"
+        )
     decoder = DecoderSpec(
-        candidate_grid_step_s=float(decoder_doc["candidate_grid_step_s"]),
-        marker_match_sigma_s=float(decoder_doc["marker_match_sigma_s"]),
-        duration_penalty_weight=float(decoder_doc["duration_penalty_weight"]),
-        gap_penalty_weight=float(decoder_doc["gap_penalty_weight"]),
-        plausible_range_penalty_weight=float(decoder_doc["plausible_range_penalty_weight"]),
-        manual_boundaries_are_locked=bool(decoder_doc["manual_boundaries_are_locked"]),
-        minimum_stage_duration_s=float(decoder_doc["minimum_stage_duration_s"]),
-        auto_threshold=float(confidence_doc["auto_threshold"]),
-        review_threshold=float(confidence_doc["review_threshold"]),
-        manual_boundary_confidence=float(confidence_doc["manual_boundary"]),
-        prior_only_boundary_confidence=float(confidence_doc["prior_only_boundary"]),
+        candidate_grid_step_s=_as_yaml_number(
+            decoder_doc.get("candidate_grid_step_s"),
+            "decoder.candidate_grid_step_s",
+        ),
+        marker_match_sigma_s=_as_yaml_number(
+            decoder_doc.get("marker_match_sigma_s"),
+            "decoder.marker_match_sigma_s",
+        ),
+        duration_penalty_weight=_as_yaml_number(
+            decoder_doc.get("duration_penalty_weight"),
+            "decoder.duration_penalty_weight",
+        ),
+        gap_penalty_weight=_as_yaml_number(
+            decoder_doc.get("gap_penalty_weight"),
+            "decoder.gap_penalty_weight",
+        ),
+        plausible_range_penalty_weight=_as_yaml_number(
+            decoder_doc.get("plausible_range_penalty_weight"),
+            "decoder.plausible_range_penalty_weight",
+        ),
+        manual_boundaries_are_locked=manual_locked,
+        minimum_stage_duration_s=_as_yaml_number(
+            decoder_doc.get("minimum_stage_duration_s"),
+            "decoder.minimum_stage_duration_s",
+        ),
+        auto_threshold=_as_yaml_number(
+            confidence_doc.get("auto_threshold"),
+            "decoder.confidence.auto_threshold",
+        ),
+        review_threshold=_as_yaml_number(
+            confidence_doc.get("review_threshold"),
+            "decoder.confidence.review_threshold",
+        ),
+        manual_boundary_confidence=_as_yaml_number(
+            confidence_doc.get("manual_boundary"),
+            "decoder.confidence.manual_boundary",
+        ),
+        prior_only_boundary_confidence=_as_yaml_number(
+            confidence_doc.get("prior_only_boundary"),
+            "decoder.confidence.prior_only_boundary",
+        ),
         source_weights=source_weights,
     )
+    decoder_numeric = (
+        decoder.candidate_grid_step_s,
+        decoder.marker_match_sigma_s,
+        decoder.duration_penalty_weight,
+        decoder.gap_penalty_weight,
+        decoder.plausible_range_penalty_weight,
+        decoder.minimum_stage_duration_s,
+        decoder.auto_threshold,
+        decoder.review_threshold,
+        decoder.manual_boundary_confidence,
+        decoder.prior_only_boundary_confidence,
+        *decoder.source_weights.values(),
+    )
+    if not all(math.isfinite(value) for value in decoder_numeric):
+        raise ProtocolConfigError("decoder numeric settings must be finite")
     if decoder.candidate_grid_step_s <= 0 or decoder.marker_match_sigma_s <= 0:
         raise ProtocolConfigError("decoder grid and marker sigma must be positive")
+    if (
+        decoder.duration_penalty_weight < 0
+        or decoder.gap_penalty_weight < 0
+        or decoder.plausible_range_penalty_weight < 0
+        or decoder.minimum_stage_duration_s <= 0
+        or any(value < 0 for value in decoder.source_weights.values())
+    ):
+        raise ProtocolConfigError("decoder penalties/weights are outside valid ranges")
     if not 0 <= decoder.review_threshold <= decoder.auto_threshold <= 1:
         raise ProtocolConfigError("confidence thresholds must satisfy 0 <= review <= auto <= 1")
+    if not (
+        0 <= decoder.manual_boundary_confidence <= 1
+        and 0 <= decoder.prior_only_boundary_confidence <= 1
+    ):
+        raise ProtocolConfigError("boundary confidence values must be in [0,1]")
 
-    window_doc = document.get("window_assignment", {})
-    window_assignment = WindowAssignmentSpec(
-        minimum_overlap_fraction=float(window_doc["minimum_overlap_fraction"]),
-        transition_guard_s=float(window_doc["transition_guard_s"]),
+    window_doc = document.get("window_assignment")
+    if not isinstance(window_doc, Mapping):
+        raise ProtocolConfigError("window_assignment must be a mapping")
+    _require_exact_keys(
+        window_doc,
+        {"minimum_overlap_fraction", "transition_guard_s"},
+        "window_assignment",
     )
-    if not 0 < window_assignment.minimum_overlap_fraction <= 1:
+    window_assignment = WindowAssignmentSpec(
+        minimum_overlap_fraction=_as_yaml_number(
+            window_doc.get("minimum_overlap_fraction"),
+            "window_assignment.minimum_overlap_fraction",
+        ),
+        transition_guard_s=_as_yaml_number(
+            window_doc.get("transition_guard_s"),
+            "window_assignment.transition_guard_s",
+        ),
+    )
+    if not math.isfinite(window_assignment.minimum_overlap_fraction) or not (
+        0 < window_assignment.minimum_overlap_fraction <= 1
+    ):
         raise ProtocolConfigError("minimum_overlap_fraction must be in (0, 1]")
-    if window_assignment.transition_guard_s < 0:
+    if (
+        not math.isfinite(window_assignment.transition_guard_s)
+        or window_assignment.transition_guard_s < 0
+    ):
         raise ProtocolConfigError("transition_guard_s must be nonnegative")
 
-    fall_doc = document.get("fall_protocol", {})
-    annotation_contract = document.get("annotation_contract", {})
+    fall_doc = document.get("fall_protocol")
+    if not isinstance(fall_doc, Mapping):
+        raise ProtocolConfigError("fall_protocol must be a mapping")
+    _require_exact_keys(
+        fall_doc,
+        {"v2_candidate_from_session", "v1_id", "v2_id"},
+        "fall_protocol",
+    )
+    v2_candidate_from_session = fall_doc.get("v2_candidate_from_session")
+    if type(v2_candidate_from_session) is not int or v2_candidate_from_session < 1:
+        raise ProtocolConfigError(
+            "fall_protocol.v2_candidate_from_session must be a positive YAML integer"
+        )
+    fall_v1_id = fall_doc.get("v1_id")
+    fall_v2_id = fall_doc.get("v2_id")
+    if (
+        not isinstance(fall_v1_id, str)
+        or not fall_v1_id
+        or not isinstance(fall_v2_id, str)
+        or not fall_v2_id
+        or fall_v1_id == fall_v2_id
+    ):
+        raise ProtocolConfigError(
+            "fall protocol IDs must be distinct non-empty YAML strings"
+        )
+    annotation_contract = document.get("annotation_contract")
+    if not isinstance(annotation_contract, Mapping):
+        raise ProtocolConfigError("annotation_contract must be a mapping")
+    _require_exact_keys(
+        annotation_contract,
+        {
+            "purpose",
+            "inference_feature_allowed",
+            "biopac_derived_annotation",
+            "phase7_assignment",
+        },
+        "annotation_contract",
+    )
+    if annotation_contract.get("purpose") != ANNOTATION_USAGE_CONTRACT["purpose"]:
+        raise ProtocolConfigError("annotation_contract purpose is not canonical")
     if annotation_contract.get("inference_feature_allowed") is not False:
         raise ProtocolConfigError("offline annotations must be forbidden as inference features")
-    biopac_contract = annotation_contract.get("biopac_derived_annotation", {})
+    biopac_contract = annotation_contract.get("biopac_derived_annotation")
+    if not isinstance(biopac_contract, Mapping):
+        raise ProtocolConfigError(
+            "annotation_contract.biopac_derived_annotation must be a mapping"
+        )
+    _require_exact_keys(
+        biopac_contract,
+        {"inference_feature_allowed", "permitted_uses"},
+        "annotation_contract.biopac_derived_annotation",
+    )
     if biopac_contract.get("inference_feature_allowed") is not False:
         raise ProtocolConfigError("BIOPAC-derived annotations must be forbidden at inference")
+    permitted_uses = biopac_contract.get("permitted_uses")
+    expected_permitted_uses = ANNOTATION_USAGE_CONTRACT[
+        "biopac_derived_annotation"
+    ]["permitted_uses"]
+    if not isinstance(permitted_uses, list) or tuple(permitted_uses) != tuple(
+        expected_permitted_uses
+    ):
+        raise ProtocolConfigError("BIOPAC annotation permitted uses are not canonical")
+    phase7_contract = annotation_contract.get("phase7_assignment")
+    if not isinstance(phase7_contract, Mapping):
+        raise ProtocolConfigError(
+            "annotation_contract.phase7_assignment must be a mapping"
+        )
+    _require_exact_keys(
+        phase7_contract,
+        {"inference_feature_allowed", "semantics"},
+        "annotation_contract.phase7_assignment",
+    )
+    if (
+        phase7_contract.get("inference_feature_allowed") is not False
+        or phase7_contract.get("semantics")
+        != ANNOTATION_USAGE_CONTRACT["phase7_assignment"]["semantics"]
+    ):
+        raise ProtocolConfigError("phase7 assignment annotation is not canonical")
     return AcquisitionProtocolConfig(
         schema_version=SCHEMA_VERSION,
-        time_basis=str(document.get("time_basis", "seconds_from_radar_start")),
+        time_basis="seconds_from_biopac_start",
         stages=tuple(stages),
         decoder=decoder,
         window_assignment=window_assignment,
-        v2_candidate_from_session=int(fall_doc["v2_candidate_from_session"]),
-        fall_v1_id=str(fall_doc["v1_id"]),
-        fall_v2_id=str(fall_doc["v2_id"]),
+        v2_candidate_from_session=v2_candidate_from_session,
+        fall_v1_id=fall_v1_id,
+        fall_v2_id=fall_v2_id,
         annotation_contract=annotation_contract,
     )
 
@@ -696,11 +1063,23 @@ def _physical_identity(session_id: str, reported_label: str | None) -> str | Non
         return reported_label
 
 
+def _exact_spreadsheet_session_number(value: Any, worksheet_row: int) -> int:
+    """Validate the physical-session selector without numeric coercion."""
+
+    if type(value) is not int or value <= 0:
+        raise ValueError(
+            "acquisition spreadsheet session number must be a positive "
+            f"exact integer at worksheet row {worksheet_row}: {value!r}"
+        )
+    return value
+
+
 def load_dataset_issue_records(
     workbook_path: str | Path,
     *,
     config: AcquisitionProtocolConfig,
     dataset_root: str | Path | None = None,
+    expected_sha256: str | None = None,
 ) -> tuple[SessionProtocolRecord, ...]:
     """Read all session rows in ``Dataset_issue.xlsx`` without writing it.
 
@@ -713,7 +1092,14 @@ def load_dataset_issue_records(
     path = Path(workbook_path)
     root = Path(dataset_root) if dataset_root is not None else path.parent
     session_dirs = _session_directories(root)
-    workbook = load_workbook(path, read_only=True, data_only=True)
+    workbook_payload, _ = _source_snapshot(
+        path,
+        label="dataset issue spreadsheet",
+        expected_sha256=expected_sha256,
+    )
+    workbook = load_workbook(
+        io.BytesIO(workbook_payload), read_only=True, data_only=True
+    )
     try:
         worksheet = workbook[workbook.sheetnames[0]]
         rows = worksheet.iter_rows(values_only=True)
@@ -731,15 +1117,20 @@ def load_dataset_issue_records(
 
         records: list[SessionProtocolRecord] = []
         current_date: date | datetime | str | None = None
-        for row in rows:
+        for worksheet_row, row in enumerate(rows, start=2):
             values = list(row) + [None] * max(0, 17 - len(row))
             session_number_raw = values[3]
             if session_number_raw is None:
                 continue
-            try:
-                session_number = int(session_number_raw)
-            except (TypeError, ValueError):
-                continue
+            # Session number selects the physical source directory and thereby
+            # its identity, protocol annotations, and later evaluation roles.
+            # Excel booleans are integers in Python and ``int(1.5)`` truncates;
+            # accepting either would silently attach one participant's row to
+            # another session.  Blank rows remain skippable, but any populated
+            # non-canonical identifier invalidates the workbook.
+            session_number = _exact_spreadsheet_session_number(
+                session_number_raw, worksheet_row
+            )
             if values[0] is not None:
                 current_date = values[0]
             if isinstance(current_date, (date, datetime)):

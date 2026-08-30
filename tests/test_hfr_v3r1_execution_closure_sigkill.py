@@ -295,7 +295,7 @@ def test_sigkill_wrapper_terminal_boundaries_replay_without_new_science(
         ("trainer_atomic_after_replace_before_directory_fsync", True),
     ],
 )
-def test_sigkill_trainer_named_temp_retry_is_exact(
+def test_sigkill_trainer_named_temp_is_quarantined_or_committed(
     tmp_path: Path, point: str, final_exists: bool
 ) -> None:
     output = tmp_path / "last.pt"
@@ -322,9 +322,13 @@ def test_sigkill_trainer_named_temp_retry_is_exact(
         ]
         assert len(temporaries) == 1
         _assert_immutable_single_link(temporaries[0])
-        assert trainer.cleanup_stale_atomic_temporaries(tmp_path) == (
-            temporaries[0].name,
-        )
+        with pytest.raises(RuntimeError, match="explicit quarantine"):
+            trainer.cleanup_stale_atomic_temporaries(tmp_path)
+        # A filename and mode are not an ownership capability.  The next
+        # invocation must stop without deleting or replacing the residue.
+        _assert_immutable_single_link(temporaries[0])
+        assert not output.exists()
+        return
     trainer._atomic_publish_immutable(
         output,
         lambda descriptor: trainer._write_all(descriptor, payload),

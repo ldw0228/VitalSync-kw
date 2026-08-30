@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import secrets
+import stat
 import sys
-import tempfile
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -35,7 +38,14 @@ from snn_rr.harmonic_set_data import (  # noqa: E402
     CandidateSource,
     candidate_bank_from_metadata,
     iter_compact_node_feature_batches,
+    resolve_joint_radar_mask,
     semantic_row_binding_sha256,
+)
+from snn_rr.harmonic_feature_layout_v3r1 import (  # noqa: E402
+    EXPECTED_FEATURE_NAMES_SEMANTIC_SHA256,
+    FEATURE_LAYOUT_SEMANTIC_SHA256,
+    TOTAL_FEATURE_WIDTH,
+    validate_ordered_feature_names,
 )
 
 
@@ -51,11 +61,29 @@ DEFAULT_FOLDS = (
     / "artifacts/runs/final_alias_gate_s12_deterministic/fold_assignments.json"
 )
 DEFAULT_OUTPUT = PROJECT_ROOT / "artifacts/cache/harmonic_set_v2"
-FORMAT_VERSION = 1
+# Version 2 adds a mandatory per-feature structural-availability tensor and
+# exact output inventory.  Reusing version 1 here would let old consumers
+# silently interpret two incompatible cache contracts as the same schema.
+FORMAT_VERSION = 2
+SCHEMA_ID = "snn_rr.harmonic_candidate_cache.v2"
 MAX_CANDIDATES = 12
 TOPK_PROPOSALS = 5
 POSTERIOR_GRID_KEYS = ("posterior_rr_grid_bpm", "posterior_rr_bins_bpm")
 BASE_PROPOSAL_CHOICES = ("none", "expected", "map", "expected-map")
+ACQUISITION_V2_SCHEMA = "snn_rr.feature_cache_acquisition.v2"
+
+RF_TIMING_MASK_CONTRACT = {
+    "mask_required_for_gap_tolerant_consumers": True,
+    "scientific_cache_requires_all_true": True,
+    "diagnostic_cache_trainable": False,
+    "invalid_cells_are_exact_zero_but_not_semantic_measurements": True,
+}
+SVD_TIMING_MASK_CONTRACT = {
+    "mask_required_for_gap_tolerant_consumers": True,
+    "scientific_source_requires_all_true": True,
+    "diagnostic_output_trainable": False,
+    "invalid_cells_are_exact_zero_but_not_semantic_measurements": True,
+}
 
 ARRAY_FILES = {
     "node_features": "node_features.npy",
@@ -68,6 +96,198 @@ ARRAY_FILES = {
     "rf_support_count": "rf_support_count.npy",
     "svd_support_count": "svd_support_count.npy",
 }
+NODE_FEATURE_AVAILABILITY_FILE = "node_feature_availability.npy"
+_HARMONIC_RATIO_TOKENS = ("r1_4", "r1_3", "r1_2", "r1", "r2", "r3", "r4")
+_FICLONE = 0x40049409
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def _clear_private_directory_fd(descriptor: int) -> None:
+    for name in os.listdir(descriptor):
+        details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(details.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                _clear_private_directory_fd(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+    os.fsync(descriptor)
+
+
+@dataclass(slots=True)
+class _StablePrivateDirectory:
+    """Private tree with fd/inode cleanup across parent path rebinding."""
+
+    path: Path
+    parent_path: Path
+    name: str
+    parent_descriptor: int
+    root_descriptor: int
+    root_device: int
+    root_inode: int
+    published: bool = False
+    cleaned: bool = False
+
+    @classmethod
+    def create(cls, parent: Path, *, prefix: str) -> _StablePrivateDirectory:
+        parent_path = parent.expanduser().resolve()
+        parent_path.mkdir(parents=True, exist_ok=True)
+        parent_descriptor = os.open(
+            parent_path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        name = ""
+        created_by_this_call = False
+        root_descriptor = -1
+        try:
+            for _ in range(128):
+                name = f"{prefix}{secrets.token_hex(16)}"
+                try:
+                    os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+                except FileExistsError:
+                    continue
+                created_by_this_call = True
+                break
+            else:
+                raise RuntimeError("cannot allocate private harmonic directory")
+            root_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            details = os.fstat(root_descriptor)
+            return cls(
+                path=parent_path / name,
+                parent_path=parent_path,
+                name=name,
+                parent_descriptor=parent_descriptor,
+                root_descriptor=root_descriptor,
+                root_device=details.st_dev,
+                root_inode=details.st_ino,
+            )
+        except BaseException:
+            if root_descriptor >= 0:
+                os.close(root_descriptor)
+            if created_by_this_call:
+                try:
+                    os.rmdir(name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            os.close(parent_descriptor)
+            raise
+
+    def assert_parent_path_current(self) -> None:
+        captured = os.fstat(self.parent_descriptor)
+        current = self.parent_path.stat()
+        if not (
+            stat.S_ISDIR(captured.st_mode)
+            and stat.S_ISDIR(current.st_mode)
+            and captured.st_dev == current.st_dev
+            and captured.st_ino == current.st_ino
+        ):
+            raise RuntimeError("harmonic output parent changed during build")
+
+    def mark_published(self) -> None:
+        self.published = True
+        os.close(self.root_descriptor)
+        os.close(self.parent_descriptor)
+        self.cleaned = True
+
+    def cleanup(self) -> None:
+        if self.cleaned:
+            return
+        cleanup_error: BaseException | None = None
+        try:
+            if self.published:
+                return
+            details = os.fstat(self.root_descriptor)
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or details.st_dev != self.root_device
+                or details.st_ino != self.root_inode
+            ):
+                raise RuntimeError("private harmonic directory identity changed")
+            _clear_private_directory_fd(self.root_descriptor)
+        except BaseException as error:
+            cleanup_error = error
+        removed = False
+        try:
+            candidates = [self.name]
+            candidates.extend(
+                name for name in os.listdir(self.parent_descriptor) if name != self.name
+            )
+            for name in candidates:
+                try:
+                    details = os.stat(
+                        name,
+                        dir_fd=self.parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                if (
+                    stat.S_ISDIR(details.st_mode)
+                    and details.st_dev == self.root_device
+                    and details.st_ino == self.root_inode
+                ):
+                    os.rmdir(name, dir_fd=self.parent_descriptor)
+                    removed = True
+                    break
+            if not removed and cleanup_error is None:
+                removed = True
+            os.fsync(self.parent_descriptor)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        finally:
+            try:
+                os.close(self.root_descriptor)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            try:
+                os.close(self.parent_descriptor)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        self.cleaned = cleanup_error is None and removed
+        if cleanup_error is not None:
+            raise RuntimeError("private harmonic directory cleanup failed") from cleanup_error
+
+
+@dataclass(slots=True)
+class _BoundInputSnapshot:
+    """Private COW/stream copies of every file consumed by one build."""
+
+    temporary: _StablePrivateDirectory
+    rf_cache: Path
+    svd_cache: Path
+    proposer: Path
+    folds: Path
+    bindings: dict[str, dict[str, Any]]
+
+    def assert_private_bytes_current(self) -> None:
+        for relative, expected in self.bindings.items():
+            path = self.temporary.path / relative
+            observed = _file_binding(path)
+            if (
+                observed["sha256"] != expected["sha256"]
+                or observed["bytes"] != expected["bytes"]
+            ):
+                raise RuntimeError(
+                    f"private harmonic input snapshot changed during build: {relative}"
+                )
+
+    def cleanup(self) -> None:
+        self.temporary.cleanup()
 
 
 def sha256_file(path: Path) -> str:
@@ -87,6 +307,259 @@ def _file_binding(path: Path) -> dict[str, Any]:
         "sha256": sha256_file(resolved),
         "bytes": resolved.stat().st_size,
     }
+
+
+def _capture_direct_entry_disk_binding(path: Path) -> dict[str, Any]:
+    """Capture stable direct-entry source bytes during module initialization.
+
+    This is not a claim about the bytes already compiled by the loader.
+    Complete executed-code closure requires a fresh isolated child importing
+    every dependency exclusively from one private source snapshot.
+    """
+
+    resolved = path.expanduser().resolve()
+    digest = hashlib.sha256()
+    try:
+        with resolved.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            consumed = 0
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                consumed += len(chunk)
+            after = os.fstat(stream.fileno())
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot capture direct builder import generation: {resolved}"
+        ) from error
+    if not (
+        stat.S_ISREG(before.st_mode)
+        and before.st_dev == after.st_dev
+        and before.st_ino == after.st_ino
+        and before.st_size == after.st_size == consumed
+        and before.st_mtime_ns == after.st_mtime_ns
+        and before.st_ctime_ns == after.st_ctime_ns
+    ):
+        raise RuntimeError(
+            f"direct builder source changed while its generation was captured: {resolved}"
+        )
+    return {"path": str(resolved), "sha256": digest.hexdigest(), "bytes": consumed}
+
+
+_DIRECT_ENTRY_DISK_BINDING = _capture_direct_entry_disk_binding(Path(__file__))
+
+
+def _assert_direct_entry_disk_binding_current(
+    expected: Mapping[str, Any] = _DIRECT_ENTRY_DISK_BINDING,
+) -> dict[str, Any]:
+    observed = _capture_direct_entry_disk_binding(
+        Path(str(expected.get("path", "")))
+    )
+    if observed != dict(expected):
+        raise RuntimeError(
+            "direct harmonic builder source changed since its initialization-time "
+            "disk binding; "
+            "a fresh isolated private-source process is required"
+        )
+    return observed
+
+
+def _copy_bound_regular_file(
+    source_path: Path,
+    destination: Path,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create an exact private snapshot and prove it matches ``expected``.
+
+    Linux reflink is attempted first so multi-gigabyte arrays remain practical;
+    its copy-on-write inode is an instantaneous byte snapshot.  Filesystems
+    without reflink use a bounded-memory streaming copy.  Both paths hash the
+    destination and require stable source-inode metadata across the operation.
+    """
+
+    source = source_path.expanduser().resolve()
+    if set(expected) != {"path", "sha256", "bytes"}:
+        raise RuntimeError(f"input binding schema is invalid: {source}")
+    if expected.get("path") != str(source):
+        raise RuntimeError(f"input binding path mismatch: {source}")
+    expected_hash = expected.get("sha256")
+    expected_bytes = expected.get("bytes")
+    if (
+        not isinstance(expected_hash, str)
+        or len(expected_hash) != 64
+        or type(expected_bytes) is not int
+        or expected_bytes < 0
+    ):
+        raise RuntimeError(f"input binding value is invalid: {source}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        with source.open("rb") as source_stream, destination.open("x+b") as target:
+            before = os.fstat(source_stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise RuntimeError(f"harmonic input is not a regular file: {source}")
+            cloned = False
+            try:
+                fcntl.ioctl(target.fileno(), _FICLONE, source_stream.fileno())
+                cloned = True
+            except OSError:
+                target.seek(0)
+                target.truncate(0)
+                source_stream.seek(0)
+                digest = hashlib.sha256()
+                copied = 0
+                while chunk := source_stream.read(4 * 1024 * 1024):
+                    target.write(chunk)
+                    digest.update(chunk)
+                    copied += len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+            if cloned:
+                target.seek(0)
+                digest = hashlib.sha256()
+                copied = 0
+                while chunk := target.read(4 * 1024 * 1024):
+                    digest.update(chunk)
+                    copied += len(chunk)
+            after = os.fstat(source_stream.fileno())
+            if not (
+                before.st_dev == after.st_dev
+                and before.st_ino == after.st_ino
+                and before.st_size == after.st_size
+                and before.st_mtime_ns == after.st_mtime_ns
+                and before.st_ctime_ns == after.st_ctime_ns
+                and copied == after.st_size
+            ):
+                raise RuntimeError(
+                    f"harmonic input changed while being snapshotted: {source}"
+                )
+            observed_hash = digest.hexdigest()
+            if copied != expected_bytes or observed_hash != expected_hash:
+                raise RuntimeError(
+                    f"harmonic input snapshot differs from bound bytes: {source}"
+                )
+            os.fchmod(target.fileno(), 0o400)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return {"path": str(destination), "sha256": observed_hash, "bytes": copied}
+
+
+def _materialize_bound_input_snapshot(
+    *,
+    rf_cache: Path,
+    svd_cache: Path,
+    proposer_path: Path,
+    folds_path: Path,
+    sessions: Sequence[str],
+    input_bindings: Mapping[str, Any],
+    parent: Path,
+) -> _BoundInputSnapshot:
+    """Copy every subsequently parsed/mapped data input into a private tree."""
+
+    temporary = _StablePrivateDirectory.create(
+        parent,
+        prefix=".harmonic-input-snapshot.",
+    )
+    root = temporary.path
+    snapshot_bindings: dict[str, dict[str, Any]] = {}
+
+    def copy(
+        source: Path, relative: Path, expected: Mapping[str, Any]
+    ) -> Path:
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise RuntimeError(f"unsafe harmonic snapshot path: {relative}")
+        destination = (root / relative).resolve()
+        try:
+            destination.relative_to(root.resolve())
+        except ValueError as error:
+            raise RuntimeError(
+                f"harmonic snapshot path escapes private root: {relative}"
+            ) from error
+        observed = _copy_bound_regular_file(source, destination, expected)
+        snapshot_bindings[str(relative)] = observed
+        return destination
+
+    try:
+        for session_id in sessions:
+            _validate_safe_session_id(session_id, "harmonic input")
+        copy(
+            rf_cache / "manifest.json",
+            Path("rf/manifest.json"),
+            input_bindings["rf_root_manifest"],
+        )
+        copy(
+            svd_cache / "manifest.json",
+            Path("svd/manifest.json"),
+            input_bindings["svd_root_manifest"],
+        )
+        snapshot_proposer = copy(
+            proposer_path, Path("proposer/input.npz"), input_bindings["proposer"]
+        )
+        snapshot_folds = copy(
+            folds_path, Path("folds/input.json"), input_bindings["fold_assignments"]
+        )
+        session_bindings = input_bindings.get("sessions")
+        if not isinstance(session_bindings, Mapping) or set(session_bindings) != set(
+            sessions
+        ):
+            raise RuntimeError("harmonic session input binding inventory is invalid")
+        for session_id in sessions:
+            bound = session_bindings[session_id]
+            if not isinstance(bound, Mapping):
+                raise RuntimeError(f"harmonic session binding is invalid: {session_id}")
+            for side, cache_root in (("rf", rf_cache), ("svd", svd_cache)):
+                session_root = (cache_root / session_id).resolve()
+                try:
+                    session_root.relative_to(cache_root.resolve())
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"harmonic {side} session path escapes cache root: {session_id}"
+                    ) from error
+                side_bindings = bound.get(side)
+                if not isinstance(side_bindings, Mapping):
+                    raise RuntimeError(
+                        f"harmonic {side} session binding is invalid: {session_id}"
+                    )
+                for binding in side_bindings.values():
+                    if not isinstance(binding, Mapping):
+                        raise RuntimeError(
+                            f"harmonic {side} file binding is invalid: {session_id}"
+                        )
+                    original = Path(str(binding.get("path", ""))).resolve()
+                    try:
+                        relative_name = original.relative_to(
+                            session_root
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(
+                            f"harmonic {side} binding escapes session root: {session_id}"
+                        ) from error
+                    if len(relative_name.parts) != 1:
+                        raise RuntimeError(
+                            f"harmonic {side} binding has nested payload path: {session_id}"
+                        )
+                    copy(
+                        original,
+                        Path(side) / session_id / relative_name,
+                        binding,
+                    )
+        result = _BoundInputSnapshot(
+            temporary=temporary,
+            rf_cache=root / "rf",
+            svd_cache=root / "svd",
+            proposer=snapshot_proposer,
+            folds=snapshot_folds,
+            bindings=snapshot_bindings,
+        )
+        result.assert_private_bytes_current()
+        return result
+    except BaseException:
+        temporary.cleanup()
+        raise
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -130,13 +603,29 @@ def _successful_sessions(manifest: Mapping[str, Any], label: str) -> list[str]:
         if not isinstance(entry, Mapping):
             raise RuntimeError(f"{label} manifest session entry is invalid")
         if entry.get("status", "ok") == "ok":
-            session_id = str(entry.get("session_id", ""))
-            if not session_id:
-                raise RuntimeError(f"{label} manifest has an empty session_id")
+            session_id = _validate_safe_session_id(
+                entry.get("session_id"), label
+            )
             result.append(session_id)
     if not result or len(set(result)) != len(result):
         raise RuntimeError(f"{label} successful session order is invalid")
     return result
+
+
+def _validate_safe_session_id(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{label} manifest has an invalid session_id")
+    session_path = Path(value)
+    if (
+        session_path.is_absolute()
+        or len(session_path.parts) != 1
+        or session_path.name != value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+    ):
+        raise RuntimeError(f"{label} manifest has an unsafe session_id: {value!r}")
+    return value
 
 
 def _fold_map(path: Path) -> dict[str, int]:
@@ -586,6 +1075,8 @@ def proposer_candidate_node_features(
     bundle: ProposalBundle,
     candidates: Any,
     row_selector: slice | np.ndarray,
+    *,
+    row_available: np.ndarray | None = None,
 ) -> tuple[np.ndarray, tuple[str, ...]]:
     """Bind full-posterior deployment descriptors to the final sorted anchors."""
 
@@ -613,7 +1104,17 @@ def proposer_candidate_node_features(
     alias = np.asarray(bundle.alias_probability)[row_selector]
     spike = np.asarray(bundle.spike_rate)[row_selector]
     radar_weights = np.asarray(bundle.radar_weights)[row_selector]
-    availability = np.asarray(bundle.availability)[row_selector]
+    upstream_availability = np.asarray(bundle.availability)[row_selector]
+    if row_available is None:
+        availability = upstream_availability
+    else:
+        availability = np.asarray(row_available)
+        if (
+            availability.dtype != np.bool_
+            or availability.shape != upstream_availability.shape
+            or np.any(availability & ~upstream_availability)
+        ):
+            raise RuntimeError("effective proposer row availability is invalid")
     direct_rr = np.asarray(bundle.direct_bpm)[row_selector]
     direct_confidence = np.asarray(bundle.direct_confidence)[row_selector]
     direct_mask = np.asarray(bundle.direct_mask)[row_selector]
@@ -733,18 +1234,418 @@ def _validate_root_manifests(
     return rf, svd, rf_sessions
 
 
+def _acquisition_v2_root_contract(
+    rf_manifest: Mapping[str, Any], svd_manifest: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Return the common acquisition-v2 contract or fail closed on a mixed pair."""
+
+    rf_contract = rf_manifest.get("acquisition_contract")
+    svd_contract = svd_manifest.get("canonical_acquisition_contract")
+    rf_v2 = (
+        isinstance(rf_contract, Mapping)
+        and rf_contract.get("schema_version") == ACQUISITION_V2_SCHEMA
+    )
+    svd_v2 = (
+        isinstance(svd_contract, Mapping)
+        and svd_contract.get("schema_version") == ACQUISITION_V2_SCHEMA
+    )
+    if not rf_v2 and not svd_v2:
+        return None
+    if not rf_v2 or not svd_v2:
+        raise RuntimeError(
+            "RF/SVD acquisition-v2 root contract presence differs"
+        )
+    if dict(rf_contract) != dict(svd_contract):
+        raise RuntimeError("RF/SVD acquisition-v2 root contracts differ")
+    mode = rf_contract.get("mode")
+    if mode not in {"strict", "diagnostic"}:
+        raise RuntimeError("acquisition-v2 root mode is invalid")
+    if type(rf_contract.get("scientific_eligible")) is not bool:
+        raise RuntimeError("acquisition-v2 scientific eligibility is invalid")
+    if mode == "diagnostic" and rf_contract.get("scientific_eligible") is not False:
+        raise RuntimeError("diagnostic acquisition-v2 input claims scientific eligibility")
+    return dict(rf_contract)
+
+
+def _load_bound_timing_mask(
+    session_dir: Path,
+    manifest: Mapping[str, Any],
+    *,
+    rows: int,
+    label: str,
+    expected_contract: Mapping[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Load one manifest-bound ``[row,view,interval]`` structural mask."""
+
+    if manifest.get("content_sha256") != _canonical_digest(
+        manifest, exclude="content_sha256"
+    ):
+        raise RuntimeError(f"{label} acquisition-v2 session manifest hash mismatch")
+    inventory = manifest.get("file_inventory")
+    if not isinstance(inventory, Mapping):
+        raise RuntimeError(f"{label} acquisition-v2 file inventory is missing")
+    if manifest.get("inventory_sha256") != _canonical_digest(inventory):
+        raise RuntimeError(f"{label} acquisition-v2 file inventory hash mismatch")
+    declared = inventory.get("radar_timing_valid_mask")
+    if not isinstance(declared, Mapping):
+        raise RuntimeError(f"{label} acquisition-v2 radar timing mask is missing")
+    if declared.get("path") != "radar_timing_valid_mask.npy":
+        raise RuntimeError(f"{label} acquisition-v2 radar timing mask path is invalid")
+    path = session_dir / "radar_timing_valid_mask.npy"
+    try:
+        binding = _file_binding(path)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"{label} acquisition-v2 radar timing mask file is missing"
+        ) from exc
+    if (
+        declared.get("sha256") != binding["sha256"]
+        or declared.get("bytes") != binding["bytes"]
+    ):
+        raise RuntimeError(f"{label} acquisition-v2 radar timing mask binding mismatch")
+    mask = np.load(path, mmap_mode="r", allow_pickle=False)
+    if (
+        mask.dtype != np.bool_
+        or mask.ndim != 3
+        or mask.shape[0] != int(rows)
+        or mask.shape[1] != 3
+        or mask.shape[2] <= 0
+    ):
+        raise RuntimeError(
+            f"{label} acquisition-v2 radar timing mask shape/dtype is invalid"
+        )
+    if declared.get("shape") != list(mask.shape) or declared.get("dtype") != "bool":
+        raise RuntimeError(
+            f"{label} acquisition-v2 radar timing mask declaration mismatch"
+        )
+    if manifest.get("radar_timing_valid_mask_shape") != list(mask.shape):
+        raise RuntimeError(
+            f"{label} acquisition-v2 radar timing mask shape claim mismatch"
+        )
+    invalid = int(mask.size - np.count_nonzero(mask))
+    if manifest.get("radar_timing_invalid_interval_count") != invalid:
+        raise RuntimeError(
+            f"{label} acquisition-v2 radar timing mask count claim mismatch"
+        )
+    if manifest.get("radar_timing_mask_contract") != dict(expected_contract):
+        raise RuntimeError(f"{label} acquisition-v2 radar timing mask contract mismatch")
+    return np.array(mask, dtype=np.bool_, copy=True), binding
+
+
+def _load_acquisition_v2_timing_masks(
+    rf_cache: Path,
+    svd_cache: Path,
+    sessions: Sequence[str],
+    root_contract: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
+    """Validate equal RF/SVD interval masks and reduce them to view availability."""
+
+    view_masks: dict[str, np.ndarray] = {}
+    records: dict[str, dict[str, Any]] = {}
+    for session_id in sessions:
+        rf_dir = rf_cache / session_id
+        svd_dir = svd_cache / session_id
+        rf_manifest = _load_json(rf_dir / "manifest.json")
+        svd_manifest = _load_json(svd_dir / "manifest.json")
+        rf_binding = rf_manifest.get("acquisition_contract")
+        svd_binding = svd_manifest.get("canonical_acquisition_binding")
+        if (
+            not isinstance(rf_binding, Mapping)
+            or not isinstance(svd_binding, Mapping)
+            or rf_binding.get("schema_version") != ACQUISITION_V2_SCHEMA
+            or svd_binding.get("schema_version") != ACQUISITION_V2_SCHEMA
+        ):
+            raise RuntimeError(
+                f"RF/SVD acquisition-v2 session binding is missing: {session_id}"
+            )
+        if dict(rf_binding) != dict(svd_binding):
+            raise RuntimeError(
+                f"RF/SVD acquisition-v2 session bindings differ: {session_id}"
+            )
+        rf_metadata = pd.read_csv(rf_dir / "metadata.csv")
+        svd_metadata = pd.read_csv(svd_dir / "metadata.csv")
+        _assert_common_rows(rf_metadata, svd_metadata, f"RF/SVD {session_id}")
+        rf_mask, rf_file = _load_bound_timing_mask(
+            rf_dir,
+            rf_manifest,
+            rows=len(rf_metadata),
+            label=f"RF {session_id}",
+            expected_contract=RF_TIMING_MASK_CONTRACT,
+        )
+        svd_mask, svd_file = _load_bound_timing_mask(
+            svd_dir,
+            svd_manifest,
+            rows=len(svd_metadata),
+            label=f"SVD {session_id}",
+            expected_contract=SVD_TIMING_MASK_CONTRACT,
+        )
+        if rf_mask.shape != svd_mask.shape or not np.array_equal(rf_mask, svd_mask):
+            raise RuntimeError(
+                f"RF/SVD acquisition-v2 radar timing masks differ: {session_id}"
+            )
+        if root_contract.get("scientific_eligible") is True and not bool(rf_mask.all()):
+            raise RuntimeError(
+                f"scientific acquisition-v2 input has invalid radar timing: {session_id}"
+            )
+        # A view is structurally available only when every right-edge interval
+        # in the exact half-open window support is valid.  Numeric evidence is
+        # deliberately not consulted for this reduction.
+        per_view = np.all(rf_mask, axis=2)
+        view_masks[session_id] = per_view.astype(np.bool_, copy=False)
+        records[session_id] = {
+            "shape": list(rf_mask.shape),
+            "interval_reduction": "all_exact_half_open_window_intervals",
+            "invalid_interval_count": int(rf_mask.size - np.count_nonzero(rf_mask)),
+            "unavailable_view_count": int(per_view.size - np.count_nonzero(per_view)),
+            "rf_sha256": rf_file["sha256"],
+            "svd_sha256": svd_file["sha256"],
+            "rf_svd_semantically_equal": True,
+        }
+    if root_contract.get("mode") == "diagnostic" and root_contract.get(
+        "scientific_eligible"
+    ) is not False:
+        raise RuntimeError("diagnostic acquisition-v2 timing masks became trainable")
+    return view_masks, records
+
+
+def _zero_unavailable_radar_features(
+    values: np.ndarray,
+    feature_names: Sequence[str],
+    radar_mask: np.ndarray,
+) -> None:
+    """Force every radar-specific feature cell to exact zero when unavailable."""
+
+    available = np.asarray(radar_mask, dtype=bool)
+    if available.shape != (values.shape[0], 3):
+        raise RuntimeError("batch structural radar mask shape mismatch")
+    names = tuple(str(name) for name in feature_names)
+    for radar in range(3):
+        prefixes = (
+            f"rf_radar{radar + 1}_",
+            f"svd_radar{radar + 1}_",
+            f"proposer_radar{radar + 1}_",
+        )
+        columns = np.asarray(
+            [index for index, name in enumerate(names) if name.startswith(prefixes)],
+            dtype=np.int64,
+        )
+        if columns.size == 0:
+            raise RuntimeError(f"radar {radar + 1} evidence feature columns are missing")
+        unavailable = ~available[:, radar]
+        if unavailable.any():
+            selected = np.ix_(unavailable, np.arange(values.shape[1]), columns)
+            values[selected] = 0.0
+            if np.count_nonzero(values[selected]):
+                raise RuntimeError("structurally unavailable radar features are nonzero")
+
+
+def _node_structural_availability(
+    feature_names: Sequence[str],
+    batch: Any,
+    *,
+    proposer_row_available: np.ndarray,
+    classical_row_available: np.ndarray,
+) -> np.ndarray:
+    """Build the exact per-cell mask used to create this feature batch."""
+
+    names = tuple(str(name) for name in feature_names)
+    candidate = np.asarray(batch.candidates.mask)
+    radar = np.asarray(batch.rf_support.radar_mask)
+    if candidate.dtype != np.bool_ or radar.dtype != np.bool_:
+        raise RuntimeError("candidate/radar structural masks must be boolean")
+    if radar.shape != (candidate.shape[0], 3):
+        raise RuntimeError("batch radar structural mask shape drifted")
+    proposer = np.asarray(proposer_row_available)
+    if proposer.dtype != np.bool_ or proposer.shape != (candidate.shape[0],):
+        raise RuntimeError("proposer row availability mask shape drifted")
+    classical = np.asarray(classical_row_available)
+    if classical.dtype != np.bool_ or classical.shape != (candidate.shape[0],):
+        raise RuntimeError("classical row availability mask shape drifted")
+    rf_mask = np.asarray(batch.rf_support.mask)
+    svd_mask = np.asarray(batch.svd_support.mask)
+    if rf_mask.dtype != np.bool_ or svd_mask.dtype != np.bool_:
+        raise RuntimeError("RF/SVD support masks must be boolean")
+    availability = np.broadcast_to(
+        candidate[..., None], (*candidate.shape, len(names))
+    ).copy()
+    previous_candidate = np.zeros_like(candidate)
+    next_candidate = np.zeros_like(candidate)
+    previous_candidate[:, 1:] = candidate[:, 1:] & candidate[:, :-1]
+    next_candidate[:, :-1] = candidate[:, :-1] & candidate[:, 1:]
+    source_mask = np.asarray(batch.candidates.source_mask, dtype=np.bool_)
+    if source_mask.shape[:2] != candidate.shape:
+        raise RuntimeError("candidate source structural mask shape drifted")
+    confidence_available = (
+        source_mask[
+            ...,
+            [int(CandidateSource.BASE), int(CandidateSource.DIRECT_MODE)],
+        ].any(axis=2)
+        & proposer[:, None]
+    )
+    confidence_available |= (
+        source_mask[
+            ...,
+            int(CandidateSource.CLASSICAL_X1) : int(CandidateSource.CLASSICAL_X4)
+            + 1,
+        ].any(axis=2)
+        & classical[:, None]
+    )
+    for radar_index in range(3):
+        confidence_available |= (
+            source_mask[..., int(CandidateSource.RADAR_PEAK_1) + radar_index]
+            & radar[:, None, radar_index]
+            & classical[:, None]
+        )
+    proposer_names = set(PROPOSER_NODE_FEATURE_NAMES)
+    proposer_source_names = {
+        "source_base",
+        "source_direct_mode",
+        "source_confidence_base",
+        "source_confidence_direct_mode",
+    }
+    for feature_index, name in enumerate(names):
+        if name == "previous_candidate_gap_bpm":
+            availability[..., feature_index] = previous_candidate
+            continue
+        if name == "next_candidate_gap_bpm":
+            availability[..., feature_index] = next_candidate
+            continue
+        if name == "candidate_confidence":
+            availability[..., feature_index] = confidence_available
+            continue
+        matched = False
+        for radar_index in range(3):
+            for ratio_index, token in enumerate(_HARMONIC_RATIO_TOKENS):
+                rf_prefix = f"rf_radar{radar_index + 1}_{token}_"
+                svd_prefix = f"svd_radar{radar_index + 1}_{token}_"
+                if name.startswith(rf_prefix):
+                    cell = rf_mask[:, :, radar_index, ratio_index].copy()
+                    if "_candidate_iq_phase_power_" in name:
+                        cell.fill(False)
+                    elif name.endswith("_cross_radar_consensus"):
+                        peer_indices = [
+                            index for index in range(3) if index != radar_index
+                        ]
+                        cell &= rf_mask[
+                            :, :, peer_indices, ratio_index
+                        ].any(axis=2)
+                    availability[..., feature_index] = cell
+                    matched = True
+                    break
+                if name.startswith(svd_prefix):
+                    availability[..., feature_index] = svd_mask[
+                        :, :, radar_index, ratio_index
+                    ]
+                    matched = True
+                    break
+            if matched:
+                break
+        if matched:
+            continue
+        if name.startswith(("rf_", "svd_")):
+            raise RuntimeError(f"unrecognized radar feature schema: {name}")
+        if name in proposer_names:
+            availability[..., feature_index] &= proposer[:, None]
+        if name in proposer_source_names:
+            availability[..., feature_index] &= proposer[:, None]
+        if name.startswith(("source_classical_", "source_confidence_classical_")):
+            availability[..., feature_index] &= classical[:, None]
+        for radar_index in range(3):
+            radar_owned = {
+                f"source_radar_peak_{radar_index + 1}",
+                f"proposer_radar{radar_index + 1}_weight",
+            }
+            if name in radar_owned:
+                availability[..., feature_index] &= radar[:, None, radar_index]
+                break
+            if name == f"source_confidence_radar_peak_{radar_index + 1}":
+                availability[..., feature_index] &= (
+                    radar[:, None, radar_index] & classical[:, None]
+                )
+                break
+    return np.asarray(availability, dtype=np.bool_)
+
+
+def _resolve_session_joint_radar_mask(
+    rf_maps: np.ndarray,
+    svd_spectra: np.ndarray,
+    svd_attributes: np.ndarray,
+    *,
+    explicit_timing_mask: np.ndarray | None,
+    svd_components: int,
+    batch_size: int,
+) -> np.ndarray:
+    """Resolve one RF+SVD availability mask before candidate admission.
+
+    This intentionally runs before the candidate bank so an unavailable SVD
+    view can never survive as a radar-peak source.  Chunking preserves the
+    cache builder's bounded-memory contract.
+    """
+
+    rows = int(np.asarray(rf_maps).shape[0])
+    if not (
+        np.asarray(svd_spectra).shape[0]
+        == np.asarray(svd_attributes).shape[0]
+        == rows
+    ):
+        raise RuntimeError("RF/SVD session evidence row counts differ")
+    if explicit_timing_mask is not None:
+        timing = np.asarray(explicit_timing_mask)
+        if timing.dtype != np.bool_ or timing.shape != (rows, 3):
+            raise RuntimeError("session timing-derived radar mask is invalid")
+    else:
+        timing = None
+    resolved = np.zeros((rows, 3), dtype=np.bool_)
+    for start in range(0, rows, int(batch_size)):
+        stop = min(rows, start + int(batch_size))
+        selected_svd = np.asarray(svd_spectra[start:stop])[
+            :, :, VERIFIED_SVD_VARIANT_INDICES, : int(svd_components), :
+        ]
+        selected_attributes = np.asarray(svd_attributes[start:stop])[
+            :, :, VERIFIED_SVD_VARIANT_INDICES, : int(svd_components), :
+        ]
+        # Only the verified raw-power half of the RF cache may establish
+        # availability.  The reserved IQ hypothesis cannot rescue a view.
+        raw_rf = np.asarray(rf_maps[start:stop])[..., :91]
+        resolved[start:stop] = resolve_joint_radar_mask(
+            raw_rf,
+            selected_svd,
+            svd_attributes=selected_attributes,
+            explicit_mask=None if timing is None else timing[start:stop],
+        )
+    return resolved
+
+
 def collect_input_bindings(
     rf_cache: Path,
     svd_cache: Path,
     proposer_path: Path,
     folds_path: Path,
     sessions: Sequence[str],
+    *,
+    acquisition_v2: bool = False,
 ) -> dict[str, Any]:
+    direct_entry_disk_binding = _assert_direct_entry_disk_binding_current()
     result: dict[str, Any] = {
         "source": {
-            "builder": _file_binding(Path(__file__)),
+            "builder": direct_entry_disk_binding,
+            "snn_rr_package": _file_binding(
+                PROJECT_ROOT / "src/snn_rr/__init__.py"
+            ),
             "harmonic_set_data": _file_binding(
                 PROJECT_ROOT / "src/snn_rr/harmonic_set_data.py"
+            ),
+            "harmonic_feature_layout_v3r1": _file_binding(
+                PROJECT_ROOT / "src/snn_rr/harmonic_feature_layout_v3r1.py"
+            ),
+        },
+        "execution_source_generation": {
+            "guard_scope": "initialization_time_direct_entry_disk_only",
+            "direct_entry_disk_binding": direct_entry_disk_binding,
+            "binds_actual_loader_compiled_bytes": False,
+            "complete_private_import_closure": False,
+            "scientific_authority_status": (
+                "terminal_blocked_without_fresh_isolated_private_source_launcher"
             ),
         },
         "rf_root_manifest": _file_binding(rf_cache / "manifest.json"),
@@ -756,6 +1657,16 @@ def collect_input_bindings(
     for session_id in sessions:
         rf_dir = rf_cache / session_id
         svd_dir = svd_cache / session_id
+        for label, cache_root, session_dir in (
+            ("RF", rf_cache, rf_dir),
+            ("SVD", svd_cache, svd_dir),
+        ):
+            try:
+                session_dir.resolve().relative_to(cache_root.resolve())
+            except ValueError as error:
+                raise RuntimeError(
+                    f"{label} session path escapes cache root: {session_id}"
+                ) from error
         result["sessions"][session_id] = {
             "rf": {
                 name: _file_binding(rf_dir / filename)
@@ -764,6 +1675,11 @@ def collect_input_bindings(
                     ("metadata", "metadata.csv"),
                     ("frequencies", "frequencies_hz.npy"),
                     ("manifest", "manifest.json"),
+                    *(
+                        (("radar_timing_valid_mask", "radar_timing_valid_mask.npy"),)
+                        if acquisition_v2
+                        else ()
+                    ),
                 )
             },
             "svd": {
@@ -774,6 +1690,11 @@ def collect_input_bindings(
                     ("metadata", "metadata.csv"),
                     ("frequencies", "frequencies_hz.npy"),
                     ("manifest", "manifest.json"),
+                    *(
+                        (("radar_timing_valid_mask", "radar_timing_valid_mask.npy"),)
+                        if acquisition_v2
+                        else ()
+                    ),
                 )
             },
         }
@@ -787,7 +1708,11 @@ def _verify_reuse(
     if not manifest_path.is_file():
         raise RuntimeError("output exists but has no complete manifest")
     manifest = _load_json(manifest_path)
-    if manifest.get("format_version") != FORMAT_VERSION or not manifest.get("complete"):
+    if (
+        manifest.get("format_version") != FORMAT_VERSION
+        or manifest.get("schema") != SCHEMA_ID
+        or not manifest.get("complete")
+    ):
         raise RuntimeError("output exists but is partial/incompatible")
     if manifest.get("content_sha256") != _canonical_digest(
         manifest, exclude="content_sha256"
@@ -800,16 +1725,66 @@ def _verify_reuse(
     outputs = manifest.get("outputs")
     if not isinstance(outputs, Mapping):
         raise RuntimeError("existing output has no output bindings")
-    for name, binding in outputs.items():
-        if not isinstance(binding, Mapping):
+    expected_outputs = {
+        **ARRAY_FILES,
+        "node_feature_availability": NODE_FEATURE_AVAILABILITY_FILE,
+        "metadata": "metadata.csv",
+        "feature_names": "feature_names.json",
+    }
+    if set(outputs) != set(expected_outputs):
+        raise RuntimeError("existing output binding inventory is incomplete or unknown")
+    for name, filename in expected_outputs.items():
+        binding = outputs[name]
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != {"filename", "sha256", "bytes"}
+            or binding.get("filename") != filename
+            or not isinstance(binding.get("sha256"), str)
+            or len(str(binding["sha256"])) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in str(binding["sha256"])
+            )
+            or type(binding.get("bytes")) is not int
+            or int(binding["bytes"]) <= 0
+        ):
             raise RuntimeError(f"existing output binding is invalid: {name}")
-        path = output_dir / str(binding.get("filename", ""))
+        path = output_dir / filename
         if not path.is_file():
             raise RuntimeError(f"existing output file is missing: {name}")
         if path.stat().st_size != int(binding.get("bytes", -1)):
             raise RuntimeError(f"existing output size mismatch: {name}")
         if sha256_file(path) != binding.get("sha256"):
             raise RuntimeError(f"existing output SHA-256 mismatch: {name}")
+    availability = np.load(
+        output_dir / NODE_FEATURE_AVAILABILITY_FILE,
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    features = np.load(
+        output_dir / ARRAY_FILES["node_features"],
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    if (
+        features.dtype != np.float32
+        or availability.dtype != np.bool_
+        or availability.shape != features.shape
+        or manifest.get("node_feature_shape") != list(features.shape)
+        or manifest.get("node_feature_dtype") != "float32"
+        or manifest.get("node_feature_availability_shape")
+        != list(availability.shape)
+        or manifest.get("node_feature_availability_dtype") != "bool"
+    ):
+        raise RuntimeError("existing node feature/availability schema drifted")
+    for start in range(0, features.shape[0], 256):
+        stop = min(start + 256, features.shape[0])
+        feature_chunk = np.asarray(features[start:stop])
+        availability_chunk = np.asarray(availability[start:stop])
+        if np.count_nonzero(feature_chunk[~availability_chunk]):
+            raise RuntimeError(
+                "existing structurally unavailable node feature is nonzero"
+            )
     return {"status": "reused", "output_dir": str(output_dir), "manifest": manifest}
 
 
@@ -840,8 +1815,190 @@ def _flush(arrays: Mapping[str, np.memmap]) -> None:
         array.flush()
 
 
+def _fsync_regular_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise RuntimeError(f"publication payload is not regular: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without replacing any existing name."""
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as error:
+        raise RuntimeError(
+            "atomic no-replace directory publication is unavailable"
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "harmonic output appeared concurrently; refusing to overwrite",
+            str(destination),
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        f"{source} -> {destination}",
+    )
+
+
+def _rename_directory_noreplace_at(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as error:
+        raise RuntimeError(
+            "atomic no-replace directory publication is unavailable"
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(destination_name),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "harmonic output appeared concurrently; refusing to overwrite",
+            destination_name,
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        f"{source_name} -> {destination_name}",
+    )
+
+
+def _durably_publish_stage(
+    stage_owner: _StablePrivateDirectory,
+    output_dir: Path,
+) -> None:
+    """Persist the exact stage inventory before/after atomic directory rename."""
+
+    stage = stage_owner.path
+    expected = {
+        *ARRAY_FILES.values(),
+        NODE_FEATURE_AVAILABILITY_FILE,
+        "metadata.csv",
+        "feature_names.json",
+        "manifest.json",
+    }
+    observed = {path.name for path in stage.iterdir()}
+    if observed != expected:
+        raise RuntimeError(
+            "harmonic publication stage inventory is incomplete or unknown"
+        )
+    for filename in sorted(expected):
+        _fsync_regular_file(stage / filename)
+    _fsync_directory(stage)
+    stage_owner.assert_parent_path_current()
+    renamed = False
+    try:
+        _rename_directory_noreplace_at(
+            stage_owner.parent_descriptor,
+            stage_owner.name,
+            output_dir.name,
+        )
+        renamed = True
+        stage_owner.assert_parent_path_current()
+        published = os.stat(
+            output_dir.name,
+            dir_fd=stage_owner.parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(published.st_mode)
+            or published.st_dev != stage_owner.root_device
+            or published.st_ino != stage_owner.root_inode
+        ):
+            raise RuntimeError("published harmonic directory inode mismatch")
+        _fsync_directory(output_dir.parent)
+        stage_owner.assert_parent_path_current()
+        os.fsync(stage_owner.parent_descriptor)
+    except BaseException:
+        if renamed:
+            try:
+                published = os.stat(
+                    output_dir.name,
+                    dir_fd=stage_owner.parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(published.st_mode)
+                    or published.st_dev != stage_owner.root_device
+                    or published.st_ino != stage_owner.root_inode
+                ):
+                    raise RuntimeError(
+                        "cannot safely roll back mismatched harmonic publication"
+                    )
+                _rename_directory_noreplace_at(
+                    stage_owner.parent_descriptor,
+                    output_dir.name,
+                    stage_owner.name,
+                )
+                os.fsync(stage_owner.parent_descriptor)
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "harmonic publication parent changed and rollback failed"
+                ) from rollback_error
+        raise
+    stage_owner.mark_published()
+
+
 def _output_bindings(stage: Path) -> dict[str, Any]:
-    names = {**ARRAY_FILES, "metadata": "metadata.csv", "feature_names": "feature_names.json"}
+    names = {
+        **ARRAY_FILES,
+        "node_feature_availability": NODE_FEATURE_AVAILABILITY_FILE,
+        "metadata": "metadata.csv",
+        "feature_names": "feature_names.json",
+    }
     return {
         name: {
             "filename": filename,
@@ -852,7 +2009,11 @@ def _output_bindings(stage: Path) -> dict[str, Any]:
     }
 
 
-def build(args: argparse.Namespace) -> dict[str, Any]:
+def _build_with_snapshot_owner(
+    args: argparse.Namespace,
+    *,
+    snapshot_owner: list[_BoundInputSnapshot],
+) -> dict[str, Any]:
     rf_cache = args.rf_cache.expanduser().resolve()
     svd_cache = args.svd_cache.expanduser().resolve()
     proposer_path = args.proposer.expanduser().resolve()
@@ -877,13 +2038,100 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("posterior NMS suppression must be finite and non-negative")
     if svd_components not in (6, 12):
         raise ValueError("svd components must be 6 or 12")
-    _, svd_root, sessions = _validate_root_manifests(rf_cache, svd_cache)
+    root_manifest_bindings = {
+        "rf": _file_binding(rf_cache / "manifest.json"),
+        "svd": _file_binding(svd_cache / "manifest.json"),
+    }
+    rf_root, svd_root, sessions = _validate_root_manifests(rf_cache, svd_cache)
+    if root_manifest_bindings != {
+        "rf": _file_binding(rf_cache / "manifest.json"),
+        "svd": _file_binding(svd_cache / "manifest.json"),
+    }:
+        raise RuntimeError("root manifest changed while it was being parsed")
+    acquisition_contract = _acquisition_v2_root_contract(rf_root, svd_root)
+    # Bind every input before copying timing masks or loading the proposer.
+    # Replaying this inventory immediately after those loads closes the window
+    # in which a replacement could otherwise become the recorded provenance
+    # while stale mask bytes remained in memory.
+    try:
+        input_bindings = collect_input_bindings(
+            rf_cache,
+            svd_cache,
+            proposer_path,
+            folds_path,
+            sessions,
+            acquisition_v2=acquisition_contract is not None,
+        )
+    except FileNotFoundError as error:
+        missing = Path(str(error.args[0])) if error.args else Path("")
+        if missing.name == "radar_timing_valid_mask.npy":
+            raise RuntimeError(
+                "acquisition-v2 radar timing mask file is missing"
+            ) from error
+        raise
+    if (
+        input_bindings.get("rf_root_manifest") != root_manifest_bindings["rf"]
+        or input_bindings.get("svd_root_manifest") != root_manifest_bindings["svd"]
+    ):
+        raise RuntimeError("root manifest changed before full input binding")
+    if collect_input_bindings(
+        rf_cache,
+        svd_cache,
+        proposer_path,
+        folds_path,
+        sessions,
+        acquisition_v2=acquisition_contract is not None,
+    ) != input_bindings:
+        raise RuntimeError("harmonic cache input changed while initial inputs loaded")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    input_snapshot = _materialize_bound_input_snapshot(
+        rf_cache=rf_cache,
+        svd_cache=svd_cache,
+        proposer_path=proposer_path,
+        folds_path=folds_path,
+        sessions=sessions,
+        input_bindings=input_bindings,
+        parent=output_dir.parent,
+    )
+    snapshot_owner.append(input_snapshot)
+    consumed_rf_cache = input_snapshot.rf_cache
+    consumed_svd_cache = input_snapshot.svd_cache
+    consumed_proposer_path = input_snapshot.proposer
+    consumed_folds_path = input_snapshot.folds
+    snapshot_rf_root, snapshot_svd_root, snapshot_sessions = (
+        _validate_root_manifests(consumed_rf_cache, consumed_svd_cache)
+    )
+    if snapshot_sessions != sessions:
+        raise RuntimeError("snapshotted root manifest session order drifted")
+    if snapshot_rf_root != rf_root or snapshot_svd_root != svd_root:
+        raise RuntimeError("snapshotted root manifest semantics drifted")
+    acquisition_timing_masks: dict[str, np.ndarray] = {}
+    acquisition_timing_records: dict[str, dict[str, Any]] = {}
+    if acquisition_contract is not None:
+        acquisition_timing_masks, acquisition_timing_records = (
+            _load_acquisition_v2_timing_masks(
+                consumed_rf_cache,
+                consumed_svd_cache,
+                sessions,
+                acquisition_contract,
+            )
+        )
+    if collect_input_bindings(
+        rf_cache,
+        svd_cache,
+        proposer_path,
+        folds_path,
+        sessions,
+        acquisition_v2=acquisition_contract is not None,
+    ) != input_bindings:
+        raise RuntimeError("harmonic cache input changed while initial inputs loaded")
     if int(svd_root.get("components", -1)) < svd_components:
         raise RuntimeError(
             f"SVD cache contains fewer than the requested {svd_components} components"
         )
-    folds = _fold_map(folds_path)
-    proposer = _load_proposer(proposer_path)
+    folds = _fold_map(consumed_folds_path)
+    proposer = _load_proposer(consumed_proposer_path)
+    input_snapshot.assert_private_bytes_current()
     proposer_frame = _proposer_frame(proposer)
     proposal_bundle = _proposal_bundle(
         proposer,
@@ -912,11 +2160,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if set(map(str, proposer_frame["identity"])) != set(folds):
         raise RuntimeError("fold assignments/proposer identity cover mismatch")
 
-    input_bindings = collect_input_bindings(
-        rf_cache, svd_cache, proposer_path, folds_path, sessions
-    )
     settings = {
         "format_version": FORMAT_VERSION,
+        "schema": SCHEMA_ID,
         "merge_radius_bpm": float(args.merge_radius_bpm),
         "batch_size": int(args.batch_size),
         "maximum_candidates": MAX_CANDIDATES,
@@ -940,15 +2186,49 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "rf_branch_policy": "raw_power_only_phase_columns_zeroed",
         "verified_svd_variant_indices": list(VERIFIED_SVD_VARIANT_INDICES),
         "svd_components": svd_components,
+        "radar_availability_policy": (
+            "acquisition_v2_explicit_rf_svd_equal_timing_mask_all_intervals"
+            if acquisition_contract is not None
+            else "legacy_numeric_evidence_fallback"
+        ),
+        "classical_availability_policy": (
+            "explicit_all_three_joint_radar_views_true"
+        ),
+        "proposer_availability_policy": (
+            "upstream_available_and_all_three_joint_radar_views_true"
+            if acquisition_contract is not None
+            else "legacy_upstream_proposer_availability"
+        ),
+        "input_consumption_policy": (
+            "rf_svd_proposer_fold_payloads_private_cow_or_stream_snapshot_"
+            "hash_equal_bound_bytes_with_original_namespace_publication_barrier"
+        ),
     }
     build_signature = _canonical_digest({"settings": settings, "inputs": input_bindings})
     if output_dir.exists():
-        return _verify_reuse(output_dir, build_signature, input_bindings)
+        result = _verify_reuse(output_dir, build_signature, input_bindings)
+        input_snapshot.assert_private_bytes_current()
+        if collect_input_bindings(
+            rf_cache,
+            svd_cache,
+            proposer_path,
+            folds_path,
+            sessions,
+            acquisition_v2=acquisition_contract is not None,
+        ) != input_bindings:
+            raise RuntimeError(
+                "harmonic cache input changed while verified output was reused"
+            )
+        return result
 
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.building.", dir=output_dir.parent))
+    stage_owner = _StablePrivateDirectory.create(
+        output_dir.parent,
+        prefix=f".{output_dir.name}.building.",
+    )
+    stage = stage_owner.path
     arrays: dict[str, np.memmap] = {}
     node_features: np.memmap | None = None
+    node_feature_availability: np.memmap | None = None
     feature_names: tuple[str, ...] | None = None
     metadata_parts: list[pd.DataFrame] = []
     session_records: list[dict[str, Any]] = []
@@ -956,8 +2236,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     try:
         arrays = _open_output_arrays(stage, len(proposer_frame))
         for session_id in sessions:
-            rf_dir = rf_cache / session_id
-            svd_dir = svd_cache / session_id
+            rf_dir = consumed_rf_cache / session_id
+            svd_dir = consumed_svd_cache / session_id
             rf_metadata = pd.read_csv(rf_dir / "metadata.csv")
             svd_metadata = pd.read_csv(svd_dir / "metadata.csv")
             _assert_common_rows(rf_metadata, svd_metadata, f"RF/SVD {session_id}")
@@ -1005,18 +2285,47 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(f"evidence row shape mismatch: {session_id}")
             if rf_maps.ndim != 4 or rf_maps.shape[-1] != 182:
                 raise RuntimeError(f"RF branch/range layout is incompatible: {session_id}")
-            raw_rf = np.asarray(rf_maps[..., :91])
-            raw_radar_mask = np.isfinite(raw_rf).all(axis=(2, 3)) & np.any(
-                raw_rf != 0, axis=(2, 3)
+            if acquisition_contract is None:
+                timing_radar_mask = None
+            else:
+                timing_radar_mask = acquisition_timing_masks[session_id]
+                if timing_radar_mask.shape != (local_rows, 3):
+                    raise RuntimeError(
+                        f"acquisition-v2 view mask shape mismatch: {session_id}"
+                    )
+            joint_radar_mask = _resolve_session_joint_radar_mask(
+                rf_maps,
+                svd_spectra,
+                svd_attributes,
+                explicit_timing_mask=timing_radar_mask,
+                svd_components=svd_components,
+                batch_size=int(args.batch_size),
             )
 
             selector = slice(offset, offset + local_rows)
+            joint_three_available = np.all(joint_radar_mask, axis=1)
+            upstream_proposer_available = np.asarray(
+                proposal_bundle.availability[selector], dtype=np.bool_
+            )
+            effective_proposer_available = (
+                upstream_proposer_available & joint_three_available
+                if acquisition_contract is not None
+                else upstream_proposer_available
+            )
+            effective_proposal_mask = np.asarray(
+                proposal_bundle.mask[selector], dtype=np.bool_
+            ) & effective_proposer_available[:, None]
             bank = candidate_bank_from_metadata(
                 rf_metadata,
                 proposal_bpm=proposal_bundle.bpm[selector],
                 proposal_confidence=proposal_bundle.confidence[selector],
-                proposal_mask=proposal_bundle.mask[selector],
+                proposal_mask=effective_proposal_mask,
                 proposal_source=proposal_bundle.source[selector],
+                radar_mask=joint_radar_mask,
+                # The fused classical estimate has no independent upstream
+                # timing receipt.  Admit it only when all three contributing
+                # radar views are structurally authorized for the row.
+                classical_available=joint_three_available,
                 merge_radius_bpm=float(args.merge_radius_bpm),
                 max_candidates=MAX_CANDIDATES,
             )
@@ -1026,7 +2335,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             if base_proposals == "none" and base_entered:
                 raise RuntimeError("implicit BASE source entered the direct-mode candidate bank")
             if base_proposals != "none":
-                expected_base_rows = proposal_bundle.availability[selector]
+                expected_base_rows = effective_proposer_available
                 observed_base_rows = np.asarray(bank.source_mask)[
                     ..., int(CandidateSource.BASE)
                 ].any(axis=1)
@@ -1042,9 +2351,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             proposer_names: tuple[str, ...] | None = None
             if include_proposer_features:
                 proposer_nodes, proposer_names = proposer_candidate_node_features(
-                    proposal_bundle, bank, selector
+                    proposal_bundle,
+                    bank,
+                    selector,
+                    row_available=effective_proposer_available,
                 )
 
+            session_feature_cursor = 0
             for batch in iter_compact_node_feature_batches(
                 rf_maps,
                 rf_frequency,
@@ -1052,7 +2365,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 svd_attributes,
                 svd_frequency,
                 bank,
-                explicit_radar_mask=raw_radar_mask,
+                explicit_radar_mask=joint_radar_mask,
                 ratios=HARMONIC_RATIOS,
                 batch_size=int(args.batch_size),
                 svd_components=svd_components,
@@ -1060,8 +2373,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 proposer_feature_names=proposer_names,
                 include_source_confidence=include_proposer_features,
             ):
-                start = offset + int(batch.row_slice.start or 0)
-                stop = offset + int(batch.row_slice.stop or local_rows)
+                if batch.row_slice.step not in (None, 1):
+                    raise RuntimeError("feature batch row slice step is not contiguous")
+                local_start = int(batch.row_slice.start or 0)
+                local_stop = int(batch.row_slice.stop or local_rows)
+                if not (
+                    local_start == session_feature_cursor
+                    and local_start < local_stop <= local_rows
+                ):
+                    raise RuntimeError(
+                        f"feature batches do not exactly cover session rows: {session_id}"
+                    )
+                session_feature_cursor = local_stop
+                start = offset + local_start
+                stop = offset + local_stop
                 output_slice = slice(start, stop)
                 names = tuple(batch.nodes.feature_names)
                 values = np.asarray(batch.nodes.features, dtype=np.float32).copy()
@@ -1072,6 +2397,35 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     ["_candidate_iq_phase_power_" in name for name in names], dtype=bool
                 )
                 values[..., phase_columns] = 0.0
+                joint = np.asarray(batch.rf_support.radar_mask, dtype=bool) & np.asarray(
+                    batch.svd_support.radar_mask, dtype=bool
+                )
+                if not np.array_equal(
+                    joint, joint_radar_mask[local_start:local_stop]
+                ):
+                    raise RuntimeError("feature batch joint radar mask drifted")
+                structural_availability = _node_structural_availability(
+                    names,
+                    batch,
+                    proposer_row_available=np.asarray(
+                        effective_proposer_available[local_start:local_stop],
+                        dtype=np.bool_,
+                    ),
+                    classical_row_available=np.asarray(
+                        np.all(
+                            joint_radar_mask[local_start:local_stop], axis=1
+                        ),
+                        dtype=np.bool_,
+                    ),
+                )
+                values = np.where(
+                    structural_availability, values, np.float32(0.0)
+                )
+                _zero_unavailable_radar_features(values, names, joint)
+                if np.count_nonzero(values[~structural_availability]):
+                    raise RuntimeError(
+                        "structurally unavailable node feature is nonzero"
+                    )
                 if not np.isfinite(values).all():
                     raise RuntimeError("node feature construction produced non-finite values")
                 if node_features is None:
@@ -1082,12 +2436,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                         dtype=np.float32,
                         shape=(len(proposer_frame), MAX_CANDIDATES, len(names)),
                     )
+                    node_feature_availability = np.lib.format.open_memmap(
+                        stage / NODE_FEATURE_AVAILABILITY_FILE,
+                        mode="w+",
+                        dtype=np.bool_,
+                        shape=(
+                            len(proposer_frame),
+                            MAX_CANDIDATES,
+                            len(names),
+                        ),
+                    )
                 elif names != feature_names:
                     raise RuntimeError("node feature schema changed between sessions")
+                if node_feature_availability is None:
+                    raise RuntimeError("node availability output was not initialized")
                 node_features[output_slice] = values
-                joint = np.asarray(batch.rf_support.radar_mask, dtype=bool) & np.asarray(
-                    batch.svd_support.radar_mask, dtype=bool
-                )
+                node_feature_availability[output_slice] = structural_availability
                 arrays["joint_radar_mask"][output_slice] = joint
                 arrays["rf_support_count"][output_slice] = np.asarray(
                     batch.rf_support.mask, dtype=np.uint8
@@ -1095,6 +2459,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 arrays["svd_support_count"][output_slice] = np.asarray(
                     batch.svd_support.mask, dtype=np.uint8
                 ).sum(axis=2)
+
+            if session_feature_cursor != local_rows:
+                raise RuntimeError(
+                    f"feature batches do not exactly cover session rows: {session_id}"
+                )
 
             canonical_metadata = rf_metadata.copy()
             canonical_metadata.insert(0, "cache_index", local_index)
@@ -1120,12 +2489,37 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                         "maximum_hz": float(svd_frequency[-1]),
                         "sha256": sha256_file(svd_dir / "frequencies_hz.npy"),
                     },
+                    **(
+                        {
+                            "acquisition_v2_radar_timing_mask": (
+                                acquisition_timing_records[session_id]
+                            )
+                        }
+                        if acquisition_contract is not None
+                        else {}
+                    ),
                 }
             )
             offset += local_rows
 
-        if offset != len(proposer_frame) or node_features is None or feature_names is None:
+        if (
+            offset != len(proposer_frame)
+            or node_features is None
+            or node_feature_availability is None
+            or feature_names is None
+        ):
             raise RuntimeError("session construction did not exactly cover proposer rows")
+        ordered_feature_names_semantic_sha256: str | None = None
+        feature_layout_semantic_sha256: str | None = None
+        if include_proposer_features:
+            if len(feature_names) != TOTAL_FEATURE_WIDTH:
+                raise RuntimeError(
+                    "proposer-feature cache must use the canonical 571-wide layout"
+                )
+            ordered_feature_names_semantic_sha256 = validate_ordered_feature_names(
+                feature_names
+            )
+            feature_layout_semantic_sha256 = FEATURE_LAYOUT_SEMANTIC_SHA256
         metadata = pd.concat(metadata_parts, ignore_index=True)
         if not np.array_equal(metadata["cache_index"].to_numpy(np.int64), cache_index):
             raise RuntimeError("constructed metadata cache_index exact cover failed")
@@ -1140,6 +2534,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "candidate_source_names": list(CANDIDATE_SOURCE_NAMES),
                 "forward_arrays": [
                     "node_features",
+                    "node_feature_availability",
                     "candidate_bpm",
                     "candidate_mask",
                     "candidate_confidence",
@@ -1149,13 +2544,38 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "forbidden_target_qc_forward_fields": [
                     *sorted(FORBIDDEN_TARGET_QC_FIELDS),
                 ],
+                "ordered_feature_names_semantic_sha256": (
+                    ordered_feature_names_semantic_sha256
+                ),
+                "feature_layout_semantic_sha256": feature_layout_semantic_sha256,
+                "axis_risk_router_v8r5_compatible": bool(
+                    ordered_feature_names_semantic_sha256
+                    == EXPECTED_FEATURE_NAMES_SEMANTIC_SHA256
+                    and feature_layout_semantic_sha256
+                    == FEATURE_LAYOUT_SEMANTIC_SHA256
+                ),
             },
         )
         node_features.flush()
+        node_feature_availability.flush()
         _flush(arrays)
+        input_snapshot.assert_private_bytes_current()
         outputs = _output_bindings(stage)
+        current_input_bindings = collect_input_bindings(
+            rf_cache,
+            svd_cache,
+            proposer_path,
+            folds_path,
+            sessions,
+            acquisition_v2=acquisition_contract is not None,
+        )
+        if current_input_bindings != input_bindings:
+            raise RuntimeError(
+                "harmonic cache input changed during build; refusing publication"
+            )
         manifest: dict[str, Any] = {
             "format_version": FORMAT_VERSION,
+            "schema": SCHEMA_ID,
             "complete": True,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "build_signature_sha256": build_signature,
@@ -1165,6 +2585,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "fold_count": int(metadata["fold"].nunique()),
             "node_feature_shape": list(node_features.shape),
             "node_feature_dtype": "float32",
+            "node_feature_availability_shape": list(
+                node_feature_availability.shape
+            ),
+            "node_feature_availability_dtype": "bool",
+            "ordered_feature_names_semantic_sha256": (
+                ordered_feature_names_semantic_sha256
+            ),
+            "feature_layout_semantic_sha256": feature_layout_semantic_sha256,
+            "axis_risk_router_v8r5_compatible": bool(
+                ordered_feature_names_semantic_sha256
+                == EXPECTED_FEATURE_NAMES_SEMANTIC_SHA256
+                and feature_layout_semantic_sha256
+                == FEATURE_LAYOUT_SEMANTIC_SHA256
+            ),
             "row_lineage_sha256": lineage,
             "settings": settings,
             "candidate_policy": {
@@ -1187,6 +2621,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "harmonic_ratios": list(HARMONIC_RATIOS),
                 "native_frequency_grid_sampling": True,
                 "out_of_band_policy": "exact_zero_and_false_mask_never_edge_clamp",
+                "structural_availability_policy": (
+                    "persist_exact_candidate_radar_native_grid_ratio_branch_"
+                    "proposer_and_classical_joint3_mask_and_reapply_after_scaling"
+                ),
                 "rf_branch_policy": "raw_power_only_phase_feature_columns_exact_zero",
                 "rf_range_policy": "preserve_91_raw_range_indices_before_compaction",
                 "svd_variant_indices": list(VERIFIED_SVD_VARIANT_INDICES),
@@ -1196,6 +2634,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     "reliability_compaction"
                 ),
                 "svd_components": svd_components,
+                "radar_availability_policy": settings["radar_availability_policy"],
+                "classical_availability_policy": settings[
+                    "classical_availability_policy"
+                ],
+                "proposer_availability_policy": settings[
+                    "proposer_availability_policy"
+                ],
+                "input_consumption_policy": settings[
+                    "input_consumption_policy"
+                ],
+                "unavailable_radar_feature_policy": (
+                    "radar_peak_sources_and_all_radar_specific_rf_svd_"
+                    "proposer_columns_plus_joint3_classical_sources_masked_"
+                    "and_exact_zero"
+                ),
                 "proposer_posterior_feature_policy": (
                     "full_posterior_candidate_local_summaries_plus_exact_row_diagnostics"
                     if include_proposer_features
@@ -1212,11 +2665,63 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "sessions": session_records,
             "outputs": outputs,
         }
+        if acquisition_contract is not None:
+            # RF/SVD root documents and an arbitrary proposer NPZ are not a
+            # nested-proposer training authorization.  Until a separately
+            # versioned verifier binds physical-identity folds, label-free
+            # proposer checkpoints/predictions, scaler scope, and source
+            # receipts, every acquisition-v2 harmonic output remains
+            # diagnostic even when its upstream cache self-declares strict.
+            manifest["classification"] = "acquisition_diagnostic"
+            manifest["scientific_eligible"] = False
+            manifest["trainable"] = False
+            manifest["acquisition_v2"] = {
+                "schema_version": ACQUISITION_V2_SCHEMA,
+                "source_mode": acquisition_contract["mode"],
+                "source_contract_sha256": _canonical_digest(acquisition_contract),
+                "rf_svd_timing_mask_semantic_equality_required": True,
+                "view_availability_reduction": "all_exact_half_open_window_intervals",
+                "numeric_payload_cannot_enable_a_masked_view": True,
+                "diagnostic_input_trainable": False,
+                "scientific_promotion_authority": "absent",
+                "scientific_promotion_blocker": (
+                    "requires_versioned_nested_label_free_proposer_and_scaler_"
+                    "authority_verifier"
+                ),
+            }
+        else:
+            # Historical source caches lack a machine-verifiable nested
+            # proposer authority.  Preserve rebuild/inspection capability, but
+            # do not let a newly generated cache imply that arbitrary NPZ
+            # candidates were label-free or identity-disjoint.
+            manifest["classification"] = (
+                "retrospective_legacy_unverified_proposer"
+            )
+            manifest["scientific_eligible"] = False
+            manifest["trainable"] = False
+            manifest["training_blocker"] = (
+                "requires_versioned_nested_label_free_proposer_authority"
+            )
         manifest["content_sha256"] = _canonical_digest(manifest)
         _write_json(stage / "manifest.json", manifest)
         if output_dir.exists():
             raise RuntimeError("output appeared concurrently; refusing to overwrite")
-        stage.replace(output_dir)
+        # The actual mmap/parse inputs were the immutable private copies; the
+        # public namespace must still contain the exact bytes named in the
+        # manifest immediately before publication.
+        input_snapshot.assert_private_bytes_current()
+        if collect_input_bindings(
+            rf_cache,
+            svd_cache,
+            proposer_path,
+            folds_path,
+            sessions,
+            acquisition_v2=acquisition_contract is not None,
+        ) != input_bindings:
+            raise RuntimeError(
+                "harmonic cache input changed before publication"
+            )
+        _durably_publish_stage(stage_owner, output_dir)
         return {"status": "built", "output_dir": str(output_dir), "manifest": manifest}
     except BaseException:
         for array in arrays.values():
@@ -1229,8 +2734,24 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 node_features.flush()
             except Exception:
                 pass
-        shutil.rmtree(stage, ignore_errors=True)
+        if node_feature_availability is not None:
+            try:
+                node_feature_availability.flush()
+            except Exception:
+                pass
+        stage_owner.cleanup()
         raise
+
+
+def build(args: argparse.Namespace) -> dict[str, Any]:
+    """Build with unconditional cleanup of every private input snapshot."""
+
+    snapshots: list[_BoundInputSnapshot] = []
+    try:
+        return _build_with_snapshot_owner(args, snapshot_owner=snapshots)
+    finally:
+        for snapshot in reversed(snapshots):
+            snapshot.cleanup()
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -8,7 +8,12 @@ environment locks, and provenance. It omits the extracted duplicate dataset,
 virtual environment, general deterministic caches, and redundant intermediate
 experiments.
 
-Read `AGENTS.md` before modifying the restored repository.
+Read `AGENTS.md` before modifying the restored repository. For current work,
+`artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md` and
+`artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md` have authority over
+Goal v2, older execution plans/progress reports, preserved release manifests,
+and `artifacts/commercial_goal_report.json`. Those older objects are historical
+evidence and cannot authorize a current run.
 
 ## 1. Backup set
 
@@ -146,6 +151,12 @@ sed -n '1,220p' artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md
 
 ## 6. Audit raw data and rebuild derived caches
 
+The commands in this section reconstruct the historical cache lineage for
+inspection and legacy-result reproduction. They do not convert the current
+acquisition-v2 state (`synchronization authorized: 0/29`) into new scientific
+authority. Use new versioned output roots for experiments and obey the current
+strict acquisition guards.
+
 ### 6.1 Dataset audit and canonical RF cache
 
 ```bash
@@ -156,7 +167,7 @@ sed -n '1,220p' artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md
   --config configs/default.yaml --force
 ```
 
-Expected canonical cache contract:
+Expected historical canonical cache contract:
 
 - 29 usable sessions
 - 9,576 candidate windows
@@ -213,34 +224,46 @@ identity being predicted.
 
 ## 7. Reproduce the established structured-SNN leader
 
-The complete commands are maintained in `README.md`. The core sequence is:
+This is a historical legacy reproduction, not a new scientific campaign. It
+cannot establish new performance while current acquisition authority is 0/29.
+The complete commands are maintained in `README.md`. Every attempt must use a
+unique versioned root; never write to the preserved leader paths. The core
+sequence is:
 
 ```bash
+REPRO_ROOT=artifacts/reproductions/legacy_leader_20260831_attempt_001
+mkdir -p artifacts/reproductions
+mkdir "$REPRO_ROOT"  # fail if this attempt root already exists
+
+.venv/bin/python scripts/build_features.py \
+  --config configs/default.yaml --cache-dir "$REPRO_ROOT/cache/rf32s" --force
+
 .venv/bin/python scripts/train.py \
   --config configs/default.yaml --model both --fold all \
   --preset default --simulation-steps 12 --device cuda --amp \
-  --aux-fusion structured \
-  --output-dir artifacts/runs/final_structured_aux_s12
+  --aux-fusion structured --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/structured_aux"
 
 .venv/bin/python scripts/train.py \
   --config configs/default.yaml --model snn --fold all \
   --preset default --simulation-steps 12 --device cuda --amp \
   --deterministic --aux-fusion structured --exact-aux-alignment \
-  --teacher-checkpoint \
-    'artifacts/runs/final_structured_aux_s12/fold_{fold}/teacher_best.pt' \
-  --output-dir artifacts/runs/final_structured_exact_s12_deterministic
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --teacher-checkpoint "$REPRO_ROOT/structured_aux/fold_{fold}/teacher_best.pt" \
+  --output-dir "$REPRO_ROOT/structured_exact"
 
 .venv/bin/python scripts/ensemble.py \
-  --run-a artifacts/runs/final_structured_aux_s12 \
-  --run-b artifacts/runs/final_structured_exact_s12_deterministic \
-  --output-dir artifacts/runs/ensemble_structured_exact \
+  --run-a "$REPRO_ROOT/structured_aux" \
+  --run-b "$REPRO_ROOT/structured_exact" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/ensemble" \
   --device cuda --workers 4
 ```
 
 The compact core already contains the selected historical checkpoints and
-metrics at those paths. Write any reproduction attempt to a new versioned
-output directory until hashes and metrics have been compared. Do not overwrite
-the preserved snapshot.
+metrics at the preserved paths. `--resume` is permitted only within the same
+new `$REPRO_ROOT` and only with its bound cache/checkpoints. Never resume into a
+preserved path or another attempt's root.
 
 Expected leader metrics are MAE 1.291, macro MAE 1.220, RMSE 2.410, within ±2
 80.79%, error >5 6.23%, and high-RR MAE 4.216. These fail all six commercial
@@ -268,13 +291,18 @@ HCES locked OOF is historical evidence. Do not reopen the test predictions to
 select a new threshold or policy.
 
 DHFER/V8R4 is not at a valid production-training launch point. The CONTEXT1
-test receipt, source snapshot, and pretrain authorization are absent. A future
-agent must complete the independent source/runtime audit and real-bubblewrap
-tests, then use the create-once issuance flow. Hand-writing those JSON files or
-bypassing a guard invalidates the campaign.
+test receipt, source snapshot, and pretrain authorization are absent. This
+source generation is terminal fail-closed: it has no independently governed
+external test issuer/runner trust root or signature verifier. A real-bubblewrap
+pass alone, local/self-hashed or self-signed JSON, monkeypatching constants, or
+hand-writing the trio cannot issue authority. Continuation requires a new
+governed source generation that implements and independently audits that trust
+anchor and verifier.
 
-V8R5 axis-preserving risk routing is a proposed next architecture, not an
-implemented result in this snapshot.
+V8R5 axis-preserving risk routing source, config, format-v2 cache validator,
+and synthetic correctness tests are implemented. It remains an unmeasured,
+training-unauthorized proposal; these implementation artifacts are not an
+accuracy result or a launch authorization.
 
 ## 9. Selected artifact map
 
@@ -303,8 +331,9 @@ For exact V8R4 continuation, restore at
 `/home/hwiseong/Documents/SnnProject`. Existing receipts bind the canonical
 absolute root, Python executable/hash, source snapshot, modes, and ledger
 bytes. At a different root or with a different interpreter, retain the files
-as historical evidence and issue a new context generation through the normal
-validator flow. Never rewrite an old receipt to make it pass.
+only as historical evidence. The current validator cannot issue a replacement
+context; that requires the new externally governed trust-root/verifier
+generation described above. Never rewrite an old receipt to make it pass.
 
 ## 10. Troubleshooting
 
@@ -355,4 +384,7 @@ A restoration is usable when all of the following are true:
 - any environment/hardware deviation has its own receipt
 - the restored agent acknowledges that current performance is not commercial
 
-Only after this checklist should cache regeneration or new training begin.
+Only after this checklist should cache regeneration or historical reproduction
+begin. New scientific training additionally requires the current acquisition,
+nested-cache, split, and externally governed execution authorizations; restore
+success alone grants none of them.

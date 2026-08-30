@@ -11,9 +11,11 @@ The time mapping used throughout is explicit::
     rsp_time_seconds = offset_seconds + scale * radar_time_seconds
 
 where ``drift_ppm = (scale - 1) * 1e6``.  Automated synchronization is
-fail-closed: a proposed mapping is usable only when the result passes the
-configured gates, or when a separately content-addressed manual approval
-binds that exact proposal and mapping.
+fail-closed: a proposed mapping remains diagnostic even when it passes the
+configured gates until an independent verifier re-derives the marker evidence
+from the bound raw inputs.  Legacy self-hashed manual decisions may revoke an
+accepted proposal, but cannot grant scientific authority without a trusted
+signature.
 """
 
 from __future__ import annotations
@@ -22,7 +24,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
+import stat
 from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
@@ -35,6 +40,9 @@ EXPECTED_RADAR_PAYLOAD_BINS = 182
 SYNC_CONFIG_SCHEMA = "snn_rr.sync_marker_affine.config.v1"
 SYNC_RECEIPT_SCHEMA = "snn_rr.sync_marker_affine.v1"
 MANUAL_APPROVAL_SCHEMA = "snn_rr.sync_marker_manual_approval.v1"
+SYNC_PROPOSAL_REPLAY_SEMANTICS = (
+    "snn_rr.sync_marker_proposal.complete_ambiguity_scan.v2"
+)
 
 
 class SynchronizationError(ValueError):
@@ -142,6 +150,17 @@ class SynchronizationConfig:
         return config
 
     def validate(self) -> None:
+        integer_fields = {
+            "expected_payload_bins": self.expected_payload_bins,
+            "min_marker_pairs": self.min_marker_pairs,
+            "good_marker_pairs": self.good_marker_pairs,
+            "min_affine_pairs": self.min_affine_pairs,
+            "manual_review_min_pairs": self.manual_review_min_pairs,
+        }
+        if any(type(value) is not int for value in integer_fields.values()):
+            raise SynchronizationError(
+                "sync integer gates must be YAML integers, not booleans or floats"
+            )
         if self.expected_payload_bins != EXPECTED_RADAR_PAYLOAD_BINS:
             raise SynchronizationError(
                 "sync v1 is bound to the exact 182-float XeThru payload"
@@ -171,20 +190,71 @@ class SynchronizationConfig:
             "rsp_sample_rate_hz": self.rsp_sample_rate_hz,
             "motion_smoothing_s": self.motion_smoothing_s,
             "motion_clip_z": self.motion_clip_z,
+            "radar_marker_z": self.radar_marker_z,
+            "radar_marker_prominence_z": self.radar_marker_prominence_z,
             "radar_marker_merge_s": self.radar_marker_merge_s,
+            "rsp_adaptive_z": self.rsp_adaptive_z,
             "rsp_marker_merge_s": self.rsp_marker_merge_s,
             "prior_tolerance_s": self.prior_tolerance_s,
             "match_residual_gate_s": self.match_residual_gate_s,
             "max_drift_ppm": self.max_drift_ppm,
             "accept_max_rmse_s": self.accept_max_rmse_s,
             "accept_max_abs_residual_s": self.accept_max_abs_residual_s,
+            "min_marker_span_s": self.min_marker_span_s,
+            "min_affine_span_s": self.min_affine_span_s,
+            "min_affine_improvement_s": self.min_affine_improvement_s,
+            "min_affine_drift_ppm": self.min_affine_drift_ppm,
+            "ambiguity_mapping_separation_s": self.ambiguity_mapping_separation_s,
         }
-        bad = sorted(name for name, value in positive.items() if float(value) <= 0)
+        bad = sorted(
+            name
+            for name, value in positive.items()
+            if isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(float(value))
+            or float(value) <= 0
+        )
         if bad:
             raise SynchronizationError(f"config fields must be positive: {bad}")
-        if not 0.0 < self.motion_range_quantile <= 1.0:
+        nonnegative = {
+            "ambiguity_rmse_margin_s": self.ambiguity_rmse_margin_s,
+            "ambiguity_score_margin": self.ambiguity_score_margin,
+        }
+        bad_nonnegative = sorted(
+            name
+            for name, value in nonnegative.items()
+            if isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not np.isfinite(float(value))
+            or float(value) < 0
+        )
+        if bad_nonnegative:
+            raise SynchronizationError(
+                f"config fields must be finite and non-negative: {bad_nonnegative}"
+            )
+        for name, value in (
+            ("rsp_fixed_high", self.rsp_fixed_high),
+            ("rsp_fixed_low", self.rsp_fixed_low),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(float(value))
+            ):
+                raise SynchronizationError(f"{name} must be null or a finite number")
+        if (
+            isinstance(self.motion_range_quantile, bool)
+            or not isinstance(self.motion_range_quantile, (int, float))
+            or not np.isfinite(self.motion_range_quantile)
+            or not (0.0 < self.motion_range_quantile <= 1.0)
+        ):
             raise SynchronizationError("motion_range_quantile must be in (0, 1]")
-        if not 0.0 <= self.accept_min_confidence <= 1.0:
+        if (
+            isinstance(self.accept_min_confidence, bool)
+            or not isinstance(self.accept_min_confidence, (int, float))
+            or not np.isfinite(self.accept_min_confidence)
+            or not (0.0 <= self.accept_min_confidence <= 1.0)
+        ):
             raise SynchronizationError("accept_min_confidence must be in [0, 1]")
         if self.min_marker_pairs < 2 or self.min_affine_pairs < 2:
             raise SynchronizationError("marker pair gates must be at least two")
@@ -198,13 +268,80 @@ class SynchronizationConfig:
         return asdict(self)
 
 
-def load_synchronization_config(path: str | Path) -> SynchronizationConfig:
-    """Read and validate a YAML synchronization contract."""
+def _configuration_source_snapshot(
+    path: str | Path, *, expected_sha256: str | None = None
+) -> bytes:
+    """Return the exact unaliased regular-file bytes consumed by the parser."""
 
-    config_path = Path(path)
+    config_path = Path(path).expanduser().absolute()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
     try:
-        value = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        before_path = os.stat(config_path, follow_symlinks=False)
+        descriptor = os.open(config_path, flags)
+        before_fd = os.fstat(descriptor)
+        if not (
+            stat.S_ISREG(before_path.st_mode)
+            and stat.S_ISREG(before_fd.st_mode)
+            and before_path.st_nlink == before_fd.st_nlink == 1
+            and (before_path.st_dev, before_path.st_ino)
+            == (before_fd.st_dev, before_fd.st_ino)
+        ):
+            raise SynchronizationError(
+                f"synchronization config must be an unaliased regular file: {config_path}"
+            )
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+        payload = b"".join(chunks)
+        after_fd = os.fstat(descriptor)
+        after_path = os.stat(config_path, follow_symlinks=False)
+    except OSError as exc:
+        raise SynchronizationError(f"cannot read synchronization config: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    signature = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if not (
+        signature(before_fd) == signature(after_fd) == signature(after_path)
+        and before_fd.st_size == len(payload)
+    ):
+        raise SynchronizationError(
+            f"synchronization config changed while being snapshotted: {config_path}"
+        )
+    observed_sha256 = digest.hexdigest()
+    if expected_sha256 is not None and observed_sha256 != expected_sha256:
+        raise SynchronizationError(
+            "synchronization config consumed-byte SHA-256 mismatch: "
+            f"expected {expected_sha256}, observed {observed_sha256}"
+        )
+    return payload
+
+
+def load_synchronization_config(
+    path: str | Path, *, expected_sha256: str | None = None
+) -> SynchronizationConfig:
+    """Read one same-inode YAML snapshot and validate the synchronization contract."""
+
+    try:
+        payload = _configuration_source_snapshot(
+            path, expected_sha256=expected_sha256
+        )
+        value = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeError, yaml.YAMLError) as exc:
         raise SynchronizationError(f"cannot read synchronization config: {exc}") from exc
     return SynchronizationConfig.from_mapping(value)
 
@@ -229,6 +366,7 @@ class MarkerCandidate:
 class RadarMotionEnvelope:
     times_s: np.ndarray = field(repr=False, compare=False)
     robust_z: np.ndarray = field(repr=False, compare=False)
+    valid_mask: np.ndarray = field(repr=False, compare=False)
     valid_view_count: int
     repaired_nonfinite_values: int
 
@@ -244,6 +382,14 @@ class TimeMapping:
     def __post_init__(self) -> None:
         if self.mode not in {"constant", "affine"}:
             raise SynchronizationError(f"unknown time mapping mode: {self.mode!r}")
+        if any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            for value in (self.offset_s, self.scale)
+        ):
+            raise SynchronizationError(
+                "time mapping parameters must be real numbers"
+            )
         if not np.isfinite(self.offset_s) or not np.isfinite(self.scale):
             raise SynchronizationError("time mapping parameters must be finite")
         if self.scale <= 0:
@@ -273,10 +419,15 @@ class TimeMapping:
     def from_dict(cls, raw: Mapping[str, Any]) -> "TimeMapping":
         if not isinstance(raw, Mapping):
             raise SynchronizationError("mapping must be a JSON object")
+        mode = raw.get("mode")
+        if not isinstance(mode, str):
+            raise SynchronizationError("mapping mode must be a JSON string")
         return cls(
-            mode=str(raw.get("mode")),  # type: ignore[arg-type]
-            offset_s=float(raw.get("offset_s")),
-            scale=float(raw.get("scale")),
+            mode=mode,  # type: ignore[arg-type]
+            offset_s=_require_json_number(
+                raw.get("offset_s"), "mapping offset_s"
+            ),
+            scale=_require_json_number(raw.get("scale"), "mapping scale"),
         )
 
 
@@ -393,6 +544,7 @@ def robust_radar_motion_envelope(
     radar_payload: np.ndarray,
     *,
     radar_times_s: Sequence[float] | np.ndarray | None = None,
+    radar_valid_mask: np.ndarray | Sequence[bool] | None = None,
     config: SynchronizationConfig | None = None,
 ) -> RadarMotionEnvelope:
     """Build a target-free motion envelope from exact 182-float payloads.
@@ -417,22 +569,66 @@ def robust_radar_motion_envelope(
     if payload.shape[0] < 1 or payload.shape[1] < 3:
         raise SynchronizationError("radar_payload contains too few views or frames")
 
+    if radar_valid_mask is None:
+        validity = np.ones(payload.shape[:2], dtype=np.bool_)
+    else:
+        validity = np.asarray(radar_valid_mask)
+        if validity.dtype != np.bool_:
+            raise SynchronizationError("radar_valid_mask must have boolean dtype")
+        if validity.shape == (payload.shape[1],):
+            validity = np.broadcast_to(validity, payload.shape[:2])
+        elif validity.shape != payload.shape[:2]:
+            raise SynchronizationError(
+                "radar_valid_mask must have shape [time] or [radar,time]"
+            )
+
+    smoothing_frames = max(
+        1, int(round(cfg.motion_smoothing_s * cfg.radar_sample_rate_hz))
+    )
+    invalid_guard_radius = max(1, int(math.ceil(smoothing_frames / 2.0)))
     frames = np.asarray(payload, dtype=np.float64).copy()
-    repaired = int((~np.isfinite(frames)).sum())
+    repaired = 0
     valid_views: list[np.ndarray] = []
-    for view in frames:
-        finite_fraction = np.isfinite(view).mean()
+    valid_transitions: list[np.ndarray] = []
+    for view_index, view in enumerate(frames):
+        frame_valid = validity[view_index]
+        if np.count_nonzero(frame_valid) < 3:
+            continue
+        finite_fraction = np.isfinite(view[frame_valid]).mean()
         if finite_fraction < 0.95:
             continue
-        if not np.isfinite(view).all():
-            column_median = np.nanmedian(np.where(np.isfinite(view), view, np.nan), axis=0)
+        bad_available = frame_valid[:, None] & ~np.isfinite(view)
+        repaired += int(np.count_nonzero(bad_available))
+        if bad_available.any():
+            available_values = np.where(
+                frame_valid[:, None] & np.isfinite(view), view, np.nan
+            )
+            column_median = np.nanmedian(available_values, axis=0)
             column_median = np.where(np.isfinite(column_median), column_median, 0.0)
-            bad_row, bad_col = np.nonzero(~np.isfinite(view))
+            bad_row, bad_col = np.nonzero(bad_available)
             view[bad_row, bad_col] = column_median[bad_col]
 
         delta = np.abs(np.diff(view, axis=0, prepend=view[[0]]))
-        per_bin_center = np.median(delta, axis=0)
-        per_bin_mad = np.median(np.abs(delta - per_bin_center[None, :]), axis=0)
+        transition_valid = frame_valid & np.concatenate(
+            (np.asarray([False]), frame_valid[:-1])
+        )
+        invalid_transition = ~transition_valid
+        guard_kernel = np.ones(
+            min(2 * invalid_guard_radius + 1, invalid_transition.size),
+            dtype=np.int16,
+        )
+        guarded_invalid = (
+            np.convolve(invalid_transition.astype(np.int16), guard_kernel, mode="same")
+            > 0
+        )
+        transition_valid &= ~guarded_invalid
+        if np.count_nonzero(transition_valid) < 2:
+            continue
+        valid_delta = delta[transition_valid]
+        per_bin_center = np.median(valid_delta, axis=0)
+        per_bin_mad = np.median(
+            np.abs(valid_delta - per_bin_center[None, :]), axis=0
+        )
         per_bin_scale = 1.4826 * per_bin_mad
         positive = per_bin_scale[per_bin_scale > np.finfo(np.float64).eps]
         scale_floor = (
@@ -444,21 +640,79 @@ def robust_radar_motion_envelope(
             per_bin_scale[None, :], scale_floor
         )
         standardized = np.clip(standardized, 0.0, cfg.motion_clip_z)
-        valid_views.append(
-            np.quantile(standardized, cfg.motion_range_quantile, axis=1)
+        view_envelope = np.zeros(payload.shape[1], dtype=np.float64)
+        view_envelope[transition_valid] = np.quantile(
+            standardized[transition_valid], cfg.motion_range_quantile, axis=1
         )
+        valid_views.append(view_envelope)
+        valid_transitions.append(transition_valid)
 
     if not valid_views:
         raise SynchronizationError("no radar view has at least 95% finite payload values")
     per_view = np.stack(valid_views, axis=0)
+    per_view_valid = np.stack(valid_transitions, axis=0)
+    combined_valid = per_view_valid.any(axis=0)
+    # A change in which physical radar views contribute can create a step in
+    # the median/max aggregate even when at least one view remains valid.
+    # Treat those topology boundaries as unavailable marker evidence and guard
+    # their full smoothing footprint.
+    topology_change = np.zeros(payload.shape[1], dtype=np.bool_)
+    topology_change[1:] = np.any(
+        per_view_valid[:, 1:] != per_view_valid[:, :-1], axis=0
+    )
+    if topology_change.any():
+        topology_kernel = np.ones(
+            min(2 * invalid_guard_radius + 1, topology_change.size),
+            dtype=np.int16,
+        )
+        topology_guard = (
+            np.convolve(
+                topology_change.astype(np.int16), topology_kernel, mode="same"
+            )
+            > 0
+        )
+        combined_valid &= ~topology_guard
     if per_view.shape[0] == 1:
         combined = per_view[0]
     else:
-        combined = 0.5 * np.median(per_view, axis=0) + 0.5 * np.max(per_view, axis=0)
-    smoothing_frames = max(1, int(round(cfg.motion_smoothing_s * cfg.radar_sample_rate_hz)))
-    smoothed = uniform_filter1d(combined, size=smoothing_frames, mode="nearest")
-    center, scale = _robust_location_scale(smoothed)
+        masked_view = np.where(per_view_valid, per_view, np.nan)
+        combined = np.zeros(payload.shape[1], dtype=np.float64)
+        valid_values = masked_view[:, combined_valid]
+        combined[combined_valid] = 0.5 * np.nanmedian(
+            valid_values, axis=0
+        ) + 0.5 * np.nanmax(valid_values, axis=0)
+    # Smooth with explicit support accounting.  Zero is a legitimate radar
+    # value, so invalid placeholders must neither dilute a neighboring output
+    # nor be hidden behind the pre-smoothing validity mask.  A returned valid
+    # sample has a completely valid filter footprint.
+    support_fraction = uniform_filter1d(
+        combined_valid.astype(np.float64),
+        size=smoothing_frames,
+        mode="constant",
+        cval=0.0,
+    )
+    smoothed_numerator = uniform_filter1d(
+        np.where(combined_valid, combined, 0.0),
+        size=smoothing_frames,
+        mode="constant",
+        cval=0.0,
+    )
+    smoothed = np.divide(
+        smoothed_numerator,
+        support_fraction,
+        out=np.zeros_like(combined),
+        where=support_fraction > 0.0,
+    )
+    smoothed_valid = combined_valid & np.isclose(
+        support_fraction, 1.0, rtol=0.0, atol=1.0e-12
+    )
+    if not smoothed_valid.any():
+        raise SynchronizationError(
+            "no radar view has complete valid smoothing support"
+        )
+    center, scale = _robust_location_scale(smoothed[smoothed_valid])
     robust_z = np.maximum((smoothed - center) / scale, 0.0)
+    robust_z[~smoothed_valid] = 0.0
     times = _as_increasing_times(
         radar_times_s,
         payload.shape[1],
@@ -468,6 +722,7 @@ def robust_radar_motion_envelope(
     return RadarMotionEnvelope(
         times_s=times,
         robust_z=robust_z,
+        valid_mask=smoothed_valid,
         valid_view_count=len(valid_views),
         repaired_nonfinite_values=repaired,
     )
@@ -514,6 +769,9 @@ def detect_radar_marker_candidates(
     z = np.asarray(envelope.robust_z, dtype=np.float64)
     if z.size != envelope.times_s.size or z.ndim != 1:
         raise SynchronizationError("radar motion envelope vectors are inconsistent")
+    valid = np.asarray(envelope.valid_mask)
+    if valid.dtype != np.bool_ or valid.shape != z.shape:
+        raise SynchronizationError("radar motion envelope valid mask is inconsistent")
     dt = float(np.median(np.diff(envelope.times_s)))
     distance = max(1, int(round(cfg.radar_marker_merge_s / dt)))
     peaks, _ = find_peaks(
@@ -522,6 +780,7 @@ def detect_radar_marker_candidates(
         prominence=cfg.radar_marker_prominence_z,
         distance=distance,
     )
+    peaks = peaks[valid[peaks]]
     return _merge_marker_indices(
         [(int(index), "motion") for index in peaks],
         z,
@@ -893,6 +1152,7 @@ def estimate_marker_time_mapping(
     alternative: _CandidateSolution | None = None
     reference_times = np.asarray(matched_radar_times or [0.0], dtype=np.float64)
     best_projection = best.mapping.radar_to_rsp(reference_times)
+    separated: list[tuple[_CandidateSolution, float]] = []
     for candidate in candidates:
         if candidate is best:
             continue
@@ -900,14 +1160,21 @@ def estimate_marker_time_mapping(
             np.max(np.abs(candidate.mapping.radar_to_rsp(reference_times) - best_projection))
         )
         if separation >= cfg.ambiguity_mapping_separation_s:
-            alternative = candidate
-            break
-    ambiguous = False
-    if alternative is not None:
-        same_count = len(alternative.pairs) == len(best.pairs)
-        close_rmse = alternative.rmse_s <= best.rmse_s + cfg.ambiguity_rmse_margin_s
-        close_score = alternative.score >= best.score - cfg.ambiguity_score_margin
-        ambiguous = same_count and close_rmse and close_score
+            separated.append((candidate, separation))
+    dangerous = [
+        (candidate, separation)
+        for candidate, separation in separated
+        if len(candidate.pairs) == len(best.pairs)
+        and candidate.rmse_s <= best.rmse_s + cfg.ambiguity_rmse_margin_s
+        and candidate.score >= best.score - cfg.ambiguity_score_margin
+    ]
+    ambiguous = bool(dangerous)
+    pool = dangerous if dangerous else separated
+    if pool:
+        alternative = max(
+            pool,
+            key=lambda item: (item[0].score, -item[0].rmse_s, item[1]),
+        )[0]
 
     pair_score = min(1.0, len(best.pairs) / float(cfg.good_marker_pairs))
     span_score = min(1.0, marker_span / max(cfg.min_marker_span_s, 1e-12))
@@ -1009,6 +1276,7 @@ def synchronize_from_signals(
     *,
     epoch_prior_offset_s: float,
     radar_times_s: Sequence[float] | np.ndarray | None = None,
+    radar_valid_mask: np.ndarray | Sequence[bool] | None = None,
     rsp_times_s: Sequence[float] | np.ndarray | None = None,
     config: SynchronizationConfig | None = None,
 ) -> SynchronizationResult:
@@ -1016,7 +1284,10 @@ def synchronize_from_signals(
 
     cfg = config or SynchronizationConfig()
     envelope = robust_radar_motion_envelope(
-        radar_payload, radar_times_s=radar_times_s, config=cfg
+        radar_payload,
+        radar_times_s=radar_times_s,
+        radar_valid_mask=radar_valid_mask,
+        config=cfg,
     )
     radar_markers = detect_radar_marker_candidates(envelope, config=cfg)
     rsp_markers = detect_rsp_marker_candidates(
@@ -1035,6 +1306,31 @@ def synchronize_from_signals(
             "radar_nonfinite_values_repaired": envelope.repaired_nonfinite_values,
             "radar_envelope_target_free": True,
             "radar_payload_interpretation": "182_real_float_payload_values",
+            "radar_valid_mask_applied": radar_valid_mask is not None,
+            "radar_input_valid_mask_sha256": (
+                None
+                if radar_valid_mask is None
+                else hashlib.sha256(
+                    np.ascontiguousarray(
+                        np.asarray(radar_valid_mask), dtype=np.bool_
+                    ).tobytes()
+                ).hexdigest()
+            ),
+            "radar_envelope_valid_mask_sha256": hashlib.sha256(
+                np.ascontiguousarray(envelope.valid_mask).tobytes()
+            ).hexdigest(),
+            "radar_invalid_guard_policy": (
+                "adjacent_pair_smoothing_support_and_view_topology"
+            ),
+            "radar_invalid_guard_radius_frames": max(
+                1,
+                int(
+                    math.ceil(
+                        round(cfg.motion_smoothing_s * cfg.radar_sample_rate_hz)
+                        / 2.0
+                    )
+                ),
+            ),
         }
     )
     return SynchronizationResult(
@@ -1162,7 +1458,9 @@ def canonical_content_sha256(document: Mapping[str, Any]) -> str:
 
 
 def _require_sha256(value: Any, label: str) -> str:
-    digest = str(value)
+    if not isinstance(value, str):
+        raise SynchronizationError(f"{label} must be a lowercase SHA-256")
+    digest = value
     if len(digest) != 64 or digest.lower() != digest or any(
         character not in "0123456789abcdef" for character in digest
     ):
@@ -1235,6 +1533,7 @@ def build_sync_receipt(
             "radar_payload_bins": EXPECTED_RADAR_PAYLOAD_BINS,
             "radar_motion_target_free": True,
             "time_mapping_equation": "rsp_time_s=offset_s+scale*radar_time_s",
+            "proposal_replay_semantics": SYNC_PROPOSAL_REPLAY_SEMANTICS,
             "config": config.to_dict(),
             "config_sha256": hashlib.sha256(canonical_json_bytes(config.to_dict())).hexdigest(),
         },
@@ -1273,6 +1572,14 @@ def validate_sync_receipt(
         raise SynchronizationError("sync receipt is not bound to 182 payload floats")
     if algorithm.get("radar_motion_target_free") is not True:
         raise SynchronizationError("sync receipt lacks target-free radar declaration")
+    proposal_replay_semantics = algorithm.get("proposal_replay_semantics")
+    if proposal_replay_semantics not in {
+        None,
+        SYNC_PROPOSAL_REPLAY_SEMANTICS,
+    }:
+        raise SynchronizationError(
+            "sync receipt proposal replay semantics are unknown"
+        )
     config = algorithm.get("config")
     if not isinstance(config, Mapping):
         raise SynchronizationError("sync receipt config must be an object")
@@ -1492,6 +1799,25 @@ def validate_sync_receipt(
         if marker_span_s != 0.0:
             raise SynchronizationError("sync receipt reports marker span without matches")
 
+    if decision == "accepted":
+        if len(matches) < config_object.min_marker_pairs:
+            raise SynchronizationError("accepted sync receipt violates marker pair gate")
+        if marker_span_s < config_object.min_marker_span_s:
+            raise SynchronizationError("accepted sync receipt violates marker span gate")
+        assert reported_rmse is not None and reported_max is not None
+        if reported_rmse_value > config_object.accept_max_rmse_s:
+            raise SynchronizationError("accepted sync receipt violates residual RMSE gate")
+        if reported_max_value > config_object.accept_max_abs_residual_s:
+            raise SynchronizationError("accepted sync receipt violates maximum residual gate")
+
+    # Receipts produced before the replay-semantics capability marker remain
+    # readable as historical, self-hashed diagnostic evidence.  They cannot
+    # authorize synchronization, so a later estimator improvement must not
+    # make the immutable record unreadable merely because its old proposal
+    # replay chose a different ambiguity alternative.
+    if proposal_replay_semantics is None:
+        return document
+
     # A content hash proves byte integrity, not that a re-hashed result is the
     # deterministic proposal implied by its marker lists.  Reconstruct that
     # proposal and require authority-relevant geometry to agree.  A caller may
@@ -1551,15 +1877,6 @@ def validate_sync_receipt(
             "sync receipt omits estimator failure reasons: "
             + ", ".join(missing_reasons)
         )
-    if decision == "accepted":
-        if len(matches) < config_object.min_marker_pairs:
-            raise SynchronizationError("accepted sync receipt violates marker pair gate")
-        if float(result.get("marker_span_s")) < config_object.min_marker_span_s:
-            raise SynchronizationError("accepted sync receipt violates marker span gate")
-        if float(reported_rmse) > config_object.accept_max_rmse_s:
-            raise SynchronizationError("accepted sync receipt violates residual RMSE gate")
-        if float(reported_max) > config_object.accept_max_abs_residual_s:
-            raise SynchronizationError("accepted sync receipt violates maximum residual gate")
     return document
 
 
@@ -1638,7 +1955,12 @@ def build_manual_approval(
     reviewed_at_utc: str,
     rationale: str,
 ) -> dict[str, Any]:
-    """Build an explicit human decision bound to one exact sync proposal."""
+    """Build a legacy audit decision bound to one exact sync proposal.
+
+    The v1 artifact has no cryptographic trust anchor.  It is retained for
+    forensic review and rejection overrides, but an ``approve`` value cannot
+    grant scientific synchronization authority.
+    """
 
     validated = validate_sync_receipt(receipt)
     if not isinstance(reviewer_id, str) or not reviewer_id.strip() or reviewer_id != reviewer_id.strip():
@@ -1699,7 +2021,21 @@ def synchronization_is_authorized(
     *,
     manual_approval: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Return whether a mapping may be consumed, validating all bindings."""
+    """Return whether a mapping may be consumed, validating all bindings.
+
+    Both the v1 synchronization receipt and its manual decision are self-hashed
+    documents.  The receipt validator can prove internal consistency and exact
+    raw-file *bindings*, but it cannot prove that its embedded radar/RSP marker
+    lists were independently re-derived from those raw bytes.  Consequently no
+    v1 receipt can grant scientific synchronization authority.  It remains
+    readable as retrospective evidence, and a manual rejection is still
+    validated as a conservative audit decision.
+
+    A successor authorization schema must bind a separately trusted verifier
+    that replays raw loading, causal timing/mask construction, marker
+    extraction, and mapping estimation before this function may ever return
+    ``True``.
+    """
 
     validated = validate_sync_receipt(receipt)
     result = validated["result"]
@@ -1708,12 +2044,13 @@ def synchronization_is_authorized(
         if manual_approval is None
         else validate_manual_approval(manual_approval, validated)
     )
-    if result["decision"] == "accepted":
-        # Manual rejection remains a fail-safe override of automatic approval.
-        return approval is None or approval["decision"] != "reject"
-    if result["decision"] != "manual_review_required" or result["ambiguous"]:
-        return False
-    return approval is not None and approval["decision"] == "approve"
+    if result["decision"] == "accepted" and approval is not None:
+        # Validate and retain a rejection as audit evidence.  Even in its
+        # absence, the self-hashed v1 proposal has no independent raw-derived
+        # authority and therefore remains fail-closed.
+        if approval["decision"] == "reject":
+            return False
+    return False
 
 
 __all__ = [

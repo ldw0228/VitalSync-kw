@@ -19,6 +19,8 @@ import numpy as np
 import yaml
 
 from .acquisition_protocol import (
+    AcquisitionProtocolConfig,
+    _source_snapshot,
     load_dataset_issue_records,
     load_protocol_config,
 )
@@ -30,13 +32,13 @@ from .data import (
 )
 from .preprocess import identity_for_session
 from .synchronization import (
+    SynchronizationConfig,
     TimeMapping,
     canonical_content_sha256,
     canonical_json_bytes,
-    load_synchronization_config,
-    read_sync_receipt,
     synchronization_is_authorized,
     validate_manual_approval,
+    validate_sync_receipt,
 )
 
 
@@ -133,13 +135,20 @@ def _authority_string_array(
 
 def load_acquisition_cohort_authority(
     path: str | Path,
+    *,
+    expected_sha256: str | None = None,
 ) -> AcquisitionCohortAuthority:
     """Parse and validate the immutable v1 cohort authority artifact."""
 
     authority_path = Path(path).resolve()
     try:
-        document = yaml.safe_load(authority_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        payload, _ = _source_snapshot(
+            authority_path,
+            label="cohort authority",
+            expected_sha256=expected_sha256,
+        )
+        document = yaml.safe_load(payload.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError) as error:
         raise AcquisitionContractError(
             f"cannot read cohort authority {authority_path}: {error}"
         ) from error
@@ -367,7 +376,7 @@ class StageWindowAssignment:
     reason: str
 
 
-def _read_strict_json(path: Path) -> dict[str, Any]:
+def _read_strict_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -384,16 +393,21 @@ def _read_strict_json(path: Path) -> dict[str, Any]:
         )
 
     try:
+        payload, digest = _source_snapshot(path, label="acquisition JSON")
         value = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload.decode("utf-8"),
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_nonfinite,
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise AcquisitionContractError(f"cannot read acquisition JSON {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise AcquisitionContractError(f"acquisition JSON must be an object: {path}")
-    return value
+    return value, digest
+
+
+def _read_strict_json(path: Path) -> dict[str, Any]:
+    return _read_strict_json_snapshot(path)[0]
 
 
 def _require_content_hash(document: Mapping[str, Any], label: str) -> str:
@@ -691,17 +705,35 @@ def _require_finite_float(
     document: Mapping[str, Any], key: str, label: str, *, minimum: float | None = None
 ) -> float:
     value = document.get(key)
-    if isinstance(value, bool):
+    # This validator consumes JSON, whose numeric domain is exactly int/float.
+    # Do not let ``float(...)`` launder strings or booleans into authority-
+    # relevant timing/confidence values.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise AcquisitionContractError(f"{label}.{key} must be a finite number")
-    try:
-        result = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise AcquisitionContractError(
-            f"{label}.{key} must be a finite number"
-        ) from exc
+    result = float(value)
     if not np.isfinite(result) or (minimum is not None and result < minimum):
         raise AcquisitionContractError(f"{label}.{key} must be a finite number")
     return result
+
+
+def _protocol_decode_has_independent_verification(
+    _session: Mapping[str, Any],
+    _receipt: Mapping[str, Any],
+    _protocol_config: AcquisitionProtocolConfig,
+) -> bool:
+    """Return whether raw-derived protocol decoding has external authority.
+
+    Acquisition-reconstruction v2 stores a self-hashed decoded protocol but
+    does not preserve a separately trusted replay receipt that re-derives the
+    complete boundary path from the bound raw inputs.  Keep historical stage
+    documents readable while making their metric eligibility fail closed.
+
+    A successor generation must replace this boundary with a verifier whose
+    trust root is outside the artifact being verified.  A local boolean or a
+    second self-hash is not sufficient.
+    """
+
+    return False
 
 
 def _require_unique_string_array(
@@ -1651,14 +1683,9 @@ def load_acquisition_reconstruction(
         _require_sha256(
             document, "cohort_authority_sha256", "acquisition root"
         )
-        if _sha256_file(cohort_authority_path) != document[
-            "cohort_authority_sha256"
-        ]:
-            raise AcquisitionContractError(
-                "acquisition root cohort authority file hash mismatch"
-            )
         cohort_authority = load_acquisition_cohort_authority(
-            cohort_authority_path
+            cohort_authority_path,
+            expected_sha256=str(document["cohort_authority_sha256"]),
         )
         if document.get("cohort_authority_schema") != (
             ACQUISITION_COHORT_AUTHORITY_SCHEMA
@@ -1758,28 +1785,20 @@ def load_acquisition_reconstruction(
             raise AcquisitionContractError(
                 f"bound synchronization config is missing: {sync_config_path}"
             )
-        if _sha256_file(sync_config_path) != document["sync_config_sha256"]:
-            raise AcquisitionContractError(
-                "acquisition root synchronization config file hash mismatch"
-            )
         try:
-            root_sync_config = load_synchronization_config(sync_config_path)
-        except ValueError as error:
+            sync_config_payload, _ = _source_snapshot(
+                sync_config_path,
+                label="synchronization configuration",
+                expected_sha256=str(document["sync_config_sha256"]),
+            )
+            root_sync_config = SynchronizationConfig.from_mapping(
+                yaml.safe_load(sync_config_payload.decode("utf-8"))
+            )
+        except (UnicodeError, ValueError, yaml.YAMLError) as error:
             raise AcquisitionContractError(
                 f"bound synchronization config is invalid: {error}"
             ) from error
         root_sync_config_document = root_sync_config.to_dict()
-        if _sha256_file(sync_config_path) != document["sync_config_sha256"]:
-            raise AcquisitionContractError(
-                "bound synchronization config changed while being parsed"
-            )
-        if _sha256_file(cohort_authority_path) != document[
-            "cohort_authority_sha256"
-        ]:
-            raise AcquisitionContractError(
-                "bound cohort authority changed while being parsed"
-            )
-
         protocol_config_path, protocol_config_hash = _resolve_bound_external_file(
             document,
             reconstruction_root=root,
@@ -1795,7 +1814,9 @@ def load_acquisition_reconstruction(
             label="dataset issue spreadsheet",
         )
         try:
-            root_protocol_config = load_protocol_config(protocol_config_path)
+            root_protocol_config = load_protocol_config(
+                protocol_config_path, expected_sha256=protocol_config_hash
+            )
         except ValueError as error:
             raise AcquisitionContractError(
                 f"bound protocol configuration is invalid: {error}"
@@ -1815,6 +1836,7 @@ def load_acquisition_reconstruction(
                 spreadsheet_path,
                 dataset_root=dataset_root,
                 config=root_protocol_config,
+                expected_sha256=spreadsheet_hash,
             )
             discovered_dataset = build_dataset_manifest(dataset_root)
         except (OSError, ValueError, BadZipFile) as error:
@@ -1934,13 +1956,18 @@ def load_acquisition_reconstruction(
 
     sessions: dict[str, AcquisitionSessionContract] = {}
     observed_usable_ids: list[str] = []
+    # Keep separately recorded historical claims so old self-hashed v2
+    # artifacts remain inspectable.  Effective authority is derived below and
+    # is necessarily stricter in the absence of an independent raw replay.
+    declared_authorized_count = 0
+    declared_eligible_count = 0
     authorized_count = 0
     eligible_count = 0
     for entry in entries:
         assert isinstance(entry, Mapping)
         session_id = str(entry["session_id"])
         session_path = _resolve_inside(root, entry.get("manifest"), "session manifest path")
-        session = _read_strict_json(session_path)
+        session, session_file_sha256 = _read_strict_json_snapshot(session_path)
         if session.get("schema_version") != schema:
             raise AcquisitionContractError(f"{session_id} has an incompatible session schema")
         if session.get("session_id") != session_id:
@@ -1948,7 +1975,7 @@ def load_acquisition_reconstruction(
         session_hash = _require_content_hash(session, f"{session_id} session manifest")
         if entry.get("content_sha256") != session_hash:
             raise AcquisitionContractError(f"{session_id} root/session hash mismatch")
-        if is_v2 and entry.get("manifest_sha256") != _sha256_file(session_path):
+        if is_v2 and entry.get("manifest_sha256") != session_file_sha256:
             raise AcquisitionContractError(f"{session_id} root/session file hash mismatch")
         if is_v2:
             context = session.get("reconstruction_context")
@@ -2036,10 +2063,13 @@ def load_acquisition_reconstruction(
         if not isinstance(sync, Mapping):
             raise AcquisitionContractError(f"{session_id} lacks synchronization metadata")
         receipt_path = _resolve_inside(root, sync.get("receipt"), "sync receipt path")
-        receipt = read_sync_receipt(receipt_path)
+        receipt_document, receipt_file_sha256 = _read_strict_json_snapshot(
+            receipt_path
+        )
+        receipt = validate_sync_receipt(receipt_document)
         if receipt.get("session_id") != session_id:
             raise AcquisitionContractError(f"{session_id} sync receipt ID mismatch")
-        if sync.get("receipt_sha256") != _sha256_file(receipt_path):
+        if sync.get("receipt_sha256") != receipt_file_sha256:
             raise AcquisitionContractError(f"{session_id} sync receipt file hash mismatch")
         if sync.get("receipt_content_sha256") != receipt.get("content_sha256"):
             raise AcquisitionContractError(f"{session_id} sync receipt content hash mismatch")
@@ -2123,7 +2153,9 @@ def load_acquisition_reconstruction(
             approval_path = _resolve_inside(
                 root, stated_approval_path, "manual approval path"
             )
-            approval = _read_strict_json(approval_path)
+            approval, approval_file_sha256 = _read_strict_json_snapshot(
+                approval_path
+            )
             approval = validate_manual_approval(approval, receipt)
             if is_v2:
                 _require_sha256(
@@ -2136,7 +2168,7 @@ def load_acquisition_reconstruction(
                     "manual_approval_content_sha256",
                     f"{session_id}.synchronization",
                 )
-            if sync.get("manual_approval_file_sha256") != _sha256_file(approval_path):
+            if sync.get("manual_approval_file_sha256") != approval_file_sha256:
                 raise AcquisitionContractError(
                     f"{session_id} manual approval file hash mismatch"
                 )
@@ -2150,9 +2182,38 @@ def load_acquisition_reconstruction(
             raise AcquisitionContractError(
                 f"{session_id} states a manual approval but does not bind its artifact"
             )
-        authorized = synchronization_is_authorized(receipt, manual_approval=approval)
-        if type(sync.get("authorized")) is not bool or sync.get("authorized") != authorized:
-            raise AcquisitionContractError(f"{session_id} authorization statement mismatch")
+        declared_authorized = _require_bool(
+            sync, "authorized", f"{session_id}.synchronization"
+        )
+        receipt_result = receipt.get("result")
+        assert isinstance(receipt_result, Mapping)
+        receipt_decision = receipt_result.get("decision")
+        legacy_decision_supports_claim = bool(
+            (
+                receipt_decision == "accepted"
+                or (
+                    receipt_decision == "manual_review_required"
+                    and approval is not None
+                    and approval.get("decision") == "approve"
+                )
+            )
+            and (approval is None or approval.get("decision") != "reject")
+        )
+        if declared_authorized and not legacy_decision_supports_claim:
+            raise AcquisitionContractError(
+                f"{session_id} historical authorization exceeds its receipt"
+            )
+        # A stored v2 `authorized=true` value is preserved as historical
+        # evidence only.  Scientific consumers require the independent
+        # raw-derived verifier represented by synchronization_is_authorized;
+        # current v1 receipts deliberately return False there.
+        authorized = bool(
+            declared_authorized
+            and synchronization_is_authorized(
+                receipt, manual_approval=approval
+            )
+        )
+        declared_authorized_count += int(declared_authorized)
         authorized_count += int(authorized)
 
         protocol = session.get("protocol")
@@ -2239,8 +2300,14 @@ def load_acquisition_reconstruction(
                 raise AcquisitionContractError(
                     f"{session_id}.protocol.confidence exceeds one"
                 )
+            if len(protocol_stages) != len(root_protocol_config.stages):
+                raise AcquisitionContractError(
+                    f"{session_id}.protocol must contain the exact ordered seven phases"
+                )
             prior_end = 0.0
-            stage_ids: set[str] = set()
+            stage_ids: list[str] = []
+            stage_statuses: list[str] = []
+            stage_confidences: list[float] = []
             for stage_index, stage in enumerate(protocol_stages):
                 assert isinstance(stage, Mapping)
                 stage_label = f"{session_id}.protocol.stages[{stage_index}]"
@@ -2249,7 +2316,15 @@ def load_acquisition_reconstruction(
                     raise AcquisitionContractError(
                         f"{stage_label}.stage_id is missing or duplicated"
                     )
-                stage_ids.add(stage_id)
+                stage_ids.append(stage_id)
+                expected_stage = root_protocol_config.stages[stage_index]
+                if (
+                    stage_id != expected_stage.stage_id
+                    or stage.get("name") != expected_stage.name
+                ):
+                    raise AcquisitionContractError(
+                        f"{stage_label} differs from the ordered protocol configuration"
+                    )
                 start_document = stage.get("start")
                 end_document = stage.get("end")
                 if not isinstance(start_document, Mapping) or not isinstance(
@@ -2270,6 +2345,8 @@ def load_acquisition_reconstruction(
                 stage_confidence = _require_finite_float(
                     stage, "confidence", stage_label, minimum=0.0
                 )
+                stage_statuses.append(str(stage.get("status")))
+                stage_confidences.append(stage_confidence)
                 if (
                     stage_start < prior_end
                     or stage_end <= stage_start
@@ -2286,6 +2363,26 @@ def load_acquisition_reconstruction(
                         f"{stage_label} timing/confidence evidence is invalid"
                     )
                 prior_end = stage_end
+            expected_stage_ids = [
+                stage.stage_id for stage in root_protocol_config.stages
+            ]
+            if stage_ids != expected_stage_ids:
+                raise AcquisitionContractError(
+                    f"{session_id}.protocol must contain the exact ordered seven phases"
+                )
+            status_rank = {"auto": 0, "uncertain": 1, "review": 2}
+            derived_status = max(stage_statuses, key=lambda item: status_rank[item])
+            if protocol_status != derived_status:
+                raise AcquisitionContractError(
+                    f"{session_id}.protocol overall status is not derived from its stages"
+                )
+            derived_confidence = float(np.mean(stage_confidences))
+            if not np.isclose(
+                protocol_confidence, derived_confidence, rtol=0.0, atol=1e-12
+            ):
+                raise AcquisitionContractError(
+                    f"{session_id}.protocol confidence is not the stage mean"
+                )
 
         range_path: Path | None = None
         range_document = session.get("range_tracking")
@@ -2329,10 +2426,25 @@ def load_acquisition_reconstruction(
             else len(sources) == 3
             and all(source == "meta_v13" for source in sources)
         )
+        declared_alignment_expected = bool(
+            measured_timing_expected
+            and declared_authorized
+            and biopac_warning_free
+        )
+        declared_stage_expected = bool(
+            protocol_status == "auto" and declared_alignment_expected
+        )
         alignment_expected = bool(
             measured_timing_expected and authorized and biopac_warning_free
         )
-        stage_expected = protocol_status == "auto"
+        stage_expected = bool(
+            protocol_status == "auto"
+            and alignment_expected
+            and is_v2
+            and _protocol_decode_has_independent_verification(
+                session, receipt, root_protocol_config
+            )
+        )
         if is_v2:
             if not isinstance(range_document, Mapping):
                 raise AcquisitionContractError(
@@ -2360,6 +2472,7 @@ def load_acquisition_reconstruction(
                 and range_document.get("status") == "built"
                 and range_document.get("selected_session_layout") == "split_halves"
             )
+        declared_strict_expected = declared_alignment_expected
         strict_expected = alignment_expected
         if is_v2:
             eligibility = session.get("eligibility")
@@ -2367,50 +2480,57 @@ def load_acquisition_reconstruction(
                 raise AcquisitionContractError(
                     f"{session_id} lacks explicit eligibility components"
                 )
-            measured_timing_eligible = _require_bool(
+            claimed_measured_timing_eligible = _require_bool(
                 eligibility, "measured_timing_eligible", f"{session_id}.eligibility"
             )
-            alignment_eligible = _require_bool(
+            claimed_alignment_eligible = _require_bool(
                 eligibility, "alignment_eligible", f"{session_id}.eligibility"
             )
-            stage_metric_eligible = _require_bool(
+            claimed_stage_metric_eligible = _require_bool(
                 eligibility, "stage_metric_eligible", f"{session_id}.eligibility"
             )
-            range_feature_eligible = _require_bool(
+            claimed_range_feature_eligible = _require_bool(
                 eligibility, "range_feature_eligible", f"{session_id}.eligibility"
             )
-            strict_cache_eligible = _require_bool(
+            claimed_strict_cache_eligible = _require_bool(
                 eligibility, "strict_cache_eligible", f"{session_id}.eligibility"
             )
-            expected = (
+            declared_expected = (
                 measured_timing_expected,
-                alignment_expected,
-                stage_expected,
+                declared_alignment_expected,
+                declared_stage_expected,
                 range_expected,
-                strict_expected,
+                declared_strict_expected,
             )
             claimed = (
-                measured_timing_eligible,
-                alignment_eligible,
-                stage_metric_eligible,
-                range_feature_eligible,
-                strict_cache_eligible,
+                claimed_measured_timing_eligible,
+                claimed_alignment_eligible,
+                claimed_stage_metric_eligible,
+                claimed_range_feature_eligible,
+                claimed_strict_cache_eligible,
             )
-            if claimed != expected:
+            if claimed != declared_expected:
                 raise AcquisitionContractError(
                     f"{session_id} eligibility components do not match source evidence"
                 )
-            scientific_eligible = _require_bool(
+            claimed_scientific_eligible = _require_bool(
                 session, "scientific_eligible", session_id
             )
-            if scientific_eligible != strict_cache_eligible:
+            if claimed_scientific_eligible != claimed_strict_cache_eligible:
                 raise AcquisitionContractError(
                     f"{session_id} scientific eligibility alias mismatch"
                 )
-            if entry.get("scientific_eligible") is not scientific_eligible:
+            if entry.get("scientific_eligible") is not claimed_scientific_eligible:
                 raise AcquisitionContractError(
                     f"{session_id} root/session eligibility mismatch"
                 )
+            declared_eligible_count += int(claimed_scientific_eligible)
+            measured_timing_eligible = measured_timing_expected
+            alignment_eligible = alignment_expected
+            stage_metric_eligible = stage_expected
+            range_feature_eligible = range_expected
+            strict_cache_eligible = strict_expected
+            scientific_eligible = strict_cache_eligible
         else:
             # V1 mixed unrelated protocol/range hypotheses into one boolean and
             # did not prove full-cohort coverage.  It remains readable for
@@ -2476,28 +2596,38 @@ def load_acquisition_reconstruction(
             raise AcquisitionContractError("acquisition root usable-session count mismatch")
         if _require_nonnegative_int(
             document, "sync_authorized_session_count", "acquisition root"
-        ) != authorized_count:
+        ) != declared_authorized_count:
             raise AcquisitionContractError(
                 "acquisition root authorization count mismatch"
             )
         if _require_nonnegative_int(
             document, "scientific_eligible_session_count", "acquisition root"
-        ) != eligible_count:
+        ) != declared_eligible_count:
             raise AcquisitionContractError(
                 "acquisition root scientific-eligibility count mismatch"
             )
-        root_scientific = _require_bool(
+        claimed_root_scientific = _require_bool(
             document, "scientific_eligible", "acquisition root"
         )
-        expected_root_scientific = bool(
+        expected_claimed_root_scientific = bool(
             full_cohort_complete
             and observed_usable_ids
-            and eligible_count == len(observed_usable_ids)
+            and declared_eligible_count == len(observed_usable_ids)
         )
-        if root_scientific != expected_root_scientific:
+        if claimed_root_scientific != expected_claimed_root_scientific:
             raise AcquisitionContractError(
                 "acquisition root scientific eligibility does not match its children"
             )
+        # Historical claims remain available in ``manifest`` above.  The
+        # effective property exposed to cache consumers is gated by the
+        # independent raw-derived authorization boundary.
+        root_scientific = bool(
+            claimed_root_scientific
+            and full_cohort_complete
+            and observed_usable_ids
+            and eligible_count == len(observed_usable_ids)
+            and authorized_count == len(observed_usable_ids)
+        )
     else:
         root_scientific = False
 
@@ -2616,10 +2746,18 @@ def assign_stage_window(
             "insufficient_stage_overlap",
         )
     status = str(best.get("status"))
-    eligible = status == "auto"
+    # ``auto`` describes only the decoded stage's local status.  It is not an
+    # authority token.  The reconstruction loader derives
+    # ``stage_metric_eligible`` from synchronization and an independently
+    # verified protocol replay; every public window assignment must retain that
+    # exact session-level gate so callers cannot accidentally promote a
+    # diagnostic stage document into evaluation evidence.
+    eligible = bool(contract.stage_metric_eligible and status == "auto")
     stage_id = str(best.get("stage_id"))
     if eligible:
         reason = "assigned"
+    elif status == "auto" and not contract.stage_metric_eligible:
+        reason = "stage_metrics_not_authorized"
     elif status == "uncertain":
         reason = "stage_uncertain"
     elif status == "review":

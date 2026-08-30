@@ -9,8 +9,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import snn_rr.acquisition_contract as acquisition_contract_module
 import snn_rr.cache as cache_module
 from snn_rr.acquisition_contract import load_acquisition_cohort_authority
+from snn_rr.acquisition_protocol import load_protocol_config
 from snn_rr.data import build_dataset_manifest
 from snn_rr.cache import (
     ACQUISITION_CACHE_SCHEMA_VERSION,
@@ -46,9 +48,14 @@ _COHORT_AUTHORITY_PATH = (
 )
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PROTOCOL_CONFIG_PATH = _PROJECT_ROOT / "configs" / "acquisition_protocol_v1.yaml"
+_PROTOCOL_CONFIG = load_protocol_config(_PROTOCOL_CONFIG_PATH)
 _SPREADSHEET_PATH = _PROJECT_ROOT / "HAI_EXPERIMENT" / "Dataset_issue.xlsx"
 _DATASET_ROOT = _PROJECT_ROOT / "HAI_EXPERIMENT"
 _DISCOVERED_DATASET = build_dataset_manifest(_DATASET_ROOT)
+_REAL_SYNC_AUTHORIZER = acquisition_contract_module.synchronization_is_authorized
+_REAL_PROTOCOL_VERIFIER = (
+    acquisition_contract_module._protocol_decode_has_independent_verification
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +67,19 @@ def _reuse_stable_dataset_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "snn_rr.acquisition_contract._validate_v2_raw_input_graph",
         lambda *_args, **_kwargs: None,
+    )
+    # Strict-cache fixtures model a future independently verified acquisition
+    # generation.  The current production v1/v2 boundary is tested in
+    # test_acquisition_contract_v2 and remains fail-closed.
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "synchronization_is_authorized",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "_protocol_decode_has_independent_verification",
+        lambda *_args, **_kwargs: True,
     )
 
 
@@ -363,7 +383,7 @@ def _metadata(
         "sync_confidence": [0.95 if authorized else 0.5],
         "alignment_scientific_eligible": [eligible],
         "acquisition_phase": ["phase1"],
-        "acquisition_phase_name": ["synthetic_stage"],
+        "acquisition_phase_name": [_PROTOCOL_CONFIG.stages[0].name],
         "acquisition_phase_status": ["auto"],
         "acquisition_phase_confidence": [0.95],
         "phase_overlap_fraction": [1.0],
@@ -374,6 +394,36 @@ def _metadata(
     }
     assert REQUIRED_ACQUISITION_ANNOTATION_COLUMNS <= set(values)
     return pd.DataFrame(values)
+
+
+def _protocol_document(session_id: str) -> dict[str, object]:
+    """Build a complete synthetic protocol that obeys the bound V1 config."""
+
+    stages: list[dict[str, object]] = []
+    stage_start = 0.0
+    for spec in _PROTOCOL_CONFIG.stages:
+        stage_end = stage_start + spec.nominal_duration_s
+        stages.append(
+            {
+                "stage_id": spec.stage_id,
+                "name": spec.name,
+                "status": "auto",
+                "confidence": 0.95,
+                "start": {"time_s": stage_start},
+                "end": {"time_s": stage_end},
+                "duration_s": spec.nominal_duration_s,
+            }
+        )
+        stage_start = stage_end
+    return {
+        "session_id": session_id,
+        "annotation_schema_version": _PROTOCOL_CONFIG.schema_version,
+        "duration_s": stage_start,
+        "status": "auto",
+        "confidence": 0.95,
+        "annotation_inference_feature_allowed": False,
+        "stages": stages,
+    }
 
 
 def _write_cache(
@@ -561,7 +611,7 @@ def _write_cache(
                 "eligibility": {
                     "measured_timing_eligible": True,
                     "alignment_eligible": source_eligible,
-                    "stage_metric_eligible": True,
+                    "stage_metric_eligible": source_eligible,
                     "range_feature_eligible": False,
                     "strict_cache_eligible": source_eligible,
                 },
@@ -595,25 +645,7 @@ def _write_cache(
                     "manual_approval_content_sha256": None,
                     "match_count": len(result["matches"]),
                 },
-                "protocol": {
-                    "session_id": current_id,
-                    "annotation_schema_version": "acquisition_protocol_v1",
-                    "duration_s": 120.0,
-                    "status": "auto",
-                    "confidence": 0.95,
-                    "annotation_inference_feature_allowed": False,
-                    "stages": [
-                        {
-                            "stage_id": "phase1",
-                            "name": "synthetic_stage",
-                            "status": "auto",
-                            "confidence": 0.95,
-                            "start": {"time_s": 0.0},
-                            "end": {"time_s": 120.0},
-                            "duration_s": 120.0,
-                        }
-                    ],
-                },
+                "protocol": _protocol_document(current_id),
                 "range_tracking": {
                     "status": "not_built",
                     "selected_session_layout": None,
@@ -740,7 +772,7 @@ def _write_cache(
             "annotation_only_columns": annotation_columns,
             "measured_timing_eligible": True,
             "alignment_eligible": source_eligible,
-            "stage_metric_eligible": True,
+            "stage_metric_eligible": source_eligible,
             "range_feature_eligible": False,
             "strict_cache_eligible": source_eligible,
         }

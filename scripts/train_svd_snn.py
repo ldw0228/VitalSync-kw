@@ -22,11 +22,13 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
 from pathlib import Path
 import random
+import stat
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -61,6 +63,11 @@ N_FOLDS = 6
 # target, identity, protocol and window-timing columns can therefore never be
 # silently added to the model when a cache schema grows.
 BASE_FEATURE_COLUMNS: tuple[str, ...] = (
+    # These two fields have an exact row-wise NPZ authority in the scientific
+    # all-window publication.  The remaining historical fields are accepted
+    # only for explicitly requested legacy reproduction.
+    "prediction_bpm",
+    "rr_std_bpm",
     "prediction_uncalibrated_bpm",
     "prediction_calibrated_bpm",
     "prediction_final_structured_aux_s12_bpm",
@@ -81,6 +88,11 @@ BASE_FEATURE_COLUMNS: tuple[str, ...] = (
     "radar_peak_2_bpm",
     "radar_peak_3_bpm",
     "radar_peak_spread_bpm",
+)
+
+SCIENTIFIC_BASE_FEATURE_COLUMNS: tuple[str, ...] = (
+    "prediction_bpm",
+    "rr_std_bpm",
 )
 
 LABEL_ONLY_COLUMNS: frozenset[str] = frozenset(
@@ -162,6 +174,86 @@ class SVDSessionArrays:
     component_signals: np.ndarray | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SVDTrainingFileBinding:
+    path: str
+    sha256: str
+    bytes: int
+    st_dev: int
+    st_ino: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+    mode: int
+    nlink: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SVDTrainingArrayBinding:
+    role: str
+    object_id: int
+    shape: tuple[int, ...]
+    dtype: str
+    strides: tuple[int, ...]
+    content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SVDTrainingSessionBinding:
+    session_id: str
+    object_id: int
+    metadata_object_id: int
+    metadata_sha256: str
+    manifest_object_id: int
+    manifest_sha256: str
+    files_sha256: tuple[tuple[str, str], ...]
+    arrays: tuple[_SVDTrainingArrayBinding, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SVDTrainingAuthorityReceipt:
+    """In-process capability issued only by the complete experiment loader."""
+
+    schema_version: int
+    training_authorized: bool
+    acquisition_v2: bool
+    historical_legacy_reproduction: bool
+    experiment_object_id: int
+    arrays_for_position_function_id: int
+    structural_mask_function_id: int
+    cache_root: str
+    oof_csv: str
+    oof_npz: str
+    base_oof_provenance: str | None
+    root_manifest_content_sha256: str | None
+    base_oof_provenance_content_sha256: str | None
+    row_binding_sha256: str
+    experiment_metadata_object_id: int
+    experiment_metadata_columns: tuple[str, ...]
+    experiment_metadata_dtypes: tuple[str, ...]
+    experiment_metadata_sha256: str
+    root_manifest_object_id: int
+    root_manifest_sha256: str
+    provenance_object_id: int
+    provenance_sha256: str
+    sessions_list_object_id: int
+    frequencies: _SVDTrainingArrayBinding
+    source_pipeline_sha256: str
+    authority_files: tuple[_SVDTrainingFileBinding, ...]
+    sessions: tuple[_SVDTrainingSessionBinding, ...]
+
+
+# Keep strong object identities so a caller cannot construct/copy/transplant a
+# receipt-shaped dataclass or an experiment-shaped subclass and turn mutable
+# assertions into authority.  Pending entries exist only across the final two
+# loader statements and are consumed exactly once by the issuer.
+_PENDING_SVD_LOADER_EXPERIMENTS: dict[
+    int, tuple["AlignedSVDExperiment", bool]
+] = {}
+_ISSUED_SVD_TRAINING_RECEIPTS: dict[
+    int, tuple[_SVDTrainingAuthorityReceipt, "AlignedSVDExperiment"]
+] = {}
+
+
 @dataclass(slots=True)
 class AlignedSVDExperiment:
     cache_root: Path
@@ -172,6 +264,7 @@ class AlignedSVDExperiment:
     frequencies_hz: np.ndarray
     root_manifest: dict[str, Any]
     provenance: dict[str, Any]
+    training_authority_receipt: _SVDTrainingAuthorityReceipt | None = None
 
     def arrays_for_position(self, position: int) -> tuple[np.ndarray, np.ndarray]:
         row = self.metadata.iloc[int(position)]
@@ -218,8 +311,8 @@ def sha256_file(path: Path, *, block_size: int = 4 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def _current_svd_pipeline_sha256() -> str:
-    paths = (
+def _feature_pipeline_source_paths() -> tuple[Path, ...]:
+    return (
         PROJECT_ROOT / "scripts/build_svd_features.py",
         SOURCE_ROOT / "snn_rr/svd_features.py",
         PROJECT_ROOT / "scripts/build_features.py",
@@ -230,9 +323,517 @@ def _current_svd_pipeline_sha256() -> str:
         SOURCE_ROOT / "snn_rr/synchronization.py",
         SOURCE_ROOT / "snn_rr/radar_timing.py",
     )
+
+
+def _training_source_paths() -> tuple[Path, ...]:
+    return (
+        *_feature_pipeline_source_paths(),
+        Path(__file__).resolve(),
+        SOURCE_ROOT / "snn_rr/svd_models.py",
+        SOURCE_ROOT / "snn_rr/models.py",
+        SOURCE_ROOT / "snn_rr/metrics.py",
+    )
+
+
+def _snapshot_training_file(path: Path) -> _SVDTrainingFileBinding:
+    """Hash one regular-file inode and reject replacement during the read."""
+
+    resolved = path.expanduser().resolve()
+    try:
+        with resolved.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            digest = hashlib.sha256()
+            for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+            after = os.fstat(handle.fileno())
+        path_after = resolved.stat()
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot snapshot SVD training authority file {resolved}: {error}"
+        ) from error
+    signature_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_mode,
+        before.st_nlink,
+    )
+    signature_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_mode,
+        after.st_nlink,
+    )
+    path_signature = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+        path_after.st_ctime_ns,
+        path_after.st_mode,
+        path_after.st_nlink,
+    )
+    if not (
+        stat.S_ISREG(before.st_mode)
+        and before.st_nlink == 1
+        and signature_before == signature_after == path_signature
+    ):
+        raise RuntimeError(
+            f"SVD training authority file changed or is not single-link regular: {resolved}"
+        )
+    return _SVDTrainingFileBinding(
+        path=str(resolved),
+        sha256=digest.hexdigest(),
+        bytes=before.st_size,
+        st_dev=before.st_dev,
+        st_ino=before.st_ino,
+        st_mtime_ns=before.st_mtime_ns,
+        st_ctime_ns=before.st_ctime_ns,
+        mode=before.st_mode,
+        nlink=before.st_nlink,
+    )
+
+
+def _snapshot_training_file_payload(
+    path: Path,
+) -> tuple[_SVDTrainingFileBinding, bytes]:
+    """Return bytes from the same stable inode represented by the binding."""
+
+    resolved = path.expanduser().resolve()
+    try:
+        with resolved.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            payload = handle.read()
+            after = os.fstat(handle.fileno())
+        path_after = resolved.stat()
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot snapshot SVD training authority file {resolved}: {error}"
+        ) from error
+    signature = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_mode,
+        value.st_nlink,
+    )
+    if not (
+        stat.S_ISREG(before.st_mode)
+        and before.st_nlink == 1
+        and len(payload) == before.st_size
+        and signature(before) == signature(after) == signature(path_after)
+    ):
+        raise RuntimeError(
+            f"SVD training authority file changed or is not single-link regular: {resolved}"
+        )
+    return (
+        _SVDTrainingFileBinding(
+            path=str(resolved),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            bytes=before.st_size,
+            st_dev=before.st_dev,
+            st_ino=before.st_ino,
+            st_mtime_ns=before.st_mtime_ns,
+            st_ctime_ns=before.st_ctime_ns,
+            mode=before.st_mode,
+            nlink=before.st_nlink,
+        ),
+        payload,
+    )
+
+
+def _dataframe_training_sha256(frame: pd.DataFrame) -> str:
+    """Bind ordered schema, dtypes, index, and every training-visible value."""
+
+    schema = {
+        "columns": [str(value) for value in frame.columns],
+        "dtypes": [str(value) for value in frame.dtypes],
+        "index_name": None if frame.index.name is None else str(frame.index.name),
+        "index_dtype": str(frame.index.dtype),
+        "shape": [int(value) for value in frame.shape],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            schema,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    digest.update(b"\0")
+    digest.update(
+        frame.to_csv(
+            index=True,
+            float_format="%.17g",
+            lineterminator="\n",
+            na_rep="<SNN_MISSING>",
+        ).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def _array_training_sha256(value: np.ndarray) -> str:
+    """Hash a numeric ndarray in canonical C order without one giant copy."""
+
+    array = np.asarray(value)
+    if array.dtype.hasobject:
+        raise RuntimeError("SVD training arrays cannot use object dtype")
+    header = json.dumps(
+        {"shape": list(array.shape), "dtype": array.dtype.str},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(header)
+    digest.update(b"\0")
+    if array.ndim == 0:
+        digest.update(np.ascontiguousarray(array).view(np.uint8).tobytes())
+        return digest.hexdigest()
+    bytes_per_row = max(1, int(array.nbytes // max(1, array.shape[0])))
+    rows_per_chunk = max(1, (8 * 1024 * 1024) // bytes_per_row)
+    for start in range(0, array.shape[0], rows_per_chunk):
+        chunk = np.ascontiguousarray(array[start : start + rows_per_chunk])
+        digest.update(chunk.view(np.uint8).tobytes())
+    return digest.hexdigest()
+
+
+def _array_training_binding(
+    role: str,
+    value: np.ndarray,
+    *,
+    include_content: bool,
+) -> _SVDTrainingArrayBinding:
+    array = np.asarray(value)
+    return _SVDTrainingArrayBinding(
+        role=role,
+        object_id=id(value),
+        shape=tuple(int(item) for item in array.shape),
+        dtype=array.dtype.str,
+        strides=tuple(int(item) for item in array.strides),
+        content_sha256=(
+            _array_training_sha256(array) if include_content else "not_authorized"
+        ),
+    )
+
+
+def _session_training_binding(
+    session: SVDSessionArrays,
+    *,
+    include_content: bool,
+) -> _SVDTrainingSessionBinding:
+    arrays: list[_SVDTrainingArrayBinding] = [
+        _array_training_binding(
+            "spectra", session.spectra, include_content=include_content
+        ),
+        _array_training_binding(
+            "attributes", session.attributes, include_content=include_content
+        ),
+        _array_training_binding(
+            "frequencies_hz",
+            session.frequencies_hz,
+            include_content=include_content,
+        ),
+    ]
+    if session.radar_timing_valid_mask is not None:
+        arrays.append(
+            _array_training_binding(
+                "radar_timing_valid_mask",
+                session.radar_timing_valid_mask,
+                include_content=include_content,
+            )
+        )
+    if session.component_signals is not None:
+        arrays.append(
+            _array_training_binding(
+                "component_signals",
+                session.component_signals,
+                include_content=include_content,
+            )
+        )
+    return _SVDTrainingSessionBinding(
+        session_id=session.session_id,
+        object_id=id(session),
+        metadata_object_id=id(session.metadata),
+        metadata_sha256=_dataframe_training_sha256(session.metadata),
+        manifest_object_id=id(session.manifest),
+        manifest_sha256=_canonical_sha256(session.manifest),
+        files_sha256=tuple(
+            sorted(
+                (str(name), str(value))
+                for name, value in session.files_sha256.items()
+            )
+        ),
+        arrays=tuple(arrays),
+    )
+
+
+def _current_svd_pipeline_sha256() -> str:
     return hashlib.sha256(
-        "".join(sha256_file(path) for path in paths).encode("utf-8")
+        "".join(sha256_file(path) for path in _feature_pipeline_source_paths()).encode(
+            "utf-8"
+        )
     ).hexdigest()
+
+
+def _current_svd_training_source_sha256() -> str:
+    return hashlib.sha256(
+        "".join(sha256_file(path) for path in _training_source_paths()).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _issue_svd_training_authority_receipt(
+    *,
+    experiment: AlignedSVDExperiment,
+    authority_path: Path,
+) -> _SVDTrainingAuthorityReceipt:
+    """Consume one exact loader object and derive its authority from source."""
+
+    pending = _PENDING_SVD_LOADER_EXPERIMENTS.pop(id(experiment), None)
+    if (
+        type(experiment) is not AlignedSVDExperiment
+        or pending is None
+        or pending[0] is not experiment
+        or type(experiment.sessions) is not list
+        or any(type(session) is not SVDSessionArrays for session in experiment.sessions)
+    ):
+        raise RuntimeError(
+            "SVD authority receipts can only be issued once for the exact object "
+            "constructed by load_aligned_experiment"
+        )
+    historical_legacy_reproduction = pending[1]
+    cache_root = experiment.cache_root
+    oof_csv = experiment.oof_csv
+    oof_npz = experiment.oof_npz
+    root_manifest = experiment.root_manifest
+    sessions = experiment.sessions
+    metadata = experiment.metadata
+    frequencies_hz = experiment.frequencies_hz
+    provenance = experiment.provenance
+
+    # Caller-provided booleans never decide authority.  Replay the current root
+    # and child documents, derive whether this is acquisition-v2, and validate
+    # the complete scientific graph again before making the decision.
+    current_root = _read_strict_json(
+        cache_root / "manifest.json", label="SVD root manifest receipt replay"
+    )
+    if _canonical_sha256(current_root) != _canonical_sha256(root_manifest):
+        raise RuntimeError("SVD root manifest bytes differ from the loaded document")
+    root_contract = current_root.get("canonical_acquisition_contract")
+    acquisition_v2 = _binding_is_acquisition_v2(root_contract)
+    root_items = current_root.get("sessions")
+    root_indicates_v2 = bool(
+        acquisition_v2
+        or current_root.get("canonical_acquisition_reconstruction_content_sha256")
+        is not None
+        or (
+            isinstance(root_items, list)
+            and any(
+                isinstance(item, Mapping)
+                and _session_has_acquisition_v2_indicator(item)
+                for item in root_items
+            )
+        )
+    )
+    if root_indicates_v2 and not acquisition_v2:
+        raise RuntimeError(
+            "acquisition-v2 SVD input cannot be downgraded during receipt issuance"
+        )
+    current_children: dict[str, Mapping[str, Any]] = {}
+    for session in sessions:
+        current_child = _read_strict_json(
+            cache_root / session.session_id / "manifest.json",
+            label=f"SVD session manifest receipt replay {session.session_id}",
+        )
+        if _canonical_sha256(current_child) != _canonical_sha256(session.manifest):
+            raise RuntimeError(
+                f"SVD session manifest differs from loaded document: {session.session_id}"
+            )
+        current_children[session.session_id] = current_child
+
+    root_scientific = False
+    fresh_base_authority: Mapping[str, Any] | None = None
+    if acquisition_v2:
+        root_scientific = _validate_acquisition_v2_svd_scope(
+            current_root, current_children
+        )
+        if root_scientific:
+            if not authority_path.is_file():
+                raise RuntimeError(
+                    "scientific acquisition-v2 receipt lacks base OOF provenance"
+                )
+            _fresh_frame, _fresh_arrays, fresh_base_authority = (
+                _validate_base_oof_authority(
+                    csv_path=oof_csv,
+                    npz_path=oof_npz,
+                    provenance_path=authority_path,
+                    svd_root_manifest=current_root,
+                )
+            )
+
+    base_authority = provenance.get("base_oof_authority")
+    base_scientific = bool(
+        isinstance(base_authority, Mapping)
+        and fresh_base_authority is not None
+        and dict(base_authority) == dict(fresh_base_authority)
+        and base_authority.get("scientific_eligible") is True
+        and provenance.get("claim_classification")
+        == "retrospective_scientific_noncommercial"
+    )
+    authorized = bool(
+        (acquisition_v2 and root_scientific and base_scientific)
+        or (not acquisition_v2 and historical_legacy_reproduction)
+    )
+    authority_paths = {
+        (cache_root / "manifest.json").resolve(),
+        oof_csv.resolve(),
+        oof_npz.resolve(),
+        *[path.resolve() for path in _training_source_paths()],
+        *[
+            (cache_root / session.session_id / "manifest.json").resolve()
+            for session in sessions
+        ],
+    }
+    # Bind every on-disk payload that supplied a training-visible object.  The
+    # in-memory content receipt below prevents object substitution; these file
+    # bindings independently prevent a loader result from outliving a changed
+    # cache source (including legacy mmap-backed reproductions).
+    for session in sessions:
+        session_dir = cache_root / session.session_id
+        filenames = [
+            "metadata.csv",
+            "spectra.npy",
+            "attributes.npy",
+            "frequencies_hz.npy",
+        ]
+        if session.component_signals is not None:
+            filenames.append("component_signals.npy")
+        if session.radar_timing_valid_mask is not None:
+            filenames.append("radar_timing_valid_mask.npy")
+        for filename in filenames:
+            candidate = (session_dir / filename).resolve()
+            if candidate.is_file():
+                authority_paths.add(candidate)
+    if authority_path.is_file():
+        authority_paths.add(authority_path.resolve())
+    bindings = tuple(
+        _snapshot_training_file(path)
+        for path in sorted(authority_paths, key=str)
+    )
+    binding_by_path = {binding.path: binding for binding in bindings}
+    root_binding = binding_by_path[str((cache_root / "manifest.json").resolve())]
+    if root_binding.sha256 != provenance.get("root_manifest_sha256"):
+        raise RuntimeError("SVD root manifest drifted before authority receipt issuance")
+    if binding_by_path[str(oof_csv.resolve())].sha256 != provenance.get(
+        "base_oof_csv_sha256"
+    ):
+        raise RuntimeError("base OOF CSV drifted before authority receipt issuance")
+    if binding_by_path[str(oof_npz.resolve())].sha256 != provenance.get(
+        "base_oof_npz_sha256"
+    ):
+        raise RuntimeError("base OOF NPZ drifted before authority receipt issuance")
+    for session in sessions:
+        manifest_path = (cache_root / session.session_id / "manifest.json").resolve()
+        binding = binding_by_path[str(manifest_path)]
+        if binding.sha256 != session.files_sha256.get("manifest"):
+            raise RuntimeError(
+                f"SVD session manifest drifted before receipt: {session.session_id}"
+            )
+        current_manifest = current_children[session.session_id]
+        payload_names = {
+            "metadata": "metadata.csv",
+            "spectra": "spectra.npy",
+            "attributes": "attributes.npy",
+            "frequencies_hz": "frequencies_hz.npy",
+        }
+        if session.component_signals is not None:
+            payload_names["component_signals"] = "component_signals.npy"
+        if session.radar_timing_valid_mask is not None:
+            payload_names["radar_timing_valid_mask"] = (
+                "radar_timing_valid_mask.npy"
+            )
+        for logical_name, filename in payload_names.items():
+            payload_path = (cache_root / session.session_id / filename).resolve()
+            payload_binding = binding_by_path.get(str(payload_path))
+            if (
+                payload_binding is None
+                or payload_binding.sha256
+                != session.files_sha256.get(logical_name)
+            ):
+                raise RuntimeError(
+                    "SVD session payload drifted before receipt: "
+                    f"{session.session_id}/{logical_name}"
+                )
+    provenance_path: str | None = None
+    provenance_content: str | None = None
+    if isinstance(base_authority, Mapping):
+        candidate = base_authority.get("provenance_path")
+        if isinstance(candidate, str) and candidate:
+            provenance_path = str(Path(candidate).resolve())
+        content = base_authority.get("provenance_content_sha256")
+        if isinstance(content, str):
+            provenance_content = content
+        recorded_sha = base_authority.get("provenance_sha256")
+        if provenance_path is not None and isinstance(recorded_sha, str):
+            binding = binding_by_path.get(provenance_path)
+            if binding is None or binding.sha256 != recorded_sha:
+                raise RuntimeError(
+                    "base OOF provenance drifted before authority receipt issuance"
+                )
+    session_bindings = tuple(
+        _session_training_binding(session, include_content=authorized)
+        for session in sessions
+    )
+    receipt = _SVDTrainingAuthorityReceipt(
+        schema_version=1,
+        training_authorized=authorized,
+        acquisition_v2=bool(acquisition_v2),
+        historical_legacy_reproduction=bool(historical_legacy_reproduction),
+        experiment_object_id=id(experiment),
+        arrays_for_position_function_id=id(AlignedSVDExperiment.arrays_for_position),
+        structural_mask_function_id=id(
+            AlignedSVDExperiment.structural_radar_mask_for_position
+        ),
+        cache_root=str(cache_root.resolve()),
+        oof_csv=str(oof_csv.resolve()),
+        oof_npz=str(oof_npz.resolve()),
+        base_oof_provenance=provenance_path,
+        root_manifest_content_sha256=(
+            str(root_manifest.get("content_sha256"))
+            if isinstance(root_manifest.get("content_sha256"), str)
+            else None
+        ),
+        base_oof_provenance_content_sha256=provenance_content,
+        row_binding_sha256=str(provenance.get("row_binding_sha256", "")),
+        experiment_metadata_object_id=id(metadata),
+        experiment_metadata_columns=tuple(str(value) for value in metadata.columns),
+        experiment_metadata_dtypes=tuple(str(value) for value in metadata.dtypes),
+        experiment_metadata_sha256=_dataframe_training_sha256(metadata),
+        root_manifest_object_id=id(root_manifest),
+        root_manifest_sha256=_canonical_sha256(root_manifest),
+        provenance_object_id=id(provenance),
+        provenance_sha256=_canonical_sha256(provenance),
+        sessions_list_object_id=id(sessions),
+        frequencies=_array_training_binding(
+            "experiment_frequencies_hz",
+            frequencies_hz,
+            include_content=authorized,
+        ),
+        source_pipeline_sha256=_current_svd_training_source_sha256(),
+        authority_files=bindings,
+        sessions=session_bindings,
+    )
+    _ISSUED_SVD_TRAINING_RECEIPTS[id(receipt)] = (receipt, experiment)
+    return receipt
 
 
 def _feature_cache_inventory_sha256(
@@ -307,7 +908,7 @@ _V2_SVD_INVENTORY_NAMES: dict[str, str] = {
 }
 
 
-def _read_strict_json(path: Path, *, label: str) -> dict[str, Any]:
+def _decode_strict_json_payload(payload: bytes, *, label: str) -> dict[str, Any]:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -321,15 +922,23 @@ def _read_strict_json(path: Path, *, label: str) -> dict[str, Any]:
 
     try:
         document = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload.decode("utf-8"),
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_nonfinite,
         )
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot read {label} {path}: {error}") from error
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeError(f"cannot decode {label}: {error}") from error
     if not isinstance(document, dict):
         raise RuntimeError(f"{label} must be a JSON object")
     return document
+
+
+def _read_strict_json(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        _binding, payload = _snapshot_training_file_payload(path)
+    except RuntimeError as error:
+        raise RuntimeError(f"cannot read {label} {path.resolve()}: {error}") from error
+    return _decode_strict_json_payload(payload, label=label)
 
 
 def _require_sha256(value: Any, *, label: str) -> str:
@@ -407,13 +1016,20 @@ def _exact_int_vector(value: Any, *, label: str) -> np.ndarray:
 def _base_oof_payloads(
     csv_path: Path,
     npz_path: Path,
+    *,
+    csv_payload: bytes | None = None,
+    npz_payload: bytes | None = None,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray], str]:
     """Read either the historical valid OOF or authority-v1 all-window form."""
 
-    frame = pd.read_csv(csv_path).sort_values("cache_index", kind="stable").reset_index(
-        drop=True
-    )
-    with np.load(npz_path, allow_pickle=False) as archive:
+    if csv_payload is None:
+        _csv_binding, csv_payload = _snapshot_training_file_payload(csv_path)
+    if npz_payload is None:
+        _npz_binding, npz_payload = _snapshot_training_file_payload(npz_path)
+    frame = pd.read_csv(io.BytesIO(csv_payload)).sort_values(
+        "cache_index", kind="stable"
+    ).reset_index(drop=True)
+    with np.load(io.BytesIO(npz_payload), allow_pickle=False) as archive:
         arrays = {name: np.asarray(archive[name]) for name in archive.files}
     if {"index", "target", "prediction", "rr_std", "fold"} <= set(arrays):
         normalized = arrays
@@ -474,6 +1090,7 @@ def _validate_base_oof_authority(
     if bound_csv != csv_path.resolve() or bound_npz != npz_path.resolve():
         raise RuntimeError("base OOF provenance points to different CSV/NPZ files")
     first_hashes: dict[str, str] = {}
+    output_payloads: dict[str, bytes] = {}
     for name, path in (("csv", bound_csv), ("npz", bound_npz)):
         declared_bytes = outputs.get(f"{name}_bytes")
         if type(declared_bytes) is not int or declared_bytes != path.stat().st_size:
@@ -482,15 +1099,19 @@ def _validate_base_oof_authority(
             outputs.get(f"{name}_sha256"),
             label=f"base OOF {name.upper()} SHA-256",
         )
-        observed_hash = sha256_file(path)
+        binding, payload = _snapshot_training_file_payload(path)
+        observed_hash = binding.sha256
         if declared_hash != observed_hash:
             raise RuntimeError(f"base OOF {name.upper()} SHA-256 mismatch")
         first_hashes[name] = observed_hash
+        output_payloads[name] = payload
 
-    frame, arrays, layout = _base_oof_payloads(bound_csv, bound_npz)
-    for name, path in (("csv", bound_csv), ("npz", bound_npz)):
-        if sha256_file(path) != first_hashes[name]:
-            raise RuntimeError(f"base OOF {name.upper()} changed while loading")
+    frame, arrays, layout = _base_oof_payloads(
+        bound_csv,
+        bound_npz,
+        csv_payload=output_payloads["csv"],
+        npz_payload=output_payloads["npz"],
+    )
     if layout != "identity_disjoint_all_windows_v2":
         raise RuntimeError(
             "scientific base OOF authority requires identity-bound all-window outputs"
@@ -746,7 +1367,10 @@ def _validate_base_oof_authority(
         checkpoint_hash = _require_sha256(
             record.get("sha256"), label=f"base OOF checkpoint {fold_key} SHA-256"
         )
-        if sha256_file(checkpoint_path) != checkpoint_hash:
+        checkpoint_binding, checkpoint_payload = _snapshot_training_file_payload(
+            checkpoint_path
+        )
+        if checkpoint_binding.sha256 != checkpoint_hash:
             raise RuntimeError(f"base OOF checkpoint {fold_key} SHA-256 mismatch")
         expected_test_identities = sorted(
             identity
@@ -760,7 +1384,7 @@ def _validate_base_oof_authority(
                 f"base OOF checkpoint {fold_key} test identities mismatch"
             )
         checkpoint = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=False
+            io.BytesIO(checkpoint_payload), map_location="cpu", weights_only=True
         )
         checkpoint_split = (
             checkpoint.get("split") if isinstance(checkpoint, Mapping) else None
@@ -843,17 +1467,20 @@ def _validate_base_oof_authority(
             artifact.get("path"),
             label=f"base OOF fold {fold_key} artifact",
         )
+        artifact_binding, artifact_payload = _snapshot_training_file_payload(
+            artifact_path
+        )
         if (
-            sha256_file(artifact_path)
+            artifact_binding.sha256
             != _require_sha256(
                 artifact.get("sha256"),
                 label=f"base OOF fold {fold_key} artifact SHA-256",
             )
             or type(artifact.get("bytes")) is not int
-            or artifact.get("bytes") != artifact_path.stat().st_size
+            or artifact.get("bytes") != artifact_binding.bytes
         ):
             raise RuntimeError(f"base OOF fold {fold_key} artifact content mismatch")
-        with np.load(artifact_path, allow_pickle=False) as fold_archive:
+        with np.load(io.BytesIO(artifact_payload), allow_pickle=False) as fold_archive:
             required_fold_fields = {
                 "index",
                 "prediction",
@@ -919,7 +1546,8 @@ def _validate_base_oof_authority(
         frozen_record.get("source_sha256"),
         label="base OOF frozen valid OOF SHA-256",
     )
-    if sha256_file(frozen_path) != frozen_hash:
+    frozen_binding, frozen_payload = _snapshot_training_file_payload(frozen_path)
+    if frozen_binding.sha256 != frozen_hash:
         raise RuntimeError("base OOF frozen valid OOF SHA-256 mismatch")
     resolved_tolerance = frozen_record.get("resolved_tolerance")
     if not isinstance(resolved_tolerance, Mapping):
@@ -930,7 +1558,7 @@ def _validate_base_oof_authority(
         raise RuntimeError("base OOF frozen prediction tolerance is invalid") from error
     if not math.isfinite(prediction_tolerance) or not 0.0 <= prediction_tolerance <= 0.4:
         raise RuntimeError("base OOF frozen prediction tolerance exceeds authority cap")
-    with np.load(frozen_path, allow_pickle=False) as frozen_archive:
+    with np.load(io.BytesIO(frozen_payload), allow_pickle=False) as frozen_archive:
         required_frozen = {"index", "target", "prediction", "fold", "run_signature"}
         if not required_frozen <= set(frozen_archive.files):
             raise RuntimeError("base OOF frozen OOF binding arrays are incomplete")
@@ -1225,15 +1853,28 @@ def _validate_v2_svd_inventory(
                 f"SVD v2 inventory payload is missing for {session_id}/{name}: {path}"
             )
         declared_bytes = binding.get("bytes")
+        snapshot_payload: bytes | None = None
+        snapshot_binding: _SVDTrainingFileBinding | None = None
+        if detach_from_mutable_source:
+            snapshot_binding, snapshot_payload = _snapshot_training_file_payload(path)
         if (
             type(declared_bytes) is not int
             or declared_bytes < 0
-            or path.stat().st_size != declared_bytes
+            or (
+                snapshot_binding.bytes
+                if snapshot_binding is not None
+                else path.stat().st_size
+            )
+            != declared_bytes
         ):
             raise RuntimeError(
                 f"SVD v2 inventory byte count mismatch for {session_id}/{name}"
             )
-        actual_sha = sha256_file(path)
+        actual_sha = (
+            snapshot_binding.sha256
+            if snapshot_binding is not None
+            else sha256_file(path)
+        )
         actual_hashes[name] = actual_sha
         if binding.get("sha256") != actual_sha:
             raise RuntimeError(
@@ -1252,13 +1893,22 @@ def _validate_v2_svd_inventory(
                 raise RuntimeError(
                     f"SVD v2 metadata dtype is invalid for {session_id}"
                 )
-            metadata = pd.read_csv(path)
+            metadata = pd.read_csv(
+                io.BytesIO(snapshot_payload)
+                if snapshot_payload is not None
+                else path
+            )
             if list(metadata.shape) != declared_shape:
                 raise RuntimeError(
                     f"SVD v2 metadata shape mismatch for {session_id}"
                 )
         else:
-            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            if snapshot_payload is not None:
+                loaded = np.load(io.BytesIO(snapshot_payload), allow_pickle=False)
+                array = np.array(loaded, copy=True, order="C")
+                array.setflags(write=False)
+            else:
+                array = np.load(path, mmap_mode="r", allow_pickle=False)
             arrays[name] = array
             if list(array.shape) != declared_shape or str(array.dtype) != declared_dtype:
                 raise RuntimeError(
@@ -1305,7 +1955,13 @@ def _validate_v2_svd_inventory(
     if detach_from_mutable_source:
         detached: dict[str, np.ndarray] = {}
         for name, array in arrays.items():
-            owned = np.array(array, copy=True, order="C")
+            owned = (
+                array
+                if array.flags.owndata
+                and not isinstance(array, np.memmap)
+                and not array.flags.writeable
+                else np.array(array, copy=True, order="C")
+            )
             if not owned.flags.owndata or isinstance(owned, np.memmap):
                 raise RuntimeError(
                     f"scientific SVD array was not detached for {session_id}/{name}"
@@ -1392,8 +2048,15 @@ def validate_input_feature_columns(columns: Sequence[str]) -> tuple[str, ...]:
 assert_no_future_target_leakage = validate_input_feature_columns
 
 
-def resolve_base_feature_columns(frame: pd.DataFrame) -> tuple[str, ...]:
-    columns = tuple(name for name in BASE_FEATURE_COLUMNS if name in frame.columns)
+def resolve_base_feature_columns(
+    frame: pd.DataFrame, *, scientific_authority: bool = False
+) -> tuple[str, ...]:
+    allowlist = (
+        SCIENTIFIC_BASE_FEATURE_COLUMNS
+        if scientific_authority
+        else BASE_FEATURE_COLUMNS
+    )
+    columns = tuple(name for name in allowlist if name in frame.columns)
     return validate_input_feature_columns(columns)
 
 
@@ -1445,8 +2108,17 @@ def load_aligned_experiment(
     *,
     base_oof_provenance: Path | None = None,
     verify_file_hashes: bool = True,
+    allow_diagnostic_acquisition_inspection: bool = False,
+    load_legacy_component_signals: bool = False,
+    historical_legacy_reproduction: bool = False,
 ) -> AlignedSVDExperiment:
-    """Load memmapped SVD sessions and enforce an exact OOF row binding."""
+    """Load SVD sessions and enforce an exact OOF row binding.
+
+    Acquisition-v2 inputs are training-authorized only when their root and
+    canonical contract both declare strict scientific eligibility.  The
+    explicit inspection flag permits diagnostic-cache analysis, but
+    :func:`train_fold` independently rejects such an experiment.
+    """
 
     cache_root = Path(cache_root).resolve()
     oof_csv = Path(oof_csv).resolve()
@@ -1493,6 +2165,19 @@ def load_aligned_experiment(
             raise RuntimeError("acquisition-v2 SVD root content hash mismatch")
         if root_manifest.get("pipeline_sha256") != _current_svd_pipeline_sha256():
             raise RuntimeError("acquisition-v2 SVD pipeline source hash mismatch")
+        root_declares_scientific = root_manifest.get("scientific_eligible") is True
+        contract_declares_scientific = bool(
+            isinstance(root_contract, Mapping)
+            and root_contract.get("mode") == "strict"
+            and root_contract.get("scientific_eligible") is True
+        )
+        if not allow_diagnostic_acquisition_inspection and not (
+            root_declares_scientific and contract_declares_scientific
+        ):
+            raise RuntimeError(
+                "diagnostic acquisition-v2 SVD caches are inspection-only; "
+                "training requires strict scientific_eligible authority"
+            )
     root_scientific = root_manifest.get("scientific_eligible") is True
 
     sessions: list[SVDSessionArrays] = []
@@ -1548,15 +2233,72 @@ def load_aligned_experiment(
                 **inventory_hashes,
             }
         else:
-            session_metadata = pd.read_csv(paths["metadata"])
-            spectra = np.load(paths["spectra"], mmap_mode="r", allow_pickle=False)
-            attributes = np.load(paths["attributes"], mmap_mode="r", allow_pickle=False)
-            frequencies = np.load(paths["frequencies_hz"], allow_pickle=False)
-            hashes = (
-                {name: sha256_file(path) for name, path in paths.items()}
-                if verify_file_hashes
-                else {"manifest": sha256_file(paths["manifest"])}
-            )
+            if historical_legacy_reproduction:
+                metadata_binding, metadata_payload = _snapshot_training_file_payload(
+                    paths["metadata"]
+                )
+                session_metadata = pd.read_csv(io.BytesIO(metadata_payload))
+
+                def load_private_legacy_array(name: str) -> tuple[np.ndarray, str]:
+                    file_binding, payload = _snapshot_training_file_payload(paths[name])
+                    loaded = np.load(io.BytesIO(payload), allow_pickle=False)
+                    owned = np.array(loaded, copy=True, order="C")
+                    owned.setflags(write=False)
+                    return owned, file_binding.sha256
+
+                spectra, spectra_sha = load_private_legacy_array("spectra")
+                attributes, attributes_sha = load_private_legacy_array("attributes")
+                frequencies, frequencies_sha = load_private_legacy_array(
+                    "frequencies_hz"
+                )
+            else:
+                session_metadata = pd.read_csv(paths["metadata"])
+                spectra = np.load(paths["spectra"], mmap_mode="r", allow_pickle=False)
+                attributes = np.load(
+                    paths["attributes"], mmap_mode="r", allow_pickle=False
+                )
+                frequencies = np.load(paths["frequencies_hz"], allow_pickle=False)
+            component_path = session_dir / "component_signals.npy"
+            if load_legacy_component_signals and component_path.is_file():
+                if historical_legacy_reproduction:
+                    component_binding, component_payload = (
+                        _snapshot_training_file_payload(component_path)
+                    )
+                    loaded_component = np.load(
+                        io.BytesIO(component_payload), allow_pickle=False
+                    )
+                    component_signals = np.array(
+                        loaded_component, copy=True, order="C"
+                    )
+                    component_signals.setflags(write=False)
+                    del component_payload, loaded_component
+                else:
+                    component_signals = np.load(
+                        component_path, mmap_mode="r", allow_pickle=False
+                    )
+            # A training receipt must bind the exact files from which every
+            # in-memory object was loaded.  The legacy CLI switch may skip
+            # optional historical manifest comparisons elsewhere, but cannot
+            # weaken this source boundary.
+            if historical_legacy_reproduction:
+                hashes = {
+                    "manifest": sha256_file(paths["manifest"]),
+                    "metadata": metadata_binding.sha256,
+                    "spectra": spectra_sha,
+                    "attributes": attributes_sha,
+                    "frequencies_hz": frequencies_sha,
+                }
+            else:
+                hashes = {name: sha256_file(path) for name, path in paths.items()}
+            # Temporal training consumes this optional legacy payload.  Hash
+            # it even when broad legacy verification is disabled so its exact
+            # source remains part of the shared loader receipt.
+            if component_signals is not None:
+                hashes["component_signals"] = (
+                    component_binding.sha256
+                    if historical_legacy_reproduction
+                    else sha256_file(component_path)
+                )
         count = len(session_metadata)
         if spectra.ndim != 5 or spectra.shape[:1] != (count,) or spectra.shape[1] != 3:
             raise RuntimeError(f"invalid spectra shape for {session_id}: {spectra.shape}")
@@ -1610,6 +2352,11 @@ def load_aligned_experiment(
             root_manifest,
             {session.session_id: session.manifest for session in sessions},
         )
+        if not allow_diagnostic_acquisition_inspection and not root_scientific:
+            raise RuntimeError(
+                "diagnostic acquisition-v2 SVD caches are inspection-only; "
+                "validated full-cohort authority is not scientifically eligible"
+            )
 
     authority_path = (
         Path(base_oof_provenance).resolve()
@@ -1716,6 +2463,14 @@ def load_aligned_experiment(
         "NPZ prediction",
         atol=5e-5,
     )
+    if "rr_std_bpm" not in base:
+        raise RuntimeError("base OOF CSV is missing rr_std_bpm")
+    _assert_close_numbers(
+        base_arrays["rr_std"],
+        base["rr_std_bpm"],
+        "NPZ rr_std",
+        atol=5e-5,
+    )
     if not np.array_equal(
         np.asarray(base_arrays["fold"]).astype(np.int64),
         base["fold"].to_numpy(np.int64),
@@ -1725,8 +2480,18 @@ def load_aligned_experiment(
     # Preserve SVD labels/metadata as the canonical side and copy only
     # deployment outputs plus the already-frozen fold from the base OOF.
     joined = source.copy()
+    scientific_base_columns = {
+        "fold",
+        *SCIENTIFIC_BASE_FEATURE_COLUMNS,
+    }
     for column in base.columns:
         if column in BINDING_COLUMNS:
+            continue
+        # Scientific model inputs are restricted to values whose exact row
+        # vectors are independently present in the authority NPZ.  Additional
+        # CSV model outputs may be useful diagnostics but cannot enter the
+        # joined training frame without their own source/hash contract.
+        if root_is_v2 and root_scientific and column not in scientific_base_columns:
             continue
         if column in joined.columns:
             if column in ("reference_quality", "radar_observable", "classical_rr_bpm"):
@@ -1758,7 +2523,24 @@ def load_aligned_experiment(
             binding_payload.to_csv(index=False, float_format="%.9g").encode("utf-8")
         ).hexdigest(),
         "row_count": int(len(joined)),
-        "feature_allowlist": list(resolve_base_feature_columns(joined)),
+        "feature_allowlist": list(
+            resolve_base_feature_columns(
+                joined,
+                scientific_authority=bool(root_is_v2 and root_scientific),
+            )
+        ),
+        "scientific_base_feature_row_hashes": (
+            {
+                "prediction_bpm": _array_training_sha256(
+                    np.asarray(base_arrays["prediction"])
+                ),
+                "rr_std_bpm": _array_training_sha256(
+                    np.asarray(base_arrays["rr_std"])
+                ),
+            }
+            if root_is_v2 and root_scientific
+            else None
+        ),
         "component_signals_status": (
             "acquisition_v2_hash_verified_not_model_input"
             if root_is_v2
@@ -1771,7 +2553,7 @@ def load_aligned_experiment(
         ),
         "acquisition_v2_authority_hashes_mandatory": bool(root_is_v2),
     }
-    return AlignedSVDExperiment(
+    experiment = AlignedSVDExperiment(
         cache_root=cache_root,
         oof_csv=oof_csv,
         oof_npz=oof_npz,
@@ -1781,6 +2563,20 @@ def load_aligned_experiment(
         root_manifest=root_manifest,
         provenance=provenance,
     )
+    _PENDING_SVD_LOADER_EXPERIMENTS[id(experiment)] = (
+        experiment,
+        bool(historical_legacy_reproduction),
+    )
+    try:
+        experiment.training_authority_receipt = (
+            _issue_svd_training_authority_receipt(
+                experiment=experiment,
+                authority_path=authority_path,
+            )
+        )
+    finally:
+        _PENDING_SVD_LOADER_EXPERIMENTS.pop(id(experiment), None)
+    return experiment
 
 
 # Backward-friendly descriptive alias.
@@ -2434,9 +3230,18 @@ def prediction_report(
 def capture_rng_state(loader: DataLoader[Any]) -> dict[str, Any]:
     loader_generator = getattr(loader, "generator", None)
     sampler_generator = getattr(getattr(loader, "sampler", None), "generator", None)
+    numpy_state = np.random.get_state()
     return {
         "python": random.getstate(),
-        "numpy": np.random.get_state(),
+        # Store the NumPy payload with tensors/primitives only so checkpoints
+        # remain compatible with torch.load(weights_only=True).
+        "numpy": {
+            "bit_generator": str(numpy_state[0]),
+            "state": torch.from_numpy(np.asarray(numpy_state[1], dtype=np.uint32).copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
         "torch_cpu": torch.get_rng_state(),
         "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         "loader": loader_generator.get_state() if isinstance(loader_generator, torch.Generator) else None,
@@ -2449,7 +3254,23 @@ def restore_rng_state(state: Mapping[str, Any], loader: DataLoader[Any]) -> None
         if required not in state:
             raise RuntimeError(f"checkpoint RNG state lacks {required}")
     random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
+    numpy_state = state["numpy"]
+    if not isinstance(numpy_state, Mapping):
+        raise RuntimeError("checkpoint NumPy RNG state uses an unsafe legacy schema")
+    try:
+        np.random.set_state(
+            (
+                str(numpy_state["bit_generator"]),
+                torch.as_tensor(numpy_state["state"], device="cpu")
+                .numpy()
+                .astype(np.uint32, copy=True),
+                int(numpy_state["position"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise RuntimeError("checkpoint NumPy RNG state is invalid") from error
     torch.set_rng_state(torch.as_tensor(state["torch_cpu"], device="cpu"))
     cuda_state = list(state["torch_cuda"])
     if cuda_state:
@@ -2574,6 +3395,187 @@ def _model_kwargs(args: argparse.Namespace, experiment: AlignedSVDExperiment, fe
     return kwargs
 
 
+def _assert_training_cache_authority(
+    experiment: AlignedSVDExperiment,
+    *,
+    historical_legacy_reproduction: bool = False,
+) -> None:
+    """Replay a loader-issued immutable receipt at every training boundary."""
+
+    receipt = getattr(experiment, "training_authority_receipt", None)
+    issued = (
+        _ISSUED_SVD_TRAINING_RECEIPTS.get(id(receipt))
+        if type(receipt) is _SVDTrainingAuthorityReceipt
+        else None
+    )
+    if (
+        type(experiment) is not AlignedSVDExperiment
+        or type(receipt) is not _SVDTrainingAuthorityReceipt
+        or receipt.schema_version != 1
+        or issued is None
+        or issued[0] is not receipt
+        or issued[1] is not experiment
+        or receipt.experiment_object_id != id(experiment)
+        or receipt.arrays_for_position_function_id
+        != id(AlignedSVDExperiment.arrays_for_position)
+        or receipt.structural_mask_function_id
+        != id(AlignedSVDExperiment.structural_radar_mask_for_position)
+    ):
+        raise RuntimeError(
+            "SVD training requires an immutable authority receipt issued by "
+            "load_aligned_experiment"
+        )
+    if not receipt.training_authorized:
+        raise RuntimeError(
+            "diagnostic acquisition-v2 SVD caches are inspection-only and cannot "
+            "enter scaler fitting, output creation, model construction, or training"
+        )
+    if not receipt.acquisition_v2 and not (
+        receipt.historical_legacy_reproduction
+        and historical_legacy_reproduction
+    ):
+        raise RuntimeError(
+            "legacy SVD training requires the loader-bound explicit historical "
+            "legacy reproduction mode"
+        )
+    if receipt.acquisition_v2 and historical_legacy_reproduction:
+        raise RuntimeError(
+            "historical legacy reproduction mode cannot be applied to acquisition-v2"
+        )
+    if (
+        str(experiment.cache_root.resolve()) != receipt.cache_root
+        or str(experiment.oof_csv.resolve()) != receipt.oof_csv
+        or str(experiment.oof_npz.resolve()) != receipt.oof_npz
+    ):
+        raise RuntimeError("SVD experiment paths differ from its loader receipt")
+    if _current_svd_training_source_sha256() != receipt.source_pipeline_sha256:
+        raise RuntimeError("SVD training source changed after authority issuance")
+    def replay_authority_files() -> None:
+        for expected in receipt.authority_files:
+            observed = _snapshot_training_file(Path(expected.path))
+            if observed != expected:
+                raise RuntimeError(
+                    "SVD authority source changed after loader issuance: "
+                    f"{expected.path}"
+                )
+
+    replay_authority_files()
+
+    if not (
+        id(experiment.metadata) == receipt.experiment_metadata_object_id
+        and tuple(str(value) for value in experiment.metadata.columns)
+        == receipt.experiment_metadata_columns
+        and tuple(str(value) for value in experiment.metadata.dtypes)
+        == receipt.experiment_metadata_dtypes
+        and _dataframe_training_sha256(experiment.metadata)
+        == receipt.experiment_metadata_sha256
+        and id(experiment.root_manifest) == receipt.root_manifest_object_id
+        and _canonical_sha256(experiment.root_manifest)
+        == receipt.root_manifest_sha256
+        and id(experiment.provenance) == receipt.provenance_object_id
+        and _canonical_sha256(experiment.provenance) == receipt.provenance_sha256
+        and type(experiment.sessions) is list
+        and all(type(session) is SVDSessionArrays for session in experiment.sessions)
+        and id(experiment.sessions) == receipt.sessions_list_object_id
+        and _array_training_binding(
+            "experiment_frequencies_hz",
+            experiment.frequencies_hz,
+            include_content=True,
+        )
+        == receipt.frequencies
+    ):
+        raise RuntimeError("SVD in-memory experiment differs from loader receipt")
+    current_session_bindings = tuple(
+        _session_training_binding(session, include_content=True)
+        for session in experiment.sessions
+    )
+    if current_session_bindings != receipt.sessions:
+        raise RuntimeError("SVD in-memory session payload differs from loader receipt")
+    if experiment.provenance.get("row_binding_sha256") != receipt.row_binding_sha256:
+        raise RuntimeError("SVD in-memory row authority differs from loader receipt")
+    binding_payload = experiment.metadata.loc[
+        :, ["cache_index", "identity", "fold", "rr_bpm"]
+    ].copy()
+    current_row_binding = hashlib.sha256(
+        binding_payload.to_csv(index=False, float_format="%.9g").encode("utf-8")
+    ).hexdigest()
+    if current_row_binding != receipt.row_binding_sha256:
+        raise RuntimeError("SVD experiment rows changed after loader issuance")
+
+    current_root = _read_strict_json(
+        Path(receipt.cache_root) / "manifest.json",
+        label="SVD training-boundary root manifest",
+    )
+    if current_root.get("content_sha256") != receipt.root_manifest_content_sha256:
+        raise RuntimeError("SVD root content authority differs from loader receipt")
+    if _canonical_sha256(experiment.root_manifest) != _canonical_sha256(current_root):
+        raise RuntimeError("SVD in-memory root manifest differs from loader receipt")
+
+    # Historical non-v2 reproduction remains available, but now only through
+    # the exact loader-issued source receipt rather than a caller-built object.
+    if not receipt.acquisition_v2:
+        replay_authority_files()
+        return
+
+    current_children: dict[str, Mapping[str, Any]] = {}
+    for session in experiment.sessions:
+        current_children[session.session_id] = _read_strict_json(
+            Path(receipt.cache_root) / session.session_id / "manifest.json",
+            label=f"SVD training-boundary child manifest {session.session_id}",
+        )
+        if _canonical_sha256(current_children[session.session_id]) != _canonical_sha256(
+            session.manifest
+        ):
+            raise RuntimeError(
+                f"SVD in-memory child manifest drifted: {session.session_id}"
+            )
+        for array in (
+            session.spectra,
+            session.component_signals,
+            session.attributes,
+            session.frequencies_hz,
+            session.radar_timing_valid_mask,
+        ):
+            if (
+                array is None
+                or isinstance(array, np.memmap)
+                or not array.flags.owndata
+                or array.flags.writeable
+            ):
+                raise RuntimeError(
+                    "scientific SVD training arrays must remain owned and read-only"
+                )
+    if not _validate_acquisition_v2_svd_scope(current_root, current_children):
+        raise RuntimeError("fresh SVD acquisition-v2 scope replay is not scientific")
+    if receipt.base_oof_provenance is None:
+        raise RuntimeError("scientific SVD receipt lacks base OOF provenance")
+    _frame, _arrays, fresh_base_authority = _validate_base_oof_authority(
+        csv_path=Path(receipt.oof_csv),
+        npz_path=Path(receipt.oof_npz),
+        provenance_path=Path(receipt.base_oof_provenance),
+        svd_root_manifest=current_root,
+    )
+    if not (
+        fresh_base_authority.get("scientific_eligible") is True
+        and fresh_base_authority.get("provenance_content_sha256")
+        == receipt.base_oof_provenance_content_sha256
+        and fresh_base_authority.get("provenance_sha256")
+        == next(
+            (
+                binding.sha256
+                for binding in receipt.authority_files
+                if binding.path == receipt.base_oof_provenance
+            ),
+            None,
+        )
+    ):
+        raise RuntimeError("fresh base OOF authority replay differs from loader receipt")
+    # Close mutations that occurred while the in-memory/session/OOF authority
+    # was being replayed.  Scientific arrays are detached and immutable; this
+    # final persistent-source barrier also protects legacy mmap reproductions.
+    replay_authority_files()
+
+
 def train_fold(
     args: argparse.Namespace,
     experiment: AlignedSVDExperiment,
@@ -2581,6 +3583,12 @@ def train_fold(
     device: torch.device,
     run_signature: str,
 ) -> tuple[PredictionResult, bool, dict[str, Any]]:
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     fold_dir = Path(args.output_dir) / f"fold_{fold}"
     fold_dir.mkdir(parents=True, exist_ok=True)
     split = make_outer_split(experiment.metadata, fold)
@@ -2603,7 +3611,19 @@ def train_fold(
     }
     atomic_write_json(fold_dir / "split.json", split_record)
 
-    columns = resolve_base_feature_columns(experiment.metadata)
+    declared_columns = experiment.provenance.get("feature_allowlist")
+    if not isinstance(declared_columns, list):
+        raise RuntimeError("SVD receipt lacks an exact base-feature allowlist")
+    columns = validate_input_feature_columns(declared_columns)
+    expected_columns = resolve_base_feature_columns(
+        experiment.metadata,
+        scientific_authority=bool(
+            experiment.training_authority_receipt is not None
+            and experiment.training_authority_receipt.acquisition_v2
+        ),
+    )
+    if columns != expected_columns:
+        raise RuntimeError("SVD base-feature allowlist differs from loader authority")
     feature_scaler = fit_robust_scaler(experiment.metadata, split.train, columns)
     base_features = feature_scaler.transform(experiment.metadata)
     train_loader = make_loader(
@@ -2651,7 +3671,10 @@ def train_fold(
     best_path = fold_dir / "svd_best.pt"
     resume_path = Path(args.resume_from) if args.resume_from else last_path
     if args.resume and resume_path.is_file():
-        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        _resume_binding, resume_payload = _snapshot_training_file_payload(resume_path)
+        checkpoint = torch.load(
+            io.BytesIO(resume_payload), map_location=device, weights_only=True
+        )
         _validate_resume_checkpoint(
             checkpoint,
             fold=fold,
@@ -2759,13 +3782,22 @@ def train_fold(
             break
     if not best_path.is_file():
         raise RuntimeError("no best checkpoint was produced")
-    best = torch.load(best_path, map_location=device, weights_only=False)
+    _best_binding, best_payload = _snapshot_training_file_payload(best_path)
+    best = torch.load(
+        io.BytesIO(best_payload), map_location=device, weights_only=True
+    )
     _validate_resume_checkpoint(
         best,
         fold=fold,
         split=split,
         run_signature=run_signature,
         source_binding_sha256=source_binding,
+    )
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
     )
     model.load_state_dict(best["model_state"])
 
@@ -2834,6 +3866,12 @@ def train_fold(
         amp=args.amp,
         max_batches=args.smoke_max_batches,
     )
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     atomic_save_npz(fold_dir / "test_predictions.npz", **_result_arrays(test, promoted=promoted))
     test_report = prediction_report(test, experiment.metadata, promoted=promoted)
     test_report.update(
@@ -2857,10 +3895,17 @@ def _build_run_config(args: argparse.Namespace, experiment: AlignedSVDExperiment
     arguments = {
         key: value for key, value in vars(args).items() if key not in excluded
     }
-    source_paths = [Path(__file__), SOURCE_ROOT / "snn_rr" / "svd_models.py"]
+    source_paths = list(_training_source_paths())
     config = {
         "schema_version": SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "claim_classification": (
+            "retrospective_scientific_noncommercial"
+            if experiment.training_authority_receipt is not None
+            and experiment.training_authority_receipt.acquisition_v2
+            else "historical_noncommercial_reproduction"
+        ),
+        "commercial_claim_allowed": False,
         "arguments": arguments,
         "source_sha256": {str(path.relative_to(PROJECT_ROOT)): sha256_file(path) for path in source_paths},
         "data_provenance": experiment.provenance,
@@ -2888,6 +3933,12 @@ def _write_oof(
     fold_results: Mapping[int, tuple[PredictionResult, bool, dict[str, Any]]],
     run_signature: str,
 ) -> dict[str, Any]:
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     count = len(experiment.metadata)
     candidate = np.full(count, np.nan, dtype=np.float32)
     final = np.full(count, np.nan, dtype=np.float32)
@@ -2957,6 +4008,12 @@ def _write_oof(
         "fold_reports": {str(key): value[2] for key, value in fold_results.items()},
         "commercial_safety_policy": "rejected folds are exact base fallback",
     }
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     output_dir = Path(args.output_dir)
     atomic_save_npz(
         output_dir / "svd_oof.npz",
@@ -3034,6 +4091,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "authority hashes are always mandatory"
         ),
     )
+    parser.add_argument(
+        "--historical-legacy-reproduction",
+        action="store_true",
+        help=(
+            "explicitly authorize noncommercial reproduction from a non-v2 "
+            "historical cache; never grants acquisition-v2 authority"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--preset", choices=("tiny", "compact", "full"), default="compact")
@@ -3088,6 +4153,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    experiment = load_aligned_experiment(
+        args.svd_cache,
+        args.base_oof_csv,
+        args.base_oof_npz,
+        base_oof_provenance=args.base_oof_provenance,
+        verify_file_hashes=args.verify_file_hashes,
+        historical_legacy_reproduction=args.historical_legacy_reproduction,
+    )
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=args.historical_legacy_reproduction,
+    )
+    if (
+        experiment.training_authority_receipt is not None
+        and not experiment.training_authority_receipt.acquisition_v2
+    ):
+        output_dir = Path(args.output_dir)
+        if output_dir.exists() and not args.resume:
+            raise RuntimeError(
+                "historical legacy reproduction requires a new, non-existing "
+                "versioned output directory"
+            )
+        if args.resume and not (output_dir / "run_config.json").is_file():
+            raise RuntimeError(
+                "historical legacy resume requires its existing run_config.json"
+            )
+    run_config = _build_run_config(args, experiment)
+    existing_run_config_path = Path(args.output_dir) / "run_config.json"
+    if args.resume and existing_run_config_path.is_file():
+        existing_run_config = _read_strict_json(
+            existing_run_config_path, label="SVD resume run config"
+        )
+        if existing_run_config.get("run_signature") != run_config.get(
+            "run_signature"
+        ):
+            raise RuntimeError("SVD resume run signature differs from output root")
+    _assert_training_cache_authority(
+        experiment,
+        historical_legacy_reproduction=args.historical_legacy_reproduction,
+    )
+
+    # Cache authorization precedes RNG/device operations so rejected
+    # diagnostic inputs cannot initialize CUDA as a side effect.
     seed_everything(args.seed, deterministic=args.deterministic)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -3095,16 +4203,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    experiment = load_aligned_experiment(
-        args.svd_cache,
-        args.base_oof_csv,
-        args.base_oof_npz,
-        base_oof_provenance=args.base_oof_provenance,
-        verify_file_hashes=args.verify_file_hashes,
-    )
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    run_config = _build_run_config(args, experiment)
-    atomic_write_json(Path(args.output_dir) / "run_config.json", run_config)
+    if not existing_run_config_path.is_file():
+        atomic_write_json(existing_run_config_path, run_config)
     folds = parse_fold_selection(args.fold)
     fold_results: dict[int, tuple[PredictionResult, bool, dict[str, Any]]] = {}
     for fold in folds:

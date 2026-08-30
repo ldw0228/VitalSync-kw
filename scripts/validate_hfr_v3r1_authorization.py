@@ -4588,6 +4588,9 @@ def validate_phase(root: Path, phase: str) -> dict[str, Any]:
 ACTIVE_TEST_RECEIPT = CAMPAIGN_DIR / (
     "IMPLEMENTATION_TEST_RECEIPT_V8R4A_CONTEXT1.json"
 )
+ACTIVE_TEST_ENFORCEMENT_RECEIPT = CAMPAIGN_DIR / (
+    "IMPLEMENTATION_TEST_SANDBOX_ENFORCEMENT_V8R4A_CONTEXT1.json"
+)
 ACTIVE_SOURCE_SNAPSHOT = CAMPAIGN_DIR / "V3R1_SOURCE_SNAPSHOT_V8R4A_CONTEXT1.json"
 ACTIVE_PRETRAIN_AUTHORIZATION = CAMPAIGN_DIR / (
     "PRETRAIN_AUTHORIZATION_V8R4A_CONTEXT1.json"
@@ -4669,6 +4672,9 @@ ACTIVE_SCIENTIFIC_REVISION = "V8R4"
 ACTIVE_INFRASTRUCTURE_REVISION = "V8R4A"
 ACTIVE_AUTHORIZATION_GENERATION = "CONTEXT1"
 ACTIVE_TEST_CLASSIFICATION = "adaptive_v3r1_v8r4a_implementation_test_receipt"
+ACTIVE_TEST_ENFORCEMENT_CLASSIFICATION = (
+    "adaptive_v3r1_v8r4a_external_test_sandbox_enforcement_receipt"
+)
 ACTIVE_SNAPSHOT_CLASSIFICATION = "adaptive_v3r1_v8r4a_source_snapshot"
 ACTIVE_PRETRAIN_CLASSIFICATION = "pretrain_adaptive_v3r1_v8r4a_authorization"
 
@@ -4740,6 +4746,23 @@ ACTIVE_FIXED_TEST_PATHS = (
     "tests/test_validate_hfr_v3r1_authorization_v8r4a.py",
     "tests/test_hfr_v3r1_execution_closure_sigkill.py",
     "tests/test_run_hfr_v3r1_v8r4a_campaign.py",
+)
+
+# Separately versioned, unmeasured successors may reuse an exact, hash-bound
+# governed dependency without becoming authority for the V8R4 campaign. Keep
+# this path allowlist and dependency surface exact before excluding the proposal
+# from the V8R4 token-closure scanner.
+_ACTIVE_INDEPENDENT_SUCCESSOR_PROPOSAL_PATHS = frozenset(
+    {"src/snn_rr/axis_risk_router_snn_v8r5.py"}
+)
+_ACTIVE_SUCCESSOR_FORBIDDEN_IMPORT_SUFFIXES = frozenset(
+    {
+        "harmonic_factor_router_v3",
+        "harmonic_factor_router_models_v3r1",
+        "run_hfr_v3r1_target_sealed",
+        "run_hfr_v3r1_v8r4a_campaign",
+        "validate_hfr_v3r1_authorization",
+    }
 )
 
 ACTIVE_HISTORICAL_FILES = {
@@ -8883,6 +8906,7 @@ def _active_validate_rootbind1_parent_chain(
             "authorization_generation",
             "admitted_context_correction_authorization",
             "admitted_context_failure_diagnostic",
+            *_ACTIVE_CONTEXT1_TEST_RECEIPT_EXTENSION_KEYS,
         })
         and set(snapshot) == (_ACTIVE_SNAPSHOT_KEYS - {
             "authorization_generation",
@@ -9743,6 +9767,13 @@ _ACTIVE_ADDENDUM_ROLES = {
     "admitted_context_correction_authorization",
     "admitted_context_failure_diagnostic",
 }
+_ACTIVE_CONTEXT1_TEST_RECEIPT_EXTENSION_KEYS = {
+    "sandbox_enforcement_receipt",
+    "collection_inventory",
+    "outcome_inventory",
+    "outcome_counts",
+    "inventory_sha256",
+}
 _ACTIVE_TEST_RECEIPT_KEYS = {
     "schema_version", "classification", "campaign_id",
     "scientific_campaign_revision", "infrastructure_revision",
@@ -9752,6 +9783,7 @@ _ACTIVE_TEST_RECEIPT_KEYS = {
     "implementation_files", "test_paths", "command", "return_code",
     "stdout_sha256", "stdout_tail", "stdout_is_complete", "runtime_state_before",
     "stdout_bytes",
+    *_ACTIVE_CONTEXT1_TEST_RECEIPT_EXTENSION_KEYS,
     "runtime_state_after", "all_tests_passed", "gpu_accessed",
     "target_or_outer_reference_accessed", "commercial_claim_authorized",
     "content_sha256",
@@ -9784,6 +9816,109 @@ _ACTIVE_PRETRAIN_KEYS = {
     "commercial_claim_authorized", "outer_fold_numeric_reference_authorized",
     "content_sha256",
 }
+
+
+def _active_validate_independent_successor_proposal(
+    relative: str, raw: bytes
+) -> None:
+    """Exclude only the exact dependency-bound, fail-closed successor proposal.
+
+    The function name is retained for the frozen validator API.  It does not
+    assert source independence: V8R5 deliberately reuses two governed modules.
+    """
+
+    if (
+        relative not in _ACTIVE_INDEPENDENT_SUCCESSOR_PROPOSAL_PATHS
+        or relative in set(ACTIVE_IMPLEMENTATION_PATHS)
+        or not relative.endswith("_v8r5.py")
+    ):
+        _fail(f"V8R4 successor path is not admitted: {relative}")
+    try:
+        text = raw.decode("utf-8")
+        tree = ast.parse(text, filename=relative)
+    except (UnicodeError, SyntaxError) as error:
+        _fail(f"V8R4 successor proposal is invalid: {relative}: {error}")
+    module_documentation = (ast.get_docstring(tree, clean=False) or "").lower()
+    required_boundaries = (
+        "separately versioned, non-authorizing successor architecture",
+        "not source-independent",
+        "unmeasured retrospective proposal",
+        "does not authorize protected training",
+    )
+    if any(boundary not in module_documentation for boundary in required_boundaries):
+        _fail(
+            "V8R4 successor proposal lacks the explicit claim boundary: "
+            f"{relative}"
+        )
+
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.add(node.module or "")
+    relative_imports = {
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level == 1
+    }
+    required_relative_imports = {
+        "harmonic_feature_layout_v3r1",
+        "svd_episode_models",
+    }
+    if relative_imports != required_relative_imports:
+        _fail(
+            "V8R4 successor governed dependency surface drifted: "
+            f"expected={sorted(required_relative_imports)}, "
+            f"observed={sorted(relative_imports)}"
+        )
+    forbidden_imports = sorted(
+        imported
+        for imported in imports
+        if any(
+            imported == suffix or imported.endswith("." + suffix)
+            for suffix in _ACTIVE_SUCCESSOR_FORBIDDEN_IMPORT_SUFFIXES
+        )
+    )
+    if forbidden_imports:
+        _fail(
+            "V8R4 successor proposal imports protected ancestry/runtime: "
+            + ", ".join(forbidden_imports)
+        )
+    required_dependency_bindings = (
+        b"_FEATURE_LAYOUT_SOURCE_SHA256",
+        b"_SPIKING_CELL_SOURCE_SHA256",
+        b'"ancestry_policy": "successor_with_hash_bound_layout_and_spiking_cell_reuse"',
+    )
+    if any(binding not in raw for binding in required_dependency_bindings):
+        _fail("V8R4 successor governed dependency source hash binding is absent")
+
+    required_false_claims = {
+        "training_authorized": False,
+        "commercial_claim_allowed": False,
+    }
+    observed_claims: dict[str, list[ast.AST]] = {
+        key: [] for key in required_false_claims
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values, strict=True):
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value in observed_claims
+            ):
+                observed_claims[key.value].append(value)
+    for claim, values in observed_claims.items():
+        if not values or any(
+            not isinstance(value, ast.Constant) or value.value is not False
+            for value in values
+        ):
+            _fail(
+                "V8R4 successor proposal does not fail closed: "
+                f"{relative}: {claim}"
+            )
 
 
 def _active_validate_surface(
@@ -9837,6 +9972,8 @@ def _active_validate_surface(
     active_set = set(ACTIVE_IMPLEMENTATION_PATHS)
     if len(active_set) != len(ACTIVE_IMPLEMENTATION_PATHS):
         _fail("active implementation path list contains duplicates")
+    if active_set & _ACTIVE_INDEPENDENT_SUCCESSOR_PROPOSAL_PATHS:
+        _fail("separately versioned successor entered the V8R4 implementation cover")
     if set(prior) - active_set:
         _fail("V8R3 implementation path was removed from the active cover")
     files: list[dict[str, Any]] = []
@@ -9881,7 +10018,16 @@ def _active_validate_surface(
                 or b"v8r4" in raw
             ):
                 token_paths.add(relative)
-    unknown = sorted(token_paths - active_set)
+    admitted_successors: set[str] = set()
+    for relative in sorted(_ACTIVE_INDEPENDENT_SUCCESSOR_PROPOSAL_PATHS):
+        if not os.path.lexists(root / relative):
+            continue
+        _binding, raw = _active_read_binding(
+            root, relative, require_frozen=False
+        )
+        _active_validate_independent_successor_proposal(relative, raw)
+        admitted_successors.add(relative)
+    unknown = sorted(token_paths - active_set - admitted_successors)
     if unknown:
         _fail("unregistered V8R4/V8R4A source paths: " + ", ".join(unknown))
     _validate_gpu_budget_module_constants(root / "src/snn_rr/gpu_budget_ledger.py")
@@ -10153,14 +10299,147 @@ _ACTIVE_RUNTIME_STATE_KEYS = {
     "usage_state",
     "execution_state",
 }
-_ACTIVE_TEST_SUCCESS_SUMMARY = re.compile(
-    r"[1-9][0-9]* passed"
-    r"(?:, [1-9][0-9]* skipped)?"
-    r"(?:, [1-9][0-9]* warnings?)?"
-    r" in [0-9]+(?:\.[0-9]+)?s"
-)
 _ACTIVE_TEST_FORBIDDEN_OUTCOME = re.compile(
     r"(?i)(?:\bfailed\b|\berrors?\b|no tests ran|interrupted)"
+)
+_ACTIVE_TEST_OUTCOME_COUNT_KEYS = {
+    "collected",
+    "passed",
+    "skipped",
+    "failed",
+    "errors",
+    "xfailed",
+    "xpassed",
+    "deselected",
+}
+
+# CONTEXT1 has no repository-external trust root today.  A content hash, frozen
+# mode, inode binding, issuer string, or a signature made by a key supplied by
+# the same repository writer is not independent authentication.  Keep that
+# absence machine-readable and terminal: provisioning an authority must be a
+# separately governed source generation with an external trust anchor and a
+# real signature verifier, not a local JSON/schema extension.
+_ACTIVE_CONTEXT1_TEST_AUTHORITY_STATUS = "blocked_no_independent_trust_root"
+_ACTIVE_CONTEXT1_TEST_TRUST_ROOT = None
+_ACTIVE_CONTEXT1_TRUSTED_ISSUER_IDS: frozenset[str] = frozenset()
+_ACTIVE_CONTEXT1_TRUSTED_RUNNER_IDS: frozenset[str] = frozenset()
+_ACTIVE_CONTEXT1_ACCEPTED_SIGNATURE_SCHEMES: frozenset[str] = frozenset()
+_ACTIVE_CONTEXT1_REQUIRED_SIGNED_TEST_BINDINGS = frozenset(
+    {
+        "issuer_identity",
+        "runner_identity",
+        "implementation_files",
+        "test_command",
+        "exact_pytest_collection_inventory",
+        "exact_terminal_outcome_inventory",
+        "runner_environment_manifest",
+        "sandbox_policy_manifest",
+        "sandbox_observation_manifest",
+        "runtime_state_before",
+        "runtime_state_after",
+    }
+)
+_ACTIVE_CONTEXT1_TEST_AUTHORITY_BLOCKER = (
+    "V8R4A CONTEXT1 issuance is blocked: no governed independently "
+    "authenticated external pytest issuer/runner trust root is configured; "
+    "repository-local handmade, self-hashed, and self-signed enforcement "
+    "receipts are non-authoritative"
+)
+
+# This digest is a source-generation pin over the complete, sorted pytest
+# nodeid collection for ACTIVE_FIXED_TEST_PATHS.  It is intentionally distinct
+# from the receipt's self-reported inventory_sha256: one invented node per file
+# (or any other proper subset/superset) must not satisfy collection closure.
+# The values are filled from an independent ``pytest --collect-only`` audit and
+# must change only with the covered source/test generation.
+_ACTIVE_FIXED_TEST_COLLECTION_COUNT = 739
+_ACTIVE_FIXED_TEST_COLLECTION_SHA256 = (
+    "b9b192c084d3f6d69094657bceb9047e368c12cac4e4420c2f75ef3c7fc39df4"
+)
+
+
+def _active_require_test_enforcement_authority() -> None:
+    """Stop until an independently governed issuer/runner trust root exists."""
+
+    if not (
+        _ACTIVE_CONTEXT1_TEST_AUTHORITY_STATUS == "trusted"
+        and _ACTIVE_CONTEXT1_TEST_TRUST_ROOT is not None
+        and _ACTIVE_CONTEXT1_TRUSTED_ISSUER_IDS
+        and _ACTIVE_CONTEXT1_TRUSTED_RUNNER_IDS
+        and _ACTIVE_CONTEXT1_ACCEPTED_SIGNATURE_SCHEMES
+    ):
+        _fail(_ACTIVE_CONTEXT1_TEST_AUTHORITY_BLOCKER)
+    # No verifier is deliberately implemented in this source generation.  Do
+    # not permit monkeypatching the status/constants into a pseudo trust root.
+    _fail(
+        "V8R4A CONTEXT1 issuance is blocked: the governed external test "
+        "authority verifier is not implemented in this source generation"
+    )
+
+
+def _active_test_collection_sha256(collection_inventory: Sequence[str]) -> str:
+    """Hash the exact sorted nodeid inventory independently of outcomes."""
+
+    return semantic_sha256(list(collection_inventory))
+
+
+_ACTIVE_TEST_ENFORCEMENT_KEYS = {
+    "schema_version",
+    "classification",
+    "campaign_id",
+    "scientific_campaign_revision",
+    "infrastructure_revision",
+    "authorization_generation",
+    "created_utc",
+    "implementation_files",
+    "test_paths",
+    "command",
+    "return_code",
+    "stdout_sha256",
+    "stdout_bytes",
+    "stdout_tail",
+    "stdout_is_complete",
+    "collection_inventory",
+    "outcome_inventory",
+    "outcome_counts",
+    "inventory_sha256",
+    "runtime_state_before",
+    "runtime_state_after",
+    "sandbox_capability",
+    "sandbox_completion",
+    "content_sha256",
+}
+_ACTIVE_TEST_SANDBOX_CAPABILITY_KEYS = {
+    "enforcement_kind",
+    "separate_mount_namespace",
+    "separate_network_namespace",
+    "minimal_device_namespace",
+    "filesystem_allowlist_complete",
+    "gpu_device_nodes_available",
+    "raw_dataset_roots_available",
+    "outer_reference_roots_available",
+    "denied_canary_probes_passed",
+}
+_ACTIVE_TEST_SANDBOX_COMPLETION_KEYS = {
+    "sandbox_process_started",
+    "sandbox_process_exited",
+    "return_code",
+    "stdout_sha256",
+    "inventory_sha256",
+    "gpu_accessed",
+    "target_or_outer_reference_accessed",
+}
+_ACTIVE_CRITICAL_BWRAP_TEST_NODEIDS = frozenset(
+    {
+        "tests/test_run_hfr_v3r1_target_sealed.py::"
+        "test_bwrap_outer_campaign_smoke_when_host_allows_namespaces",
+        "tests/test_run_hfr_v3r1_target_sealed.py::"
+        "test_bwrap_directory_fd_mount_allows_atomic_replace_when_available",
+        "tests/test_run_hfr_v3r1_target_sealed.py::"
+        "test_bwrap_readonly_parent_with_three_readwrite_children_when_available",
+        "tests/test_run_hfr_v3r1_target_sealed.py::"
+        "test_bwrap_readonly_lifecycle_directory_blocks_receipt_replace_when_available",
+    }
 )
 
 
@@ -10235,29 +10514,138 @@ def _active_validate_create_stage(root: Path, stage: str) -> None:
     _active_validate_postfailure_ledger_prefixes(root, require_exact=True)
 
 
-def _active_validate_test_receipt_evidence(
-    root: Path,
-    document: Mapping[str, Any],
-    *,
-    implementation: Sequence[Mapping[str, Any]],
-) -> None:
-    """Purely validate the exact fixed-test evidence carried by one receipt."""
+def _active_test_inventory_sha256(
+    collection_inventory: Sequence[str],
+    outcome_inventory: Sequence[Mapping[str, Any]],
+    outcome_counts: Mapping[str, Any],
+) -> str:
+    """Hash the exact collection and terminal outcome inventory."""
+
+    return semantic_sha256(
+        {
+            "collection_inventory": list(collection_inventory),
+            "outcome_inventory": list(outcome_inventory),
+            "outcome_counts": dict(outcome_counts),
+        }
+    )
+
+
+def _active_validate_test_inventory(document: Mapping[str, Any]) -> None:
+    """Require one passing terminal outcome for every collected nodeid."""
+
+    collection = document.get("collection_inventory")
+    outcomes = document.get("outcome_inventory")
+    counts = document.get("outcome_counts")
+    recorded_hash = document.get("inventory_sha256")
+    if not (
+        isinstance(collection, list)
+        and collection
+        and all(isinstance(nodeid, str) and nodeid for nodeid in collection)
+        and collection == sorted(collection)
+        and len(collection) == len(set(collection))
+        and isinstance(outcomes, list)
+        and len(outcomes) == len(collection)
+        and isinstance(counts, Mapping)
+        and set(counts) == _ACTIVE_TEST_OUTCOME_COUNT_KEYS
+        and all(
+            type(counts.get(key)) is int and counts[key] >= 0
+            for key in _ACTIVE_TEST_OUTCOME_COUNT_KEYS
+        )
+        and isinstance(recorded_hash, str)
+        and len(recorded_hash) == 64
+        and all(character in "0123456789abcdef" for character in recorded_hash)
+    ):
+        _fail("V8R4A fixed-test inventory schema drifted")
+
+    if not (
+        len(collection) == _ACTIVE_FIXED_TEST_COLLECTION_COUNT
+        and _active_test_collection_sha256(collection)
+        == _ACTIVE_FIXED_TEST_COLLECTION_SHA256
+    ):
+        _fail("V8R4A fixed-test inventory is not the exact pinned collection")
+
+    observed_paths: set[str] = set()
+    for nodeid in collection:
+        matches = [
+            path
+            for path in ACTIVE_FIXED_TEST_PATHS
+            if nodeid == path or nodeid.startswith(path + "::")
+        ]
+        if len(matches) != 1:
+            _fail(f"V8R4A fixed-test inventory has undeclared nodeid: {nodeid}")
+        observed_paths.add(matches[0])
+    if observed_paths != set(ACTIVE_FIXED_TEST_PATHS):
+        _fail("V8R4A fixed-test inventory does not cover every declared test path")
+
+    allowed_outcomes = {"passed", "skipped", "failed", "error", "xfailed", "xpassed"}
+    normalized_outcomes: list[dict[str, str]] = []
+    for row in outcomes:
+        if not (
+            isinstance(row, Mapping)
+            and set(row) == {"nodeid", "outcome"}
+            and isinstance(row.get("nodeid"), str)
+            and isinstance(row.get("outcome"), str)
+            and row["outcome"] in allowed_outcomes
+        ):
+            _fail("V8R4A fixed-test terminal outcome inventory drifted")
+        normalized_outcomes.append(
+            {"nodeid": str(row["nodeid"]), "outcome": str(row["outcome"])}
+        )
+    if (
+        normalized_outcomes
+        != sorted(normalized_outcomes, key=lambda row: row["nodeid"])
+        or [row["nodeid"] for row in normalized_outcomes] != collection
+    ):
+        _fail("V8R4A fixed-test collection/outcome inventories disagree")
+
+    computed_counts = {
+        "collected": len(collection),
+        "passed": sum(row["outcome"] == "passed" for row in normalized_outcomes),
+        "skipped": sum(row["outcome"] == "skipped" for row in normalized_outcomes),
+        "failed": sum(row["outcome"] == "failed" for row in normalized_outcomes),
+        "errors": sum(row["outcome"] == "error" for row in normalized_outcomes),
+        "xfailed": sum(row["outcome"] == "xfailed" for row in normalized_outcomes),
+        "xpassed": sum(row["outcome"] == "xpassed" for row in normalized_outcomes),
+        "deselected": 0,
+    }
+    if not exact_json_equal(counts, computed_counts):
+        _fail("V8R4A fixed-test outcome counts disagree with the exact inventory")
+    if (
+        counts["passed"] != counts["collected"]
+        or any(
+            counts[key] != 0
+            for key in (
+                "skipped",
+                "failed",
+                "errors",
+                "xfailed",
+                "xpassed",
+                "deselected",
+            )
+        )
+        or any(row["outcome"] != "passed" for row in normalized_outcomes)
+    ):
+        _fail("V8R4A fixed critical suite must pass with zero skips")
+    passed_nodeids = {row["nodeid"] for row in normalized_outcomes}
+    if not _ACTIVE_CRITICAL_BWRAP_TEST_NODEIDS <= passed_nodeids:
+        _fail("V8R4A real-bubblewrap critical tests lack exact PASS evidence")
+    if recorded_hash != _active_test_inventory_sha256(
+        collection, normalized_outcomes, counts
+    ):
+        _fail("V8R4A fixed-test inventory hash drifted")
+
+
+def _active_validate_test_result_payload(document: Mapping[str, Any]) -> None:
+    """Validate byte-complete stdout plus the authoritative test inventory."""
 
     stdout_tail = document.get("stdout_tail")
     stdout_sha256 = document.get("stdout_sha256")
     stdout_bytes = document.get("stdout_bytes")
-    runtime_before = document.get("runtime_state_before")
-    runtime_after = document.get("runtime_state_after")
     encoded_stdout = (
         stdout_tail.encode("utf-8") if isinstance(stdout_tail, str) else b""
     )
-    terminal_summary = ""
-    if isinstance(stdout_tail, str) and stdout_tail.rstrip("\n"):
-        terminal_summary = stdout_tail.rstrip("\n").splitlines()[-1]
     if not (
-        exact_json_equal(document.get("test_paths"), list(ACTIVE_FIXED_TEST_PATHS))
-        and exact_json_equal(document.get("command"), _active_fixed_test_command(root))
-        and type(document.get("return_code")) is int
+        type(document.get("return_code")) is int
         and document.get("return_code") == 0
         and isinstance(stdout_tail, str)
         and document.get("stdout_is_complete") is True
@@ -10269,8 +10657,113 @@ def _active_validate_test_receipt_evidence(
         and all(character in "0123456789abcdef" for character in stdout_sha256)
         and hashlib.sha256(encoded_stdout).hexdigest() == stdout_sha256
         and "[100%]" in stdout_tail
-        and _ACTIVE_TEST_SUCCESS_SUMMARY.fullmatch(terminal_summary) is not None
         and _ACTIVE_TEST_FORBIDDEN_OUTCOME.search(stdout_tail) is None
+    ):
+        _fail("V8R4A fixed-test byte evidence drifted")
+    _active_validate_test_inventory(document)
+
+
+def _active_validate_enforcement_binding(binding: Any) -> None:
+    if not (
+        isinstance(binding, Mapping)
+        and set(binding)
+        == {"path", "sha256", "bytes", "mode", "nlink", "st_dev", "st_ino"}
+        and binding.get("path") == ACTIVE_TEST_ENFORCEMENT_RECEIPT.as_posix()
+        and isinstance(binding.get("sha256"), str)
+        and len(binding["sha256"]) == 64
+        and all(character in "0123456789abcdef" for character in binding["sha256"])
+        and type(binding.get("bytes")) is int
+        and binding["bytes"] > 0
+        and binding.get("mode") == "0444"
+        and binding.get("nlink") == 1
+        and type(binding.get("st_dev")) is int
+        and type(binding.get("st_ino")) is int
+    ):
+        _fail("V8R4A external sandbox enforcement binding drifted")
+
+
+def _active_validate_test_enforcement_receipt(
+    root: Path,
+    implementation: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate a frozen full-capability-sandbox receipt from an external run."""
+
+    _active_require_test_enforcement_authority()
+    if not os.path.lexists(root / ACTIVE_TEST_ENFORCEMENT_RECEIPT):
+        _fail(
+            "V8R4A external sandbox enforcement receipt is required; "
+            "unsandboxed local test execution cannot issue CONTEXT1 evidence"
+        )
+    document, binding = _active_load_document(
+        root,
+        ACTIVE_TEST_ENFORCEMENT_RECEIPT,
+        classification=ACTIVE_TEST_ENFORCEMENT_CLASSIFICATION,
+    )
+    _active_validate_trio_identity(document, label="external test enforcement receipt")
+    _active_validate_test_result_payload(document)
+    runtime_before = document.get("runtime_state_before")
+    runtime_after = document.get("runtime_state_after")
+    capability = document.get("sandbox_capability")
+    completion = document.get("sandbox_completion")
+    if not (
+        set(document) == _ACTIVE_TEST_ENFORCEMENT_KEYS
+        and document.get("scientific_campaign_revision") == ACTIVE_SCIENTIFIC_REVISION
+        and document.get("infrastructure_revision") == ACTIVE_INFRASTRUCTURE_REVISION
+        and exact_json_equal(
+            document.get("implementation_files"), list(implementation)
+        )
+        and exact_json_equal(document.get("test_paths"), list(ACTIVE_FIXED_TEST_PATHS))
+        and exact_json_equal(document.get("command"), _active_fixed_test_command(root))
+        and isinstance(runtime_before, Mapping)
+        and isinstance(runtime_after, Mapping)
+        and set(runtime_before) == _ACTIVE_RUNTIME_STATE_KEYS
+        and set(runtime_after) == _ACTIVE_RUNTIME_STATE_KEYS
+        and exact_json_equal(runtime_before, runtime_after)
+        and isinstance(capability, Mapping)
+        and set(capability) == _ACTIVE_TEST_SANDBOX_CAPABILITY_KEYS
+        and capability.get("enforcement_kind")
+        == "external_full_capability_sandbox_v1"
+        and capability.get("separate_mount_namespace") is True
+        and capability.get("separate_network_namespace") is True
+        and capability.get("minimal_device_namespace") is True
+        and capability.get("filesystem_allowlist_complete") is True
+        and capability.get("gpu_device_nodes_available") is False
+        and capability.get("raw_dataset_roots_available") is False
+        and capability.get("outer_reference_roots_available") is False
+        and capability.get("denied_canary_probes_passed") is True
+        and isinstance(completion, Mapping)
+        and set(completion) == _ACTIVE_TEST_SANDBOX_COMPLETION_KEYS
+        and completion.get("sandbox_process_started") is True
+        and completion.get("sandbox_process_exited") is True
+        and type(completion.get("return_code")) is int
+        and completion.get("return_code") == document.get("return_code") == 0
+        and completion.get("stdout_sha256") == document.get("stdout_sha256")
+        and completion.get("inventory_sha256") == document.get("inventory_sha256")
+        and completion.get("gpu_accessed") is False
+        and completion.get("target_or_outer_reference_accessed") is False
+    ):
+        _fail("V8R4A external full-capability sandbox evidence drifted")
+    return document, binding
+
+
+def _active_validate_test_receipt_evidence(
+    root: Path,
+    document: Mapping[str, Any],
+    *,
+    implementation: Sequence[Mapping[str, Any]],
+) -> None:
+    """Purely validate the exact fixed-test evidence carried by one receipt."""
+
+    _active_require_test_enforcement_authority()
+    runtime_before = document.get("runtime_state_before")
+    runtime_after = document.get("runtime_state_after")
+    _active_validate_test_result_payload(document)
+    _active_validate_enforcement_binding(
+        document.get("sandbox_enforcement_receipt")
+    )
+    if not (
+        exact_json_equal(document.get("test_paths"), list(ACTIVE_FIXED_TEST_PATHS))
+        and exact_json_equal(document.get("command"), _active_fixed_test_command(root))
         and exact_json_equal(
             document.get("implementation_files"), list(implementation)
         )
@@ -10284,31 +10777,30 @@ def _active_validate_test_receipt_evidence(
 
 
 def create_test_receipt(root: Path) -> dict[str, Any]:
+    _active_require_test_enforcement_authority()
     _active_validate_create_stage(root, "test_receipt")
     implementation = _active_static_validation(root, require_frozen=True)
-    state_before, state_before_document = _active_state(root, require_closed=True)
+    _state_before, state_before_document = _active_state(root, require_closed=True)
     _active_venv_interpreter(root)
-    command = _active_fixed_test_command(root)
-    completed = subprocess.run(
-        command,
-        cwd=root,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=3600,
+    enforcement, enforcement_binding = _active_validate_test_enforcement_receipt(
+        root, implementation
     )
-    if completed.returncode != 0:
-        _fail("V8R4A fixed implementation tests failed:\n" + completed.stdout[-20000:])
     _state_after, state_after_document = _active_state(root, require_closed=True)
-    if not exact_json_equal(state_before_document, state_after_document):
-        _fail("V8R4A fixed tests mutated migrated GPU state")
-    stdout = completed.stdout.encode("utf-8")
-    if len(stdout) > _ACTIVE_TEST_STDOUT_LIMIT_BYTES:
-        _fail("V8R4A fixed-test stdout exceeds the complete evidence limit")
+    if not (
+        exact_json_equal(state_before_document, state_after_document)
+        and exact_json_equal(
+            enforcement.get("runtime_state_before"), state_before_document
+        )
+        and exact_json_equal(
+            enforcement.get("runtime_state_after"), state_after_document
+        )
+    ):
+        _fail("V8R4A external sandbox tests do not bind the current closed state")
     correction = _active_binding(root, ACTIVE_V8R4_CORRECTION)
     infrastructure = _active_binding(root, ACTIVE_V8R4A_CORRECTION)
     migration = _active_binding(root, ACTIVE_MIGRATION_RECEIPT)
+    completion = enforcement["sandbox_completion"]
+    counts = enforcement["outcome_counts"]
     document = {
         "schema_version": 1,
         "classification": ACTIVE_TEST_CLASSIFICATION,
@@ -10323,19 +10815,26 @@ def create_test_receipt(root: Path) -> dict[str, Any]:
         "infrastructure_correction_authorization": infrastructure,
         "gpu_state_migration_receipt": migration,
         **_active_addendum_bindings(root),
+        "sandbox_enforcement_receipt": enforcement_binding,
         "implementation_files": implementation,
         "test_paths": list(ACTIVE_FIXED_TEST_PATHS),
-        "command": command,
-        "return_code": completed.returncode,
-        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-        "stdout_bytes": len(stdout),
-        "stdout_tail": completed.stdout,
-        "stdout_is_complete": True,
+        "command": enforcement["command"],
+        "return_code": enforcement["return_code"],
+        "stdout_sha256": enforcement["stdout_sha256"],
+        "stdout_bytes": enforcement["stdout_bytes"],
+        "stdout_tail": enforcement["stdout_tail"],
+        "stdout_is_complete": enforcement["stdout_is_complete"],
+        "collection_inventory": enforcement["collection_inventory"],
+        "outcome_inventory": enforcement["outcome_inventory"],
+        "outcome_counts": counts,
+        "inventory_sha256": enforcement["inventory_sha256"],
         "runtime_state_before": state_before_document,
         "runtime_state_after": state_after_document,
-        "all_tests_passed": True,
-        "gpu_accessed": False,
-        "target_or_outer_reference_accessed": False,
+        "all_tests_passed": counts["passed"] == counts["collected"],
+        "gpu_accessed": completion["gpu_accessed"],
+        "target_or_outer_reference_accessed": completion[
+            "target_or_outer_reference_accessed"
+        ],
         "commercial_claim_authorized": False,
     }
     _atomic_create_json(root / ACTIVE_TEST_RECEIPT, document)
@@ -10352,6 +10851,24 @@ def _active_validate_test_receipt(
     _active_validate_test_receipt_evidence(
         root, document, implementation=implementation
     )
+    enforcement, enforcement_binding = _active_validate_test_enforcement_receipt(
+        root, implementation
+    )
+    copied_enforcement_fields = (
+        "command",
+        "return_code",
+        "stdout_sha256",
+        "stdout_bytes",
+        "stdout_tail",
+        "stdout_is_complete",
+        "collection_inventory",
+        "outcome_inventory",
+        "outcome_counts",
+        "inventory_sha256",
+        "runtime_state_before",
+        "runtime_state_after",
+    )
+    completion = enforcement["sandbox_completion"]
     if not (
         set(document) == _ACTIVE_TEST_RECEIPT_KEYS
         and type(document.get("schema_version")) is int
@@ -10360,10 +10877,22 @@ def _active_validate_test_receipt(
         and document.get("infrastructure_revision") == ACTIVE_INFRASTRUCTURE_REVISION
         and document.get("authorization_generation")
         == ACTIVE_AUTHORIZATION_GENERATION
+        and exact_json_equal(
+            document.get("sandbox_enforcement_receipt"), enforcement_binding
+        )
+        and all(
+            exact_json_equal(document.get(field), enforcement.get(field))
+            for field in copied_enforcement_fields
+        )
         and document.get("all_tests_passed") is True
         and document.get("return_code") == 0
-        and document.get("gpu_accessed") is False
-        and document.get("target_or_outer_reference_accessed") is False
+        and exact_json_equal(
+            document.get("gpu_accessed"), completion.get("gpu_accessed")
+        )
+        and exact_json_equal(
+            document.get("target_or_outer_reference_accessed"),
+            completion.get("target_or_outer_reference_accessed"),
+        )
         and document.get("commercial_claim_authorized") is False
         and exact_json_equal(
             document.get("correction_authorization"),
@@ -10453,6 +10982,7 @@ def _active_validate_snapshot_metadata(
 
 
 def create_source_snapshot(root: Path) -> dict[str, Any]:
+    _active_require_test_enforcement_authority()
     _active_validate_create_stage(root, "source_snapshot")
     implementation = _active_static_validation(root, require_frozen=True)
     test, _test_binding = _active_validate_test_receipt(root, implementation)
@@ -10564,6 +11094,7 @@ def _active_validate_snapshot(
 
 
 def create_pretrain_authorization(root: Path) -> dict[str, Any]:
+    _active_require_test_enforcement_authority()
     _active_validate_create_stage(root, "pretrain_authorization")
     snapshot, snapshot_binding, implementation = _active_validate_snapshot(root)
     _test, test_binding = _active_validate_test_receipt(root, implementation)
@@ -10677,6 +11208,7 @@ def _active_validate_pretrain_common(
     expected_phase: str | None = None,
     expected_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    _active_require_test_enforcement_authority()
     if admitted_binding is None:
         if expected_phase is not None or expected_context is not None:
             _fail("admitted phase/context supplied without an admitted binding")
@@ -10864,6 +11396,7 @@ def _active_target_documents(
 ]:
     """Validate the create-once chain using only capability-mounted files."""
 
+    _active_require_test_enforcement_authority()
     _active_validate_execution_closure_target_chain(root)
 
     authorization, authorization_binding = _active_load_document(

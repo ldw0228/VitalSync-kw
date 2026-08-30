@@ -19,6 +19,23 @@ assert _SPEC is not None and _SPEC.loader is not None
 trainer = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = trainer
 _SPEC.loader.exec_module(trainer)
+_PRODUCTION_LOAD_MANIFEST = trainer._load_manifest
+
+
+@pytest.fixture(autouse=True)
+def _allow_explicit_unit_cache_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep downstream smoke tests independent of the production authority gate."""
+
+    def load_manifest(root: Path) -> dict[str, object]:
+        document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        if (
+            document.get("classification") == "unit_test_fixture"
+            and document.get("trainable") == "pytest_only"
+        ):
+            return document
+        return _PRODUCTION_LOAD_MANIFEST(root)
+
+    monkeypatch.setattr(trainer, "_load_manifest", load_manifest)
 
 
 def _synthetic_cache(tmp_path: Path) -> tuple[Path, Path]:
@@ -62,7 +79,16 @@ def _synthetic_cache(tmp_path: Path) -> tuple[Path, Path]:
     np.save(root / "joint_radar_mask.npy", radar)
     pd.DataFrame(metadata).to_csv(root / "metadata.csv", index=False)
     (root / "manifest.json").write_text(
-        json.dumps({"format_version": 1, "complete": True, "row_count": rows}),
+        json.dumps(
+            {
+                "format_version": 2,
+                "schema": "snn_rr.harmonic_candidate_cache.v2",
+                "complete": True,
+                "row_count": rows,
+                "classification": "unit_test_fixture",
+                "trainable": "pytest_only",
+            }
+        ),
         encoding="utf-8",
     )
     fallback = tmp_path / "fallback.csv"
@@ -554,6 +580,206 @@ def test_optimizer_never_steps_mid_carried_session(tmp_path: Path) -> None:
     )
     assert optimizer.step_calls == 1
     assert losses["optimizer_steps"] == 1.0
+
+
+def test_structural_scaling_cannot_resurrect_unavailable_radar_cells(
+    tmp_path: Path,
+) -> None:
+    cache, fallback = _synthetic_cache(tmp_path)
+    names = [
+        "rf_radar1_r1_raw_power_mean",
+        "rf_radar2_r1_raw_power_mean",
+        "rf_radar3_r1_raw_power_mean",
+        "candidate_core_0",
+        "candidate_core_1",
+        "candidate_core_2",
+    ]
+    (cache / "feature_names.json").write_text(
+        json.dumps({"node_feature_names": names}), encoding="utf-8"
+    )
+    radar = np.load(cache / "joint_radar_mask.npy", allow_pickle=False)
+    radar[0, 0] = False
+    np.save(cache / "joint_radar_mask.npy", radar, allow_pickle=False)
+    node = np.load(cache / "node_features.npy", allow_pickle=False)
+    node[0, :, 0] = 1234.0
+    np.save(cache / "node_features.npy", node, allow_pickle=False)
+
+    experiment = trainer.load_experiment(cache, fallback)
+    positions = np.arange(len(experiment.metadata), dtype=np.int64)
+    availability = trainer.structural_node_availability(experiment, positions)
+    assert not availability[0, :, 0].any()
+    scaler = trainer.fit_robust_scaler(experiment, positions)
+    transformed = scaler.transform(
+        np.asarray(experiment.node_features), availability
+    )
+
+    assert np.count_nonzero(transformed[0, :, 0]) == 0
+    assert np.signbit(transformed[0, :, 0]).sum() == 0
+
+
+def test_structural_scaling_masks_ratio_geometry_and_absent_iq_branch() -> None:
+    names = (
+        "rf_radar1_r4_raw_power_mean",
+        "rf_radar1_r1_raw_power_mean",
+        "rf_radar1_r1_candidate_iq_phase_power_mean",
+        "svd_radar2_r1_4_max",
+        "candidate_core",
+    )
+    node = np.asarray(
+        [[[2.0, 1.0, 91.0, 81.0, 3.0],
+          [4.0, 2.0, 92.0, 82.0, 4.0],
+          [99.0, 3.0, 93.0, 5.0, 5.0]]],
+        dtype=np.float32,
+    )
+    experiment = trainer.Experiment(
+        root=Path("."),
+        metadata=pd.DataFrame({"identity": ["I0"], "reference_valid": [True]}),
+        node_features=node,
+        candidate_rr=np.asarray([[10.0, 10.0, 40.0]], dtype=np.float32),
+        candidate_mask=np.ones((1, 3), dtype=np.bool_),
+        radar_mask=np.ones((1, 3), dtype=np.bool_),
+        base_prediction=np.zeros(1, dtype=np.float32),
+        base_std=np.ones(1, dtype=np.float32),
+        base_available=np.ones(1, dtype=np.bool_),
+        manifest={},
+        feature_names=names,
+    )
+    positions = np.asarray([0], dtype=np.int64)
+    availability = trainer.structural_node_availability(experiment, positions)
+
+    assert availability[0, :, 0].tolist() == [True, True, False]
+    assert availability[0, :, 1].tolist() == [True, True, True]
+    assert not availability[0, :, 2].any()
+    assert availability[0, :, 3].tolist() == [False, False, True]
+    assert availability[0, :, 4].tolist() == [True, True, True]
+
+    scaler = trainer.fit_robust_scaler(experiment, positions)
+    transformed = scaler.transform(node, availability)
+    assert np.count_nonzero(transformed[~availability]) == 0
+    assert np.signbit(transformed[~availability]).sum() == 0
+
+
+def test_legacy_structural_fallback_masks_gaps_and_single_radar_consensus() -> None:
+    names = (
+        "previous_candidate_gap_bpm",
+        "next_candidate_gap_bpm",
+        "rf_radar1_r1_raw_power_mean",
+        "rf_radar1_r1_raw_power_cross_radar_consensus",
+    )
+    experiment = trainer.Experiment(
+        root=Path("."),
+        metadata=pd.DataFrame({"identity": ["I0"], "reference_valid": [True]}),
+        node_features=np.zeros((1, 2, len(names)), dtype=np.float32),
+        candidate_rr=np.asarray([[12.0, 0.0]], dtype=np.float32),
+        candidate_mask=np.asarray([[True, False]], dtype=np.bool_),
+        radar_mask=np.asarray([[True, False, False]], dtype=np.bool_),
+        base_prediction=np.zeros(1, dtype=np.float32),
+        base_std=np.ones(1, dtype=np.float32),
+        base_available=np.ones(1, dtype=np.bool_),
+        manifest={},
+        feature_names=names,
+    )
+    availability = trainer.structural_node_availability(
+        experiment, np.asarray([0], dtype=np.int64)
+    )
+    assert not availability[..., 0].any()
+    assert not availability[..., 1].any()
+    assert availability[0, 0, 2]
+    assert not availability[..., 3].any()
+
+
+def test_persisted_exact_availability_overrides_legacy_geometry(
+    tmp_path: Path,
+) -> None:
+    cache, fallback = _synthetic_cache(tmp_path)
+    node = np.load(cache / "node_features.npy", allow_pickle=False)
+    persisted = np.ones_like(node, dtype=np.bool_)
+    persisted[0, 0, 0] = False
+    node[0, 0, 0] = 0.0
+    np.save(cache / "node_features.npy", node, allow_pickle=False)
+    np.save(
+        cache / "node_feature_availability.npy", persisted, allow_pickle=False
+    )
+
+    experiment = trainer.load_experiment(cache, fallback)
+    actual = trainer.structural_node_availability(
+        experiment, np.asarray([0], dtype=np.int64)
+    )
+    np.testing.assert_array_equal(actual, persisted[:1])
+
+
+def test_persisted_availability_rejects_padding_and_nonzero_masked_cells(
+    tmp_path: Path,
+) -> None:
+    cache, fallback = _synthetic_cache(tmp_path)
+    node = np.load(cache / "node_features.npy", allow_pickle=False)
+    candidate = np.load(cache / "candidate_mask.npy", allow_pickle=False)
+    candidate[0, 0] = False
+    np.save(cache / "candidate_mask.npy", candidate, allow_pickle=False)
+    availability = np.ones_like(node, dtype=np.bool_)
+    np.save(
+        cache / "node_feature_availability.npy", availability, allow_pickle=False
+    )
+    with pytest.raises(RuntimeError, match="padded candidate"):
+        trainer.load_experiment(cache, fallback)
+
+    candidate[0, 0] = True
+    np.save(cache / "candidate_mask.npy", candidate, allow_pickle=False)
+    availability[0, 0, 0] = False
+    np.save(
+        cache / "node_feature_availability.npy", availability, allow_pickle=False
+    )
+    with pytest.raises(RuntimeError, match="unavailable cached"):
+        trainer.load_experiment(cache, fallback)
+
+
+@pytest.mark.parametrize("trainable", [None, False, "true", True])
+def test_production_manifest_never_accepts_self_asserted_trainable(
+    tmp_path: Path, trainable: object
+) -> None:
+    cache = tmp_path / "authority_gate"
+    cache.mkdir()
+    manifest: dict[str, object] = {
+        "format_version": 2,
+        "schema": "snn_rr.harmonic_candidate_cache.v2",
+        "complete": True,
+        "classification": "scientific_nested_verified",
+    }
+    if trainable is not None:
+        manifest["trainable"] = trainable
+    manifest["content_sha256"] = trainer.sha256_json(manifest)
+    (cache / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    expected = "no versioned" if trainable is True else "inspection-only"
+    with pytest.raises(RuntimeError, match=expected):
+        _PRODUCTION_LOAD_MANIFEST(cache)
+
+
+def test_acquisition_v2_diagnostic_cache_fails_before_output_creation(
+    tmp_path: Path,
+) -> None:
+    cache, fallback = _synthetic_cache(tmp_path)
+    manifest_path = cache / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "classification": "acquisition_diagnostic",
+            "scientific_eligible": False,
+            "trainable": False,
+            "acquisition_v2": {
+                "schema_version": "snn_rr.feature_cache_acquisition.v2",
+                "diagnostic_input_trainable": False,
+            },
+        }
+    )
+    manifest["content_sha256"] = trainer.sha256_json(manifest)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    output = tmp_path / "must_not_exist"
+    args = _args(cache, fallback, output)
+
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        trainer.train(args)
+    assert not output.exists()
 
 
 def test_source_decoder_uses_argmax_candidate_not_expectation() -> None:

@@ -12,7 +12,11 @@ import pandas as pd
 import pytest
 import torch
 
-from snn_rr.split_authority import canonical_content_sha256, sha256_file
+from snn_rr.split_authority import (
+    canonical_content_sha256,
+    load_identity_split_authority,
+    sha256_file,
+)
 
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts/build_nested_proposer_stack.py"
@@ -106,20 +110,9 @@ def _make_fixture(root: Path) -> dict[str, Path]:
         unit_dir = root / "runs" / f"seed_{SEED}" / f"outer_{OUTER}" / stem
         fold_dir = unit_dir / f"fold_{document['fold_id']}"
         fold_dir.mkdir(parents=True)
-        provenance = {
-            "mode": "custom_identity_split",
-            "schema_version": 1,
-            "fold_id": document["fold_id"],
-            "split_manifest_content_sha256": document["content_sha256"],
-            "split_manifest_file_sha256": sha256_file(manifest_path),
-            "fold_assignments_sha256": fold_sha,
-            "cache_manifest_sha256": cache_sha,
-            "train_identities": document["identities"]["train"],
-            "validation_identities": document["identities"]["validation"],
-            "prediction_identities": document["identities"]["prediction"],
-            "excluded_identities": document["identities"]["excluded"],
-            "scaler_identities": document["identities"]["scaler"],
-        }
+        provenance = load_identity_split_authority(
+            manifest_path, metadata=metadata, cache_dir=cache
+        ).checkpoint_provenance()
         checkpoint_path = fold_dir / "snn_best.pt"
         torch.save(
             {

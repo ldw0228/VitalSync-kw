@@ -16,6 +16,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from snn_rr.cache import CacheProvenance, FeatureCache
+import snn_rr.split_authority as split_authority_module
 from snn_rr.split_authority import (
     canonical_content_sha256,
     load_identity_split_authority,
@@ -63,6 +64,22 @@ def _legacy_cache_provenance(tmp_path: Path) -> CacheProvenance:
     )
 
 
+def _write_cache_metadata_files(
+    cache_dir: Path, metadata: pd.DataFrame
+) -> pd.DataFrame:
+    session_ids = sorted(metadata["session_id"].astype(str).unique())
+    canonical_frames: list[pd.DataFrame] = []
+    for session_id in session_ids:
+        session_dir = cache_dir / session_id
+        session_dir.mkdir(exist_ok=True)
+        metadata_path = session_dir / "metadata.csv"
+        metadata.loc[metadata["session_id"].astype(str) == session_id].to_csv(
+            metadata_path, index=False
+        )
+        canonical_frames.append(pd.read_csv(metadata_path))
+    return pd.concat(canonical_frames, ignore_index=True)
+
+
 def _write_custom_split_fixture(
     tmp_path: Path,
     *,
@@ -79,12 +96,14 @@ def _write_custom_split_fixture(
                 "reference_valid": [True, False, True, True, True, True, True, False],
             }
         )
+    session_ids = sorted(metadata["session_id"].astype(str).unique())
+    metadata = _write_cache_metadata_files(cache_dir, metadata)
     cache_manifest = {
         "config_sha256": "1" * 64,
         "pipeline_sha256": "2" * 64,
         "sessions": [
             {"session_id": session, "status": "ok"}
-            for session in sorted(metadata["session_id"].astype(str).unique())
+            for session in session_ids
         ],
     }
     cache_manifest_path = cache_dir / "manifest.json"
@@ -911,6 +930,95 @@ def test_custom_split_exact_cover_and_explicit_indices(tmp_path: Path) -> None:
     assert authority.checkpoint_provenance()["scaler_identities"] == ["A"]
 
 
+def test_custom_split_binds_exact_metadata_bytes_content_and_object(
+    tmp_path: Path,
+) -> None:
+    split_path, cache_dir, metadata = _write_custom_split_fixture(tmp_path)
+    authority = load_identity_split_authority(
+        split_path, metadata=metadata, cache_dir=cache_dir
+    )
+    provenance = authority.checkpoint_provenance()
+
+    assert provenance["authority_receipt_version"] == 2
+    assert provenance["metadata_row_count"] == len(metadata)
+    assert len(provenance["metadata_source_content_sha256"]) == 64
+    assert len(provenance["metadata_row_roles_sha256"]) == 64
+    assert len(authority.metadata_file_bindings) == 4
+
+    with pytest.raises(RuntimeError, match="exact loader-bound metadata object"):
+        authority.explicit_indices(metadata.copy(deep=True), include_invalid=False)
+    copied_authority = copy.copy(authority)
+    with pytest.raises(RuntimeError, match="not issued by the loader"):
+        copied_authority.explicit_indices(metadata, include_invalid=False)
+
+    object.__setattr__(authority, "train_identities", ("C",))
+    with pytest.raises(RuntimeError, match="authority changed after loader issuance"):
+        authority.explicit_indices(metadata, include_invalid=False)
+
+
+def test_custom_split_rejects_session_identity_role_transplant_before_issuance(
+    tmp_path: Path,
+) -> None:
+    split_path, cache_dir, metadata = _write_custom_split_fixture(tmp_path)
+    forged = metadata.copy(deep=True)
+    forged.loc[forged["session_id"] == "SA", "identity"] = "C"
+    forged.loc[forged["session_id"] == "SC", "identity"] = "A"
+
+    with pytest.raises(ValueError, match="exact cache metadata byte snapshot"):
+        load_identity_split_authority(
+            split_path, metadata=forged, cache_dir=cache_dir
+        )
+
+
+def test_custom_split_rejects_in_place_reference_role_mutation(
+    tmp_path: Path,
+) -> None:
+    split_path, cache_dir, metadata = _write_custom_split_fixture(tmp_path)
+    authority = load_identity_split_authority(
+        split_path, metadata=metadata, cache_dir=cache_dir
+    )
+    metadata.loc[0, "reference_valid"] = False
+
+    with pytest.raises(RuntimeError, match="metadata changed after authority issuance"):
+        authority.explicit_indices(metadata, include_invalid=False)
+
+
+def test_custom_split_rejects_non_boolean_reference_roles(tmp_path: Path) -> None:
+    split_path, cache_dir, metadata = _write_custom_split_fixture(tmp_path)
+    forged = metadata.copy(deep=True)
+    forged["reference_valid"] = forged["reference_valid"].map(
+        {True: "true", False: "false"}
+    )
+
+    with pytest.raises(ValueError, match="reference_valid.*exact booleans"):
+        load_identity_split_authority(
+            split_path, metadata=forged, cache_dir=cache_dir
+        )
+
+
+def test_custom_split_rejects_metadata_path_change_after_private_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    split_path, cache_dir, metadata = _write_custom_split_fixture(tmp_path)
+    original = split_authority_module._read_regular_file_snapshot
+
+    def mutate_after_snapshot(path: Path, label: str):
+        payload, digest, byte_count = original(path, label)
+        if label == "cache metadata SA":
+            path.write_bytes(payload + b"\n")
+        return payload, digest, byte_count
+
+    monkeypatch.setattr(
+        split_authority_module,
+        "_read_regular_file_snapshot",
+        mutate_after_snapshot,
+    )
+    with pytest.raises(ValueError, match="cache metadata SA changed"):
+        load_identity_split_authority(
+            split_path, metadata=metadata, cache_dir=cache_dir
+        )
+
+
 def test_custom_split_rejects_manifest_and_referenced_hash_mutation(
     tmp_path: Path,
 ) -> None:
@@ -1014,6 +1122,7 @@ def test_custom_run_bypasses_rotating_split_and_oof_and_never_loads_excluded(
         classical_rr_bpm=np.linspace(10.0, 17.0, len(metadata)),
         classical_confidence=1.0,
     )
+    metadata = _write_cache_metadata_files(cache_dir, metadata)
     auxiliary = np.ones((len(metadata), 61), dtype=np.float32)
     auxiliary[:, 0] = np.arange(len(metadata))
     cache = FeatureCache(
@@ -1172,6 +1281,8 @@ def test_legacy_split_and_parser_behavior_remain_available() -> None:
     assert args.cache_trust_mode == "scientific"
     legacy_args = _TRAIN.parse_args(["--cache-trust-mode", "legacy"])
     assert legacy_args.cache_trust_mode == "legacy"
+    with pytest.raises(SystemExit):
+        _TRAIN.parse_args(["--cache-trust-mode", "acquisition-diagnostic"])
     metadata = pd.DataFrame(
         {
             "identity": ["A", "A", "B", "B", "C", "C"],
@@ -1200,13 +1311,6 @@ def test_legacy_split_and_parser_behavior_remain_available() -> None:
             {
                 "require_acquisition_contract": True,
                 "require_scientific_eligible": True,
-            },
-        ),
-        (
-            "acquisition-diagnostic",
-            {
-                "require_acquisition_contract": True,
-                "require_scientific_eligible": False,
             },
         ),
         (
@@ -1246,13 +1350,6 @@ def test_run_passes_explicit_cache_trust_policy_to_loader(
 @pytest.mark.parametrize(
     ("trust_mode", "schema_version", "classification", "scientific", "mask"),
     [
-        (
-            "acquisition-diagnostic",
-            "snn_rr.feature_cache_acquisition.v1",
-            "acquisition_diagnostic",
-            False,
-            None,
-        ),
         (
             "scientific",
             "snn_rr.feature_cache_acquisition.v2",
@@ -1300,4 +1397,82 @@ def test_acquisition_training_fails_closed_without_complete_structural_timing(
     )
 
     with pytest.raises((ValueError, RuntimeError), match="timing mask|interval"):
+        _TRAIN.run(args)
+
+
+def test_diagnostic_cache_is_rejected_before_training_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provenance = CacheProvenance(
+        classification="acquisition_diagnostic",
+        root_manifest_path=str(tmp_path / "cache" / "manifest.json"),
+        root_manifest_sha256="1" * 64,
+        root_manifest_content_sha256="2" * 64,
+        acquisition_schema_version="snn_rr.feature_cache_acquisition.v2",
+        acquisition_mode="diagnostic",
+        scientific_eligible=False,
+        config_sha256="3" * 64,
+        pipeline_sha256="4" * 64,
+        reconstruction_content_sha256="5" * 64,
+        inventory_sha256="6" * 64,
+        inventory_file_count=5,
+        selected_sessions=("S01_A",),
+    )
+    cache = FeatureCache(
+        maps=np.ones((1, 3, 2, 4), dtype=np.float16),
+        aux=np.ones((1, 37), dtype=np.float32),
+        metadata=_timing_mask_metadata(1),
+        frequencies_hz=np.asarray([0.1, 0.2], dtype=np.float32),
+        provenance=provenance,
+        radar_timing_valid_mask=np.ones((1, 3, 1), dtype=np.bool_),
+    )
+    events: list[str] = []
+    monkeypatch.setattr(_TRAIN, "load_feature_cache", lambda *args, **kwargs: cache)
+    monkeypatch.setattr(
+        _TRAIN,
+        "seed_everything",
+        lambda *args, **kwargs: events.append("seed"),
+    )
+    monkeypatch.setattr(
+        _TRAIN.torch.cuda,
+        "is_available",
+        lambda: events.append("cuda") or True,
+    )
+    monkeypatch.setattr(
+        _TRAIN,
+        "fit_aux_scaler",
+        lambda *args, **kwargs: events.append("scaler"),
+    )
+    output_dir = tmp_path / "must_not_exist"
+    args = _TRAIN.parse_args(
+        [
+            "--cache-trust-mode",
+            "scientific",
+            "--device",
+            "cuda",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="verified v2 full-cohort"):
+        _TRAIN.run(args)
+
+    assert events == []
+    assert not output_dir.exists()
+
+
+def test_removed_diagnostic_trust_mode_fails_before_cache_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _TRAIN.parse_args(["--cache-trust-mode", "scientific"])
+    args.cache_trust_mode = "acquisition-diagnostic"
+    monkeypatch.setattr(
+        _TRAIN,
+        "load_feature_cache",
+        lambda *args, **kwargs: pytest.fail("cache loader must not be reached"),
+    )
+
+    with pytest.raises(ValueError, match="inspection-only"):
         _TRAIN.run(args)

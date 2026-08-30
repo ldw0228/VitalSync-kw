@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -624,6 +625,12 @@ def test_scientific_v2_arrays_are_owned_and_survive_source_mutation(
         assert array is not None
         assert np.array_equal(array, snapshots[name])
 
+    output_dir = tmp_path / "source_drift_output_must_not_exist"
+    args = _TRAIN.parse_args(["--output-dir", str(output_dir)])
+    with pytest.raises(RuntimeError, match="authority source changed"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+    assert not output_dir.exists()
+
 
 def test_forged_target_equal_base_csv_and_npz_are_rejected(
     tmp_path: Path,
@@ -696,7 +703,11 @@ def test_acquisition_v2_structural_mask_overrides_numeric_zero_and_zeroes_invali
         cache, scientific=False, zero_radar=0
     )
     experiment = _TRAIN.load_aligned_experiment(
-        cache, csv_path, npz_path, verify_file_hashes=False
+        cache,
+        csv_path,
+        npz_path,
+        verify_file_hashes=False,
+        allow_diagnostic_acquisition_inspection=True,
     )
     sample = _TRAIN.SVDSourceDataset(
         experiment, [0], np.zeros((len(experiment.metadata), 1), dtype=np.float32)
@@ -710,7 +721,11 @@ def test_acquisition_v2_structural_mask_overrides_numeric_zero_and_zeroes_invali
         cache, scientific=False, invalid_radar=1
     )
     experiment = _TRAIN.load_aligned_experiment(
-        cache, csv_path, npz_path, verify_file_hashes=False
+        cache,
+        csv_path,
+        npz_path,
+        verify_file_hashes=False,
+        allow_diagnostic_acquisition_inspection=True,
     )
     feature_columns = tuple(experiment.provenance["feature_allowlist"])
     sample = _TRAIN.SVDSourceDataset(
@@ -753,6 +768,372 @@ def test_acquisition_v2_cannot_be_downgraded_by_stripping_bindings(
         _TRAIN.load_aligned_experiment(
             cache, csv_path, npz_path, verify_file_hashes=False
         )
+
+
+def test_svd_main_rejects_diagnostic_cache_before_training_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=False)
+    events: list[str] = []
+    monkeypatch.setattr(
+        _TRAIN,
+        "seed_everything",
+        lambda *args, **kwargs: events.append("seed"),
+    )
+    monkeypatch.setattr(
+        _TRAIN.torch.cuda,
+        "is_available",
+        lambda: events.append("cuda") or True,
+    )
+    monkeypatch.setattr(
+        _TRAIN,
+        "fit_robust_scaler",
+        lambda *args, **kwargs: events.append("scaler"),
+    )
+    monkeypatch.setattr(
+        _TRAIN,
+        "SourceSeparatedRRSNN",
+        lambda *args, **kwargs: events.append("model"),
+    )
+    output_dir = tmp_path / "must_not_exist"
+
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        _TRAIN.main(
+            [
+                "--svd-cache",
+                str(cache),
+                "--base-oof-csv",
+                str(csv_path),
+                "--base-oof-npz",
+                str(npz_path),
+                "--device",
+                "cuda",
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+
+    assert events == []
+    assert not output_dir.exists()
+
+
+def test_svd_train_fold_rejects_explicit_diagnostic_inspection_before_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=False)
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        verify_file_hashes=False,
+        allow_diagnostic_acquisition_inspection=True,
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        _TRAIN,
+        "fit_robust_scaler",
+        lambda *args, **kwargs: events.append("scaler"),
+    )
+    monkeypatch.setattr(
+        _TRAIN,
+        "SourceSeparatedRRSNN",
+        lambda *args, **kwargs: events.append("model"),
+    )
+    output_dir = tmp_path / "must_not_exist"
+    args = _TRAIN.parse_args(["--output-dir", str(output_dir)])
+
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    assert events == []
+    assert not output_dir.exists()
+
+
+def test_svd_train_fold_rejects_forged_in_memory_scientific_promotion(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=False)
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        verify_file_hashes=False,
+        allow_diagnostic_acquisition_inspection=True,
+    )
+    output_dir = tmp_path / "forged_output_must_not_exist"
+    args = _TRAIN.parse_args(["--output-dir", str(output_dir)])
+
+    # These were the complete mutable-field bypass before the loader-issued
+    # receipt became the authority source.
+    root_contract = experiment.root_manifest["canonical_acquisition_contract"]
+    root_contract["mode"] = "strict"
+    root_contract["scientific_eligible"] = True
+    experiment.root_manifest["scientific_eligible"] = True
+    experiment.provenance["base_oof_authority"]["scientific_eligible"] = True
+    experiment.provenance[
+        "claim_classification"
+    ] = "retrospective_scientific_noncommercial"
+
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    # A receipt-shaped copy with its decision flipped was not issued by the
+    # loader and must fail before any output directory is created.
+    experiment.training_authority_receipt = replace(
+        experiment.training_authority_receipt,
+        training_authorized=True,
+    )
+    with pytest.raises(RuntimeError, match="issued by load_aligned_experiment"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    assert not output_dir.exists()
+
+
+def test_svd_train_fold_rejects_target_encoded_allowed_metadata_before_output(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=True)
+    provenance_path = _publish_scientific_base_oof_authority(
+        cache, csv_path, npz_path
+    )
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        base_oof_provenance=provenance_path,
+    )
+    experiment.metadata["prediction_bpm"] = experiment.metadata["rr_bpm"].to_numpy()
+    output_dir = tmp_path / "metadata_forgery_must_not_exist"
+    args = _TRAIN.parse_args(["--output-dir", str(output_dir)])
+
+    with pytest.raises(RuntimeError, match="in-memory experiment"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    assert not output_dir.exists()
+
+
+def test_svd_train_fold_rejects_owned_readonly_target_encoded_array_before_output(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=True)
+    provenance_path = _publish_scientific_base_oof_authority(
+        cache, csv_path, npz_path
+    )
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        base_oof_provenance=provenance_path,
+    )
+    session = experiment.sessions[0]
+    forged = np.array(session.spectra, copy=True, order="C")
+    forged[:, 0, 0, 0, 0] = experiment.metadata["rr_bpm"].to_numpy(
+        dtype=forged.dtype
+    )
+    forged.setflags(write=False)
+    assert forged.flags.owndata and not forged.flags.writeable
+    session.spectra = forged
+    output_dir = tmp_path / "array_forgery_must_not_exist"
+    args = _TRAIN.parse_args(["--output-dir", str(output_dir)])
+
+    with pytest.raises(RuntimeError, match="session payload"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    assert not output_dir.exists()
+
+
+def test_diagnostic_v2_cannot_be_reissued_as_legacy_authority(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=False)
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        allow_diagnostic_acquisition_inspection=True,
+    )
+    assert experiment.training_authority_receipt is not None
+    assert experiment.training_authority_receipt.acquisition_v2 is True
+    assert experiment.training_authority_receipt.training_authorized is False
+
+    # The issuer has no caller-controlled acquisition/scientific booleans and
+    # consumes the loader's pending exact-object registration only once.
+    with pytest.raises(RuntimeError, match="only be issued once"):
+        _TRAIN._issue_svd_training_authority_receipt(
+            experiment=experiment,
+            authority_path=tmp_path / "missing-provenance.json",
+        )
+
+
+def test_svd_authority_rejects_exact_clone_subclass_and_session_subclass(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=True)
+    provenance_path = _publish_scientific_base_oof_authority(
+        cache, csv_path, npz_path
+    )
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        base_oof_provenance=provenance_path,
+    )
+    fields = {
+        name: getattr(experiment, name)
+        for name in _TRAIN.AlignedSVDExperiment.__dataclass_fields__
+    }
+    clone = _TRAIN.AlignedSVDExperiment(**fields)
+
+    class TargetInjectingExperiment(_TRAIN.AlignedSVDExperiment):
+        def arrays_for_position(self, position: int) -> tuple[np.ndarray, np.ndarray]:
+            spectra, attributes = super().arrays_for_position(position)
+            forged = np.array(spectra, copy=True)
+            forged.flat[0] = float(self.metadata.iloc[position]["rr_bpm"])
+            return forged, attributes
+
+    subclass = TargetInjectingExperiment(**fields)
+    args = _TRAIN.parse_args(["--output-dir", str(tmp_path / "must_not_exist")])
+    for candidate in (clone, subclass):
+        with pytest.raises(RuntimeError, match="issued by load_aligned_experiment"):
+            _TRAIN.train_fold(
+                args, candidate, 0, torch.device("cpu"), "test"
+            )
+
+    original_sessions = experiment.sessions
+
+    class TargetInjectingSession(_TRAIN.SVDSessionArrays):
+        pass
+
+    source = original_sessions[0]
+    experiment.sessions = [
+        TargetInjectingSession(
+            **{
+                name: getattr(source, name)
+                for name in _TRAIN.SVDSessionArrays.__dataclass_fields__
+            }
+        )
+    ]
+    with pytest.raises(RuntimeError, match="in-memory experiment"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+    experiment.sessions = original_sessions
+    assert not Path(args.output_dir).exists()
+
+
+def test_scientific_extra_model_output_cannot_enter_feature_graph(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=True)
+    frame = pd.read_csv(csv_path)
+    frame["prediction_uncalibrated_bpm"] = frame["rr_bpm"]
+    frame["quality"] = frame["rr_bpm"]
+    frame.to_csv(csv_path, index=False)
+    provenance_path = _publish_scientific_base_oof_authority(
+        cache, csv_path, npz_path
+    )
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        base_oof_provenance=provenance_path,
+    )
+    assert experiment.provenance["feature_allowlist"] == [
+        "prediction_bpm",
+        "rr_std_bpm",
+    ]
+    assert "prediction_uncalibrated_bpm" not in experiment.metadata
+    assert "quality" not in experiment.metadata
+    np.testing.assert_allclose(
+        experiment.metadata["prediction_bpm"],
+        np.load(npz_path, allow_pickle=False)["prediction_bpm"],
+    )
+
+
+def test_legacy_training_requires_loader_and_caller_explicit_mode(
+    tmp_path: Path,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    inspection = _TRAIN.load_aligned_experiment(cache, csv_path, npz_path)
+    assert inspection.training_authority_receipt is not None
+    assert inspection.training_authority_receipt.acquisition_v2 is False
+    assert inspection.training_authority_receipt.training_authorized is False
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        _TRAIN._assert_training_cache_authority(inspection)
+
+    reproduction = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        historical_legacy_reproduction=True,
+    )
+    assert reproduction.training_authority_receipt is not None
+    assert reproduction.training_authority_receipt.training_authorized is True
+    with pytest.raises(RuntimeError, match="explicit historical"):
+        _TRAIN._assert_training_cache_authority(reproduction)
+    _TRAIN._assert_training_cache_authority(
+        reproduction, historical_legacy_reproduction=True
+    )
+
+
+def test_scientific_archives_are_consumed_from_stable_byte_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache, csv_path, npz_path = _synthetic_cache(tmp_path)
+    _upgrade_synthetic_cache_to_acquisition_v2(cache, scientific=True)
+    provenance_path = _publish_scientific_base_oof_authority(
+        cache, csv_path, npz_path
+    )
+    original_numpy_load = np.load
+    original_torch_load = _TRAIN.torch.load
+    numpy_sources: list[object] = []
+    torch_calls: list[tuple[object, object]] = []
+
+    def guarded_numpy_load(source: object, *args: object, **kwargs: object) -> object:
+        numpy_sources.append(source)
+        if isinstance(source, (str, Path)):
+            raise AssertionError("scientific archive reopened by path")
+        return original_numpy_load(source, *args, **kwargs)
+
+    def guarded_torch_load(source: object, *args: object, **kwargs: object) -> object:
+        torch_calls.append((source, kwargs.get("weights_only")))
+        return original_torch_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(_TRAIN.np, "load", guarded_numpy_load)
+    monkeypatch.setattr(_TRAIN.torch, "load", guarded_torch_load)
+    experiment = _TRAIN.load_aligned_experiment(
+        cache,
+        csv_path,
+        npz_path,
+        base_oof_provenance=provenance_path,
+    )
+    assert experiment.training_authority_receipt is not None
+    assert experiment.training_authority_receipt.training_authorized is True
+    assert numpy_sources
+    assert torch_calls
+    assert all(not isinstance(source, (str, Path)) for source in numpy_sources)
+    assert all(not isinstance(source, (str, Path)) for source, _ in torch_calls)
+    assert all(weights_only is True for _, weights_only in torch_calls)
+
+
+def test_training_source_closure_includes_trainers_models_and_forward_dependencies() -> None:
+    paths = {path.resolve() for path in _TRAIN._training_source_paths()}
+    required = {
+        _TRAIN.Path(_TRAIN.__file__).resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/svd_models.py").resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/models.py").resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/metrics.py").resolve(),
+    }
+    assert required <= paths
 
 
 def test_input_allowlist_blocks_target_identity_and_unlisted_values() -> None:

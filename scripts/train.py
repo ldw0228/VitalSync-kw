@@ -60,7 +60,6 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from snn_rr.cache import (  # noqa: E402
-    ACQUISITION_CACHE_SCHEMA_VERSION_V2,
     FeatureCache,
     append_causal_history_features,
     fit_aux_scaler,
@@ -2308,20 +2307,12 @@ def _run_signature(args: argparse.Namespace) -> str:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.epochs < 1 or args.batch_size < 1 or args.patience < 1:
         raise ValueError("epochs, batch size, and patience must be positive")
-    seed_everything(args.seed, deterministic=args.deterministic)
-    if args.num_threads:
-        torch.set_num_threads(args.num_threads)
-    torch.set_float32_matmul_precision("high")
-
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-    amp_enabled = bool(args.amp and device.type == "cuda")
-
     trust_mode = str(args.cache_trust_mode)
+    if trust_mode not in {"scientific", "legacy"}:
+        raise ValueError(
+            "diagnostic acquisition caches are inspection-only and cannot be "
+            "used by this training entry point"
+        )
     cache = load_feature_cache(
         args.cache_dir,
         require_acquisition_contract=trust_mode != "legacy",
@@ -2347,27 +2338,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "to be structurally valid"
             )
         claim_classification = "retrospective_scientific_noncommercial"
-    elif trust_mode == "acquisition-diagnostic":
-        if not cache_classification.startswith("acquisition_"):
-            raise ValueError(
-                "acquisition-diagnostic trust mode requires an acquisition-aware cache"
-            )
-        if (
-            cache.provenance.acquisition_schema_version
-            != ACQUISITION_CACHE_SCHEMA_VERSION_V2
-            or cache.radar_timing_valid_mask is None
-        ):
-            raise ValueError(
-                "acquisition-diagnostic training requires a verified v2 cache and "
-                "its structural radar timing mask; older acquisition caches are "
-                "inspection-only"
-            )
-        claim_classification = "acquisition_diagnostic_noncommercial"
     elif trust_mode == "legacy":
         if cache_classification != "legacy":
             raise ValueError(
                 "legacy trust mode cannot downgrade an acquisition-aware cache; "
-                "use scientific or acquisition-diagnostic"
+                "diagnostic acquisition caches are inspection-only"
             )
         claim_classification = "retrospective_legacy_noncommercial"
     else:  # argparse guards this; keep programmatic callers fail closed.
@@ -2381,6 +2356,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if cache.radar_timing_valid_mask is not None
         else "legacy_all_views_assumed"
     )
+
+    # Establish cache authority before any RNG seeding can touch CUDA, before
+    # device discovery, and before scaler/model/output construction.  A
+    # diagnostic acquisition cache must remain a read-only inspection input.
+    seed_everything(args.seed, deterministic=args.deterministic)
+    if args.num_threads:
+        torch.set_num_threads(args.num_threads)
+    torch.set_float32_matmul_precision("high")
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+    amp_enabled = bool(args.amp and device.type == "cuda")
+
     stored_range_bins = int(cache.maps.shape[-1])
     if stored_range_bins % 2:
         raise ValueError(
@@ -3011,13 +3003,12 @@ def build_parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=Path(data.get("cache_dir", "artifacts/cache/rf32s")))
     parser.add_argument(
         "--cache-trust-mode",
-        choices=("scientific", "acquisition-diagnostic", "legacy"),
+        choices=("scientific", "legacy"),
         default="scientific",
         help=(
             "scientific (default) requires a verified v2 full-cohort acquisition "
-            "cache; acquisition-diagnostic explicitly declares a structural-mask-aware "
-            "diagnostic-only path and forbids scientific claims; legacy is an explicit noncommercial "
-            "compatibility mode for historical caches"
+            "cache; acquisition-v2 diagnostic caches are inspection-only; legacy "
+            "is an explicit noncommercial compatibility mode for historical caches"
         ),
     )
     parser.add_argument(

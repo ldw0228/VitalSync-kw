@@ -17,6 +17,7 @@ def _resample(
     *,
     starts: list[float] | None = None,
     sequences: list[np.ndarray] | None = None,
+    output_hz: object = 10.0,
     max_gap_s: float = 0.050,
     gap_policy: str = "mask",
 ):
@@ -30,7 +31,7 @@ def _resample(
             if sequences is None
             else sequences
         ),
-        output_hz=10.0,
+        output_hz=output_hz,
         max_gap_s=max_gap_s,
         gap_policy=gap_policy,
         timestamp_sources=["meta_v13"] * view_count,
@@ -153,6 +154,72 @@ def test_sequence_gap_is_masked_even_when_timestamps_look_regular() -> None:
     assert result.values[0, 1, 0] == 0.0
     assert result.summary["per_view"][0]["frame_sequence_gap_count"] == 1
     assert result.summary["per_view"][0]["sequence_gap_interval_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        np.asarray([0.0, 1.0, 2.0, 3.0]),
+        np.asarray([0.0, 1.0, 2.5, 3.0]),
+        np.asarray([0.0, 1.0, np.nan, 3.0]),
+        np.asarray([0, 1, 2, 3], dtype=np.uint64)
+        + np.uint64(np.iinfo(np.int64).max),
+        np.asarray([False, True, True, False]),
+        np.asarray([0 + 0j, 1 + 0j, 2 + 1j, 3 + 0j]),
+        np.asarray([0.0, 1.0, float(2**63), 3.0], dtype=np.float64),
+    ],
+)
+def test_frame_sequence_must_be_exact_finite_int64(sequence: np.ndarray) -> None:
+    times = np.arange(sequence.size, dtype=np.float64) * 0.025
+    values = np.arange(sequence.size, dtype=np.float32)[:, None]
+    with pytest.raises(RadarTimingError, match="not integral"):
+        _resample([values], [times], sequences=[sequence], max_gap_s=0.030)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("output_hz", True),
+        ("output_hz", "10.0"),
+        ("max_gap_s", True),
+        ("max_gap_s", "0.03"),
+    ],
+)
+def test_resampling_controls_reject_bool_and_string_numbers(
+    field: str, value: object
+) -> None:
+    times = np.arange(12, dtype=np.float64) / 40.0
+    values = np.ones((12, 1), dtype=np.float32)
+    kwargs = {field: value}
+    with pytest.raises(RadarTimingError, match="must be"):
+        _resample([values], [times], **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [
+        ("starts", [True]),
+        ("starts", ["1800000000.0"]),
+        ("times", np.asarray(["0", "0.025", "0.050", "0.075"])),
+        ("times", np.asarray([False, True, True, True])),
+        ("payload", np.asarray([[False], [True], [False], [True]])),
+        ("payload", np.asarray([["0"], ["1"], ["2"], ["3"]])),
+    ],
+)
+def test_timing_arrays_reject_bool_and_string_numeric_coercion(
+    kind: str, value: object
+) -> None:
+    times: object = np.arange(4, dtype=np.float64) / 40.0
+    payload: object = np.ones((4, 1), dtype=np.float32)
+    starts: object = [1_800_000_000.0]
+    if kind == "starts":
+        starts = value
+    elif kind == "times":
+        times = value
+    else:
+        payload = value
+    with pytest.raises(RadarTimingError, match="real numeric|finite real"):
+        _resample([payload], [times], starts=starts, max_gap_s=0.030)
 
 
 def test_1280_regular_frames_form_exactly_one_320_sample_32s_support() -> None:

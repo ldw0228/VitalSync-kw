@@ -26,6 +26,64 @@ _FIXED_POINT_TICKS_PER_SECOND = 1_000_000_000
 _CANONICAL_ARRAY_HASH_SCHEMA = "snn_rr.canonical_ndarray_sha256.v1"
 
 
+def _strict_finite_real(value: Any, label: str) -> float:
+    """Accept a real numeric scalar without laundering bool/string values."""
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise RadarTimingError(f"{label} must be a finite real number")
+    result = float(value)
+    if not np.isfinite(result):
+        raise RadarTimingError(f"{label} must be a finite real number")
+    return result
+
+
+def _strict_real_array(value: Any, label: str) -> np.ndarray:
+    """Reject bool, complex, string, and object arrays before numeric casts."""
+
+    array = np.asarray(value)
+    try:
+        valid_dtype = bool(
+            np.issubdtype(array.dtype, np.number)
+            and not np.issubdtype(array.dtype, np.bool_)
+            and not np.issubdtype(array.dtype, np.complexfloating)
+        )
+    except TypeError:
+        valid_dtype = False
+    if not valid_dtype:
+        raise RadarTimingError(f"{label} must contain real numeric values")
+    return array
+
+
+def _strict_int64_array(value: Any, label: str) -> np.ndarray:
+    """Return exact int64 coordinates without bool/float/string laundering."""
+
+    array = np.asarray(value)
+    try:
+        if (
+            np.issubdtype(array.dtype, np.bool_)
+            or np.issubdtype(array.dtype, np.complexfloating)
+            or not np.issubdtype(array.dtype, np.number)
+        ):
+            raise ValueError("dtype is not numeric integral")
+        int64_info = np.iinfo(np.int64)
+        if np.issubdtype(array.dtype, np.floating):
+            raise ValueError("floating frame counters are forbidden")
+        if np.issubdtype(array.dtype, np.unsignedinteger):
+            if array.size and int(array.max()) > int64_info.max:
+                raise OverflowError("unsigned values exceed int64")
+        elif np.issubdtype(array.dtype, np.signedinteger):
+            if array.size and (
+                int(array.min()) < int64_info.min
+                or int(array.max()) > int64_info.max
+            ):
+                raise OverflowError("signed values exceed int64")
+        return array.astype(np.int64, copy=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RadarTimingError(f"{label} is not integral") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class CausalUniformRadarResampleV1:
     """Uniform, right-edge-timestamped radar samples and their validity mask.
@@ -107,8 +165,10 @@ def repair_common_timestamp_plateaus(
     affected half-open interval; callers without one must fail closed.
     """
 
-    measured = np.asarray(measured_times_s, dtype=np.float64)
-    sequences = np.asarray(frame_sequences)
+    measured = _strict_real_array(
+        measured_times_s, "common radar timestamps"
+    ).astype(np.float64, copy=False)
+    sequences = _strict_int64_array(frame_sequences, "frame_sequences")
     if measured.ndim != 1 or measured.size < 2:
         raise RadarTimingError("common radar time must contain at least two frames")
     if sequences.ndim != 2 or sequences.shape[1] != measured.size:
@@ -175,8 +235,16 @@ def fuse_common_radar_timeline(
         and len(relative_times_s) >= 1
     ):
         raise RadarTimingError("radar timing inputs must have equal non-zero view counts")
-    relative = [np.asarray(item, dtype=np.float64) for item in relative_times_s]
-    sequences = [np.asarray(item) for item in frame_sequences]
+    relative = [
+        _strict_real_array(item, f"radar view {index} timestamps").astype(
+            np.float64, copy=False
+        )
+        for index, item in enumerate(relative_times_s)
+    ]
+    sequences = [
+        _strict_int64_array(item, f"radar view {index} frame sequence")
+        for index, item in enumerate(frame_sequences)
+    ]
     for view_index, (times, sequence) in enumerate(zip(relative, sequences, strict=True)):
         if times.ndim != 1 or sequence.ndim != 1 or len(times) != len(sequence):
             raise RadarTimingError(f"radar view {view_index} timing vectors are inconsistent")
@@ -188,7 +256,9 @@ def fuse_common_radar_timeline(
             raise RadarTimingError(
                 f"radar view {view_index} time moves backwards at frame {first}"
             )
-    starts = np.asarray(start_epochs_s, dtype=np.float64)
+    starts = _strict_real_array(
+        start_epochs_s, "radar start epochs"
+    ).astype(np.float64, copy=False)
     if not np.isfinite(starts).all():
         raise RadarTimingError("radar start epochs must be finite")
     common = min(map(len, relative))
@@ -485,17 +555,19 @@ def causal_uniform_resample_radar_views_v1(
                 + ", ".join(rejected)
             )
 
-    rate = float(output_hz)
-    maximum_gap = float(max_gap_s)
-    if not np.isfinite(rate) or rate <= 0:
+    rate = _strict_finite_real(output_hz, "output_hz")
+    maximum_gap = _strict_finite_real(max_gap_s, "max_gap_s")
+    if rate <= 0:
         raise RadarTimingError("output_hz must be finite and positive")
-    if not np.isfinite(maximum_gap) or maximum_gap <= 0:
+    if maximum_gap <= 0:
         raise RadarTimingError("max_gap_s must be finite and positive")
     if gap_policy not in {"mask", "raise"}:
         raise RadarTimingError("gap_policy must be 'mask' or 'raise'")
     interval_s = 1.0 / rate
 
-    starts = np.asarray(start_epochs_s, dtype=np.float64)
+    starts = _strict_real_array(
+        start_epochs_s, "radar start epochs"
+    ).astype(np.float64, copy=False)
     if starts.ndim != 1 or not np.isfinite(starts).all():
         raise RadarTimingError("radar start epochs must be a finite vector")
     origin, start_offsets_s, start_offset_ticks, start_arithmetic = (
@@ -515,8 +587,12 @@ def causal_uniform_resample_radar_views_v1(
             strict=True,
         )
     ):
-        payload = np.asarray(raw_values)
-        times = np.asarray(raw_times, dtype=np.float64)
+        payload = _strict_real_array(
+            raw_values, f"radar view {view_index} payload"
+        )
+        times = _strict_real_array(
+            raw_times, f"radar view {view_index} timestamps"
+        ).astype(np.float64, copy=False)
         sequence = np.asarray(raw_sequence)
         if payload.ndim < 1 or times.ndim != 1 or sequence.ndim != 1:
             raise RadarTimingError(
@@ -538,12 +614,9 @@ def causal_uniform_resample_radar_views_v1(
             trailing_shape = payload.shape[1:]
         elif payload.shape[1:] != trailing_shape:
             raise RadarTimingError("all radar views must have the same payload shape")
-        try:
-            sequence_i64 = sequence.astype(np.int64, copy=False)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise RadarTimingError(
-                f"radar view {view_index} frame sequence is not integral"
-            ) from exc
+        sequence_i64 = _strict_int64_array(
+            sequence, f"radar view {view_index} frame sequence"
+        )
         boundary_summary = _boundary_plateau_summary_v1(times)
         measured, repair_summary = repair_common_timestamp_plateaus(
             times, sequence_i64[None, :]
@@ -870,8 +943,8 @@ def causal_uniform_resample_radar_views_v1(
 def block_mean_times(times_s: np.ndarray, factor: int) -> np.ndarray:
     """Return the timestamp of non-overlapping causal block-mean samples."""
 
-    values = np.asarray(times_s, dtype=np.float64)
-    if values.ndim != 1 or factor <= 0:
+    values = _strict_real_array(times_s, "times").astype(np.float64, copy=False)
+    if values.ndim != 1 or type(factor) is not int or factor <= 0:
         raise RadarTimingError("times must be a vector and factor must be positive")
     usable = len(values) - len(values) % factor
     if usable < factor:

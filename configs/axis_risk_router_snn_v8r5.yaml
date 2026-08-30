@@ -1,0 +1,572 @@
+schema_version: 2
+campaign: v8r5_axis_preserving_soft_risk_proposal
+classification: retrospective_adaptive_unmeasured_proposal
+training_authorized: false
+commercial_claim_allowed: false
+
+input:
+  node_feature_width: 571
+  harmonic_cache_format_version: 2
+  harmonic_cache_schema: snn_rr.harmonic_candidate_cache.v2
+  canonical_cache_builder_flags:
+    proposer_features: true
+    svd_components: 12
+    node_feature_availability: required
+  ordered_feature_names_semantic_sha256: d7553f8b11733903393575d02bc6acd4a8edefd5ce0e538491295ec84d938f05
+  feature_layout_semantic_sha256: 8c8a7d8be241c4dddfe8d6d96324e102a7db37081553974dbec1f04a52655d01
+  maximum_candidates: 12
+  rr_min_bpm: 6.0
+  rr_max_bpm: 45.0
+  structural_mask_required: true
+  per_feature_availability_forward_input_required: true
+  availability_must_be_cache_provenance_bound: true
+  concrete_cache_contract_validator: validate_v8r5_cache_contract
+  concrete_cache_validator_checks:
+    - strict_json_without_nan_or_infinity
+    - manifest_schema_and_content_sha256
+    - bound_payload_hash_size_and_single_inode_snapshot
+    - all_forward_array_headers
+    - chunked_unavailable_exact_zero
+    - candidate_padding_and_structural_ceiling
+  cache_contract_validation_does_not_authorize_training: true
+  classical_rr_availability_forward_input_required: true
+  unavailable_cells_exact_zero_after_scaling: true
+  iq_branch_available: false
+  forward_target_free: true
+
+model:
+  ancestry_policy: successor_with_hash_bound_layout_and_spiking_cell_reuse
+  source_execution_binding:
+    scope: initialization_time_disk_bytes_not_actual_loader_compiled_bytes
+    binds_actual_loader_compiled_bytes: false
+    terminal_training_authorization_blocker: external_launcher_executed_byte_closure_and_verifier_absent
+  proposal_config_absence_policy: module_import_fails_closed
+  governed_reused_dependencies:
+    - harmonic_feature_layout_v3r1
+    - svd_episode_models.EpisodeSpikingCell
+  governed_dependency_source_sha256:
+    harmonic_feature_layout_v3r1: f779b46a5f3818dc051e3f0758388ec0baccda9a3e05d8d14da9f8553456bf07
+    svd_episode_models: bd9bfaca5babe5cc6c3636f1f5954ae9ef879b3770cef13fe2a342b3bbc0b11c
+  independent_implementation_claim: false
+  hidden_channels: 64
+  graph_blocks: 2
+  simulation_steps: 8
+  dropout: 0.05
+  beta: 0.92
+  adaptation_decay: 0.97
+  adaptation_strength: 0.40
+  maximum_parameters: 400000
+  candidate_rr_coordinate_bounds_source: input.rr_min_bpm_and_rr_max_bpm
+  coordinate_interaction: evidence_and_coordinates_concatenated_before_pooling
+  availability_interaction: per_feature_mask_concatenated_with_each_core_rf_svd_value_group
+  axial_pooling:
+    - ratio_then_radar_attention
+    - radar_then_ratio_attention
+  graph_relations:
+    - near
+    - receiver_is_2x_sender
+    - sender_is_2x_receiver
+    - receiver_is_3x_sender
+    - sender_is_3x_receiver
+    - receiver_is_4x_sender
+    - sender_is_4x_receiver
+  relation_geometry:
+    near_tolerance_bpm: 0.5
+    ratio_tolerance_bpm: 0.75
+    edge_log_ratio_bandwidth: 0.08
+    factor_affinity_bandwidth_bpm: 0.75
+  continuous_edge_evidence: directed_log_ratio_proximity
+  temporal_cells: [plif, alif]
+  temporal_state_dtype: float32
+  amp_state_policy: canonical_float32_across_streaming_chunks
+  training_rr_output: training_soft_rr_bpm
+  deployment_rr_output: deployment_hard_rr_bpm
+  hard_selection: deployment_only_and_excluded_from_loss
+  checkpoint_state_contract:
+    strict_load_only: true
+    assign_false_only: true
+    exact_key_shape_dtype_and_dense_layout_preflight: true
+    private_tensor_snapshot_before_copy: true
+    private_model_recursive_load_preflight: true
+    transactional_live_rollback_on_unexpected_failure: true
+    all_floating_and_complex_tensors_finite_before_copy: true
+    persistent_and_nonpersistent_live_parameters_and_buffers_finite_before_copy: true
+    source_layout_config_dependency_receipt: persistent_uint8_canonical_json
+    non_tensor_runtime_structure_receipt: persistent_uint8_canonical_json
+    behavior_contract_match: fresh_runtime_attributes_live_buffer_and_checkpoint_exact
+    constructor_bound_runtime_behavior_attributes_immutable: true
+    root_and_child_training_eval_mode_coherence_required: true
+    state_dict_load_hooks_forbidden: true
+    state_dict_export_revalidates_runtime_receipts: true
+    route_temperature_match: exact_expected_float32_value
+  safe_initialization: anchor_fallback
+  disjoint_expert_heads: [value, route_preference, calibrated_risk]
+  route_preference_input_gradient_to_shared_representation: stopped
+
+routing:
+  temperature_initial: 1.0
+  temperature_is_persistent_state_dict_buffer: true
+  temperature_updates_require_validated_setter: true
+  nonfinite_source_policy: >-
+    remove_nonfinite_expert_then_finite_classical_fallback_or_unavailable_quality_zero
+  nonfinite_raw_head_preactivations_removed_before_nonlinear_transforms: true
+  nonfinite_graph_or_temporal_state_policy: >-
+    remove_experts_zero_sanitize_stream_state_then_finite_classical_fallback_or_unavailable
+  quality_zero_on_source_integrity_failure: true
+  predicted_risk_heads:
+    - expected_absolute_error_bpm
+    - probability_error_gt_2_bpm
+    - probability_error_gt_5_bpm
+    - predictive_scale_bpm
+  tail_probability_parameterization: >-
+    probability_error_gt_5_equals_probability_error_gt_2_times_a_conditional_probability
+  tail_probability_monotonicity_structural: true
+  quality_head_supervision: deployment_argmax_or_explicit_classical_fallback_error_within_2_bpm
+  quality_exact_zero_without_deployable_source: true
+  calibrated_risk_to_router_gradient: stopped
+  calibrated_risk_and_route_preference_parameter_sharing: forbidden
+  inference_risk_weights:
+    tail2: 1.0
+    tail5: 3.0
+  equivalence_tolerance_bpm: 0.35
+
+loss:
+  soft_expected_deployment_cost: 1.0
+  equivalence_set_cross_entropy: 0.35
+  equivalence_value_smooth_l1: 0.50
+  expected_abs_error_calibration: 0.20
+  tail2_bce: 0.15
+  tail5_bce: 0.20
+  scale_nll: 0.05
+  quality_bce: 0.15
+  calibration_reduction: available_expert_mean_per_row_then_weighted_row_mean
+  differentiable_tail_weights:
+    error_gt_2_bpm: 0.5
+    error_gt_5_bpm: 1.5
+  differentiable_tail_surrogate: sigmoid_gate_fraction_indicator
+  smooth_tail_bpm: 0.25
+  target_rr_bounds_bpm: [6.0, 45.0]
+  invalid_target_sanitization: replace_before_float32_conversion_and_all_arithmetic
+
+planned_training_contract:
+  loss_api_stage_argument: training_stage
+  stage_active_losses_enforced_by_loss_api: true
+  note: >-
+    No protected training may start until the declared acquisition/sync/cache
+    authority and a new versioned V8R5 validator authorization exist.
+  fixed_seeds: [20260828, 20260829, 20260830]
+  split_unit: physical_identity
+  outer_folds: 6
+  architecture_selection: one_common_variant_across_all_folds_and_seeds
+  stages:
+    - name: axis_and_expert_value_warmup
+      optimizer_updates: 300
+      route_temperature_start: 1.0
+      route_temperature_end: 1.0
+      trainable_modules:
+        - encoder
+        - graph
+        - pool
+        - episode_projection
+        - radar_context
+        - source_context
+        - temporal
+        - candidate_value_head
+        - anchor_value_head
+      frozen_modules:
+        - candidate_route_head
+        - anchor_route_head
+        - candidate_risk_head
+        - anchor_risk_head
+        - factor_head
+        - quality_head
+      active_losses: [equivalence_value_smooth_l1]
+      temperature_interpolation: constant
+    - name: soft_risk_router_warmup
+      optimizer_updates: 300
+      route_temperature_start: 1.0
+      route_temperature_end: 0.5
+      trainable_modules:
+        - candidate_route_head
+        - anchor_route_head
+        - candidate_risk_head
+        - anchor_risk_head
+        - factor_head
+        - quality_head
+      frozen_modules:
+        - encoder
+        - graph
+        - pool
+        - episode_projection
+        - radar_context
+        - source_context
+        - temporal
+        - candidate_value_head
+        - anchor_value_head
+      active_losses:
+        - soft_expected_deployment_cost
+        - equivalence_set_cross_entropy
+        - expected_abs_error_calibration
+        - tail2_bce
+        - tail5_bce
+        - scale_nll
+        - quality_bce
+      temperature_interpolation: linear_by_optimizer_update
+    - name: joint_finetune
+      optimizer_updates: 600
+      route_temperature_start: 0.5
+      route_temperature_end: 0.25
+      trainable_modules: [all]
+      frozen_modules: []
+      active_losses: [all_declared_losses]
+      temperature_interpolation: linear_by_optimizer_update
+  total_optimizer_updates: 1200
+  complete_sessions_per_optimizer_update: 4
+  optimizer:
+    name: adamw
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    gradient_clip_norm: 2.0
+  router_temperature_schedule: [1.0, 0.25]
+  post_training_calibration:
+    name: held_identity_cross_fitted_calibration
+    outer_test_target_access: forbidden
+    retrospective_order:
+      - freeze_common_architecture_release_mode_and_fixed_updates
+      - refit_each_outer_fold_on_non_test_identities_only
+      - fit_calibrator_on_non_test_identity_cross_fit_or_held_identity_only
+      - seal_all_outer_predictions
+      - reveal_outer_target_once
+    deployment_order:
+      - freeze_common_model_and_refit_on_development_cohort
+      - seal_model_weights_before_calibration_predictions
+      - evaluate_calibration_by_identity_cross_fitting
+      - fit_final_calibrator_once_on_full_untouched_calibration_cohort
+      - seal_calibrator_and_thresholds
+      - do_not_refit_model_after_calibration
+      - reveal_untouched_confirmation_target_once
+  optimizer_updates_fixed_before_run: true
+  outer_test_target_adaptation_forbidden: true
+  identity_rr_band_group_dro: planned
+  seven_radar_masks_balanced: planned
+
+evaluation_contract:
+  schema_version: 2
+  fixed_seeds: [20260828, 20260829, 20260830]
+  fixed_seed_policy: every_seed_independently_passes_every_required_gate
+  numeric_policy:
+    comparison_is_inclusive: true
+    compare_unrounded_float64: true
+    nonfinite_metric_result: fail
+  six_accuracy_gates:
+    overall_mae_bpm:
+      operator: le
+      threshold: 1.0
+    identity_macro_mae_bpm:
+      operator: le
+      threshold: 1.0
+      identity_weighting: equal
+    rmse_bpm:
+      operator: le
+      threshold: 1.8
+    within_2_bpm_fraction:
+      operator: ge
+      threshold: 0.90
+      event: absolute_error_le_2_bpm
+    error_gt_5_bpm_fraction:
+      operator: le
+      threshold: 0.03
+      event: absolute_error_gt_5_bpm
+    rr_25_35_mae_bpm:
+      operator: le
+      threshold: 2.0
+      target_interval_bpm:
+        lower: 25.0
+        upper: 35.0
+        endpoints_inclusive: true
+  denominator_contract:
+    population: all_authoritative_reference_valid_rows
+    prediction_coverage_fraction_required: 1.0
+    fallback_predictions_in_accuracy_metrics: true
+    no_estimate_or_unavailable_rows_may_be_dropped: false
+    no_estimate_or_nonfinite_prediction_policy: fail_entire_seed_population
+    duplicate_missing_or_unexpected_row_policy: fail_entire_seed_population
+    report_counts:
+      - authoritative_rows
+      - direct_estimates
+      - fallback_estimates
+      - no_estimates
+      - unavailable
+      - exclusions_by_predeclared_reason
+  authoritative_rowset:
+    source: rebuild_from_g1_g4_authorized_raw_reference_contract
+    required_manifest_fields:
+      - stable_row_key
+      - physical_identity
+      - physical_source_session_id
+      - window_number
+      - window_start_ns
+      - window_end_ns
+      - reference_qc
+      - target_binding_sha256
+    row_count: must_be_frozen_before_prediction
+    ordered_row_keys_sha256: must_be_frozen_before_prediction
+    content_sha256: must_be_frozen_before_prediction
+  legacy_frozen_2327_policy:
+    historical_rows: 2327
+    co_primary_only_if_exact_bijective_crosswalk: true
+    crosswalk_fields:
+      - stable_row_key
+      - physical_identity
+      - physical_source_session_id
+      - window_start_ns
+      - window_end_ns
+      - reference_qc
+      - target
+    crosswalk_row_count: must_be_frozen_before_prediction
+    crosswalk_ordered_keys_sha256: must_be_frozen_before_prediction
+    crosswalk_content_sha256: must_be_frozen_before_prediction
+    mismatch_classification: historical_comparator_only
+  co_primary_populations:
+    - name: authoritative_full_valid_reference_oof
+      expected_rows: must_be_frozen_before_prediction
+      selected_row_keys_sha256: must_be_frozen_before_prediction
+      overlapping_windows_are_correlated: true
+      every_seed_must_pass_all_six_accuracy_gates: true
+    - name: authoritative_deterministic_chronological_greedy_32s_nonoverlap
+      expected_rows: must_be_frozen_before_prediction
+      selected_row_keys_sha256: must_be_frozen_before_prediction
+      selector_source_sha256: must_be_frozen_before_prediction
+      selector_manifest_sha256: must_be_frozen_before_prediction
+      grouping_key: physical_source_session_id
+      grouping_must_reset_at_every_session: true
+      selector_uses_prediction_or_rr_value: false
+      selector_rule: >-
+        Per physical session, sort reference-QC-valid windows by
+        (window_start_ns, window_end_ns, stable_row_key), select the earliest
+        row, then select the next row whose start is at or after the prior
+        selected end; never carry the previous end across a session boundary.
+      selector_freeze_phase: before_any_prediction_or_target_reveal
+      every_seed_must_pass_all_six_accuracy_gates: true
+  both_co_primary_populations_must_pass: true
+  stride_phase_evaluation:
+    phase_count: 8
+    phase_offsets: [0, 1, 2, 3, 4, 5, 6, 7]
+    selector_rule: window_number_modulo_8_equals_phase_offset
+    grouping_key: physical_source_session_id
+    window_number_provenance:
+      source: authoritative_session_local_cache_producer_window_number
+      renumber_after_filtering: forbidden
+      bound_fields:
+        - producer_source_sha256
+        - producer_config_sha256
+        - physical_source_session_id
+        - session_start_ns
+        - base_stride_ns
+    selector_source_sha256: must_be_frozen_before_prediction
+    selected_row_count_by_phase: must_be_frozen_before_prediction
+    selected_row_keys_sha256_by_phase: must_be_frozen_before_prediction
+    selector_manifest_sha256: must_be_frozen_before_prediction
+    selector_freeze_phase: before_any_prediction_or_target_reveal
+    every_phase_and_every_seed_must_pass_all_six_accuracy_gates: true
+    aggregate_rule: report_each_phase_and_locked_macro_without_averaging_away_failure
+  retrospective_support_floors:
+    authoritative_full_and_greedy_each:
+      physical_identities_exact: 18
+      usable_source_sessions_exact: 29
+      rr_25_35_min_identities: 6
+      rr_25_35_min_greedy_nonoverlap_rows: 48
+    each_stride_phase:
+      min_identities: 12
+      rr_25_35_min_identities: 4
+      rr_25_35_min_rows: 16
+    insufficient_support_policy: promotion_blocked_not_passed
+  rr_35_45_promotion_safety_gate:
+    target_interval_bpm:
+      lower: 35.0
+      upper: 45.0
+      endpoints_inclusive: true
+    min_identities: 3
+    min_greedy_nonoverlap_rows: 24
+    mae_bpm:
+      operator: le
+      threshold: 3.0
+    error_gt_5_bpm_fraction:
+      operator: le
+      threshold: 0.05
+    every_seed_and_both_co_primary_populations_must_pass: true
+    insufficient_support_policy: promotion_blocked_not_passed
+  outer_test_policy:
+    reveal_budget_per_prelocked_campaign: 1
+    reveal_after_all_fold_prediction_packs_are_sealed: true
+    hypothesis_selection_from_outer_target: forbidden
+    threshold_calibrator_ensemble_checkpoint_selection_from_outer_target: forbidden
+    post_reveal_model_change_in_same_campaign: forbidden
+    later_use_of_same_cohort: retrospective_discovery_only
+  identity_cluster_bootstrap:
+    clusters: physical_identity_with_all_sessions_and_rows
+    prospective_site_stratification: true
+    resamples: 10000
+    seed: 20260831
+    confidence_level_one_sided: 0.95
+    lower_is_better_rule: upper_bound_le_threshold
+    higher_is_better_rule: lower_bound_ge_threshold
+    all_six_accuracy_bounds_must_pass: true
+
+prospective_release_contract:
+  schema_version: 1
+  scope: internal_engineering_release_criteria_not_regulatory_or_medical_guarantee
+  precollection_power:
+    method: simulation_based_identity_cluster_power_using_planned_missingness_and_band_prevalence
+    minimum_power_for_each_of_six_accuracy_gates: 0.90
+    one_sided_alpha: 0.05
+    analysis_and_sample_size_frozen_before_collection: true
+    numeric_cohort_floors_may_be_increased_but_not_decreased: true
+  r1_internal_engineering_pass:
+    accuracy: all_fixed_seeds_all_required_populations_phases_and_safety_gates
+    calibration:
+      identity_cross_fitted: true
+      equal_mass_ece_bins: 10
+      maximum_ece: 0.05
+      nominal_interval_coverages: [0.50, 0.70, 0.80, 0.90, 0.95]
+      maximum_absolute_coverage_gap_each: 0.05
+      full_denominator_required: true
+    radar_masks: [123, 12, 13, 23, 1, 2, 3]
+    fault_engineering:
+      minimum_injections_per_type_device_mask: 100
+      estimate_availability_when_any_source_deployable_min: 0.99
+      fallback_activation_success_min: 0.99
+      spurious_fallback_fraction_max: 0.01
+      all_source_missing_safe_no_estimate_fraction: 1.0
+      crashes_max: 0
+      silent_state_corruptions_max: 0
+      fault_detection_recall_min: 0.99
+      normal_input_false_alarm_fraction_max: 0.01
+      recovery_seconds_max: 8.0
+    target_device:
+      warm_latency_p95_ms_max: 250.0
+      latency_p99_ms_strictly_less_than: 4000.0
+      peak_host_ram_bytes_max: 1073741824
+      peak_vram_bytes_max: 2147483648
+      parameter_count_max: 400000
+  r2_prospective_calibrated:
+    cohort_floor:
+      identities_min: 40
+      sessions_min: 80
+      sites_min: 2
+      physical_radar_sets_min: 3
+      collection_days_min: 10
+      development_identity_overlap_max: 0
+      unplanned_session_exclusion_fraction_max: 0.10
+    reference_contract:
+      independent_reference_device: required
+      blinded_qc_operator: required
+      hardware_trigger_or_measurable_clock: required
+    intended_rr_support:
+      range_bpm: [6.0, 45.0]
+      bands_bpm: [[6.0, 10.0], [10.0, 15.0], [15.0, 20.0], [20.0, 25.0], [25.0, 35.0], [35.0, 45.0]]
+      band_endpoint_policy: lower_inclusive_upper_exclusive_except_final_upper_inclusive
+      each_band_identities_min: 10
+      each_band_greedy_nonoverlap_rows_min: 40
+      rr_25_35_identities_min: 20
+      rr_25_35_greedy_nonoverlap_rows_min: 160
+      rr_35_45_identities_min: 12
+      rr_35_45_greedy_nonoverlap_rows_min: 80
+    accuracy:
+      one_sided_identity_cluster_bootstrap_95_bounds_all_six: required
+      reference_valid_prediction_coverage_required: 1.0
+      fallback_included_in_metrics: true
+      no_estimates_allowed: 0
+    calibration:
+      assessment: identity_cross_fitted_before_final_fit
+      maximum_ece: 0.05
+      maximum_absolute_coverage_gap_each: 0.05
+      interval_width_and_score_reported: true
+    enrollment_funnel:
+      report_enrolled_acquired_reference_qc_direct_fallback_no_estimate: true
+      report_every_predeclared_exclusion_reason_and_count: true
+      missing_radar_may_not_be_excluded: true
+  r3_commercial_release_candidate:
+    cohort_floor:
+      identities_min: 100
+      sessions_min: 200
+      sites_min: 3
+      physical_radar_sets_min: 5
+      hardware_lots_min: 3
+      collection_days_min: 20
+      development_or_calibration_identity_overlap_max: 0
+      unplanned_session_exclusion_fraction_max: 0.05
+    reference_contract:
+      independent_reference_device: required
+      blinded_qc_operator: required
+      hardware_trigger_or_measurable_clock: required
+      confirmation_reference_qc_locked_before_target_reveal: true
+    intended_rr_support:
+      range_bpm: [6.0, 45.0]
+      bands_bpm: [[6.0, 10.0], [10.0, 15.0], [15.0, 20.0], [20.0, 25.0], [25.0, 35.0], [35.0, 45.0]]
+      band_endpoint_policy: lower_inclusive_upper_exclusive_except_final_upper_inclusive
+      each_band_identities_min: 25
+      each_band_greedy_nonoverlap_rows_min: 100
+      rr_25_35_identities_min: 40
+      rr_25_35_greedy_nonoverlap_rows_min: 320
+      rr_35_45_identities_min: 25
+      rr_35_45_greedy_nonoverlap_rows_min: 160
+    accuracy:
+      one_sided_identity_cluster_bootstrap_95_bounds_all_six: required
+      rr_35_45_point_and_upper_bounds_must_pass: true
+      reference_valid_prediction_coverage_required: 1.0
+      no_estimates_allowed: 0
+      confirmation_target_reveal_budget: 1
+      missing_radar_may_not_be_excluded: true
+    calibration:
+      maximum_ece: 0.03
+      maximum_absolute_coverage_gap_each: 0.03
+    target_device_fault_campaign:
+      radar_masks: [123, 12, 13, 23, 1, 2, 3]
+      fault_types: [gain, offset, impulse, burst, jitter, gap, range_shift, phase_inversion, flatline, restart, out_of_order, duplicate]
+      minimum_injections_per_fault_per_target_device: 100
+      crashes_max: 0
+      silent_state_corruptions_max: 0
+      eligible_source_availability_and_fallback_min: 0.995
+      fault_detection_recall_min: 0.99
+      false_fallback_fraction_max: 0.01
+      recovery_seconds_max: 8.0
+    target_device:
+      warm_latency_p95_ms_max: 250.0
+      latency_p99_ms_strictly_less_than: 4000.0
+      peak_host_ram_bytes_max: 1073741824
+      peak_vram_bytes_max: 2147483648
+    shadow:
+      consecutive_days_min: 30
+      device_units_min: 20
+      eligible_windows_min: 10000
+      pipeline_availability_min: 0.995
+      crashes_max: 0
+    canary:
+      days_min: 14
+      device_units_min: 5
+      eligible_windows_min: 5000
+    rollback:
+      drills_min: 3
+      trigger_detection_seconds_max: 60
+      signed_rollback_completion_seconds_max: 300
+      model_or_state_schema_corruptions_max: 0
+  claim_boundary:
+    r3_is_not_regulatory_approval: true
+    r3_is_not_medical_or_clinical_guarantee: true
+    all_numbers_are_unmet_predeclared_internal_criteria: true
+
+required_promotion_evidence:
+  - three_fixed_seeds_each_pass_all_six_accuracy_gates
+  - authoritative_rowset_and_selector_hashes_frozen_before_prediction
+  - full_valid_reference_oof_coverage_including_fallback_and_no_estimate_counts
+  - rr_35_45_separate_promotion_safety_gate
+  - seven_radar_mask_evaluation
+  - nonoverlap_and_eight_stride_phase_evaluation
+  - calibration_and_selective_risk
+  - chronological_streaming_parity
+  - cpu_cuda_latency_and_memory
+  - immutable_provenance
+  - one_outer_target_reveal_per_prelocked_campaign
+  - precollection_identity_cluster_power
+  - independent_prospective_confirmation_before_commercial_claim

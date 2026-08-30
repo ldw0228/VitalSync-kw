@@ -785,7 +785,10 @@ def reconstruct_subject(
         rsp_start_epoch_s=biopac.start_datetime.timestamp(),
     )
     envelope = robust_radar_motion_envelope(
-        payload, radar_times_s=radar_times_s, config=sync_config
+        payload,
+        radar_times_s=radar_times_s,
+        radar_valid_mask=feature_resample.valid_mask,
+        config=sync_config,
     )
     radar_markers = detect_radar_marker_candidates(envelope, config=sync_config)
     rsp_markers = detect_rsp_marker_candidates(
@@ -804,6 +807,29 @@ def reconstruct_subject(
             "radar_nonfinite_values_repaired": envelope.repaired_nonfinite_values,
             "radar_envelope_target_free": True,
             "radar_payload_interpretation": "182_real_float_payload_values",
+            "radar_resample_valid_mask_applied": True,
+            "radar_resample_valid_mask_sha256": hashlib.sha256(
+                np.ascontiguousarray(feature_resample.valid_mask).tobytes()
+            ).hexdigest(),
+            "radar_envelope_valid_mask_sha256": hashlib.sha256(
+                np.ascontiguousarray(envelope.valid_mask).tobytes()
+            ).hexdigest(),
+            "radar_invalid_guard_policy": (
+                "adjacent_pair_smoothing_support_and_view_topology"
+            ),
+            "radar_invalid_guard_radius_frames": max(
+                1,
+                int(
+                    np.ceil(
+                        round(
+                            sync_config.motion_smoothing_s
+                            * sync_config.radar_sample_rate_hz
+                        )
+                        / 2.0
+                    )
+                ),
+            ),
+            "radar_envelope_valid_sample_count": int(envelope.valid_mask.sum()),
         }
     )
     sync_result = SynchronizationResult(
@@ -870,6 +896,7 @@ def reconstruct_subject(
         session_dir / "sync_signals.npz",
         radar_times_s=radar_times_s.astype(np.float64),
         radar_motion_robust_z=envelope.robust_z.astype(np.float32),
+        radar_motion_valid_mask=envelope.valid_mask.astype(bool),
         rsp_marker_times_s=np.asarray([item.time_s for item in rsp_markers]),
         radar_marker_times_s=np.asarray([item.time_s for item in radar_markers]),
     )
@@ -906,10 +933,15 @@ def reconstruct_subject(
         review_reasons.append("biopac_reference_metadata_warning")
     if timestamp_plateau_intervals:
         review_reasons.append("radar_timestamp_plateau_structurally_masked")
+    review_reasons.append("independent_raw_derived_sync_verifier_absent")
+    review_reasons.append("independent_protocol_decode_verifier_absent")
     alignment_eligible = bool(
         authorized and measured_timing_eligible and biopac_reference_eligible
     )
-    stage_metric_eligible = protocol.status == "auto"
+    # The current protocol artifact is self-hashed reconstruction evidence,
+    # not a separately trusted replay from its raw sources.  Retain the decode
+    # for diagnostic inspection but never let it authorize stage metrics.
+    stage_metric_eligible = False
     range_feature_eligible = bool(
         range_document.get("status") == "built"
         and range_document.get("layout_selection_causal") is True
@@ -1144,15 +1176,23 @@ def main() -> int:
         "spreadsheet_sha256": _sha256_file(spreadsheet_path),
         "cohort_authority_sha256": _sha256_file(cohort_authority_path),
     }
-    sync_config = load_synchronization_config(sync_config_path)
-    protocol_config = load_protocol_config(protocol_config_path)
+    sync_config = load_synchronization_config(
+        sync_config_path,
+        expected_sha256=parsed_input_hashes["sync_config_sha256"],
+    )
+    protocol_config = load_protocol_config(
+        protocol_config_path,
+        expected_sha256=parsed_input_hashes["protocol_config_sha256"],
+    )
     cohort_authority = load_acquisition_cohort_authority(
-        cohort_authority_path
+        cohort_authority_path,
+        expected_sha256=parsed_input_hashes["cohort_authority_sha256"],
     )
     records = load_dataset_issue_records(
         spreadsheet_path,
         dataset_root=dataset_root,
         config=protocol_config,
+        expected_sha256=parsed_input_hashes["spreadsheet_sha256"],
     )
     for key, source_path in (
         ("sync_config_sha256", sync_config_path),
@@ -1301,6 +1341,12 @@ def main() -> int:
         strict_failure_reasons.append("not_all_usable_sessions_have_authorized_sync")
     if len(eligible) != len(usable):
         strict_failure_reasons.append("not_all_usable_sessions_are_strict_cache_eligible")
+    strict_failure_reasons.extend(
+        (
+            "independent_raw_derived_sync_verifier_absent",
+            "independent_protocol_decode_verifier_absent",
+        )
+    )
     root: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "created_at_utc": _utc_now(),

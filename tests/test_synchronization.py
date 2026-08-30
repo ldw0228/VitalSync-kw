@@ -5,6 +5,7 @@ import hashlib
 
 import numpy as np
 import pytest
+import snn_rr.synchronization as synchronization_module
 
 from snn_rr.synchronization import (
     MANUAL_APPROVAL_SCHEMA,
@@ -60,6 +61,27 @@ def _accepted_result():
     return estimate_marker_time_mapping(
         radar, rsp, epoch_prior_offset_s=5.0, config=_decision_config()
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["motion_range_quantile", "accept_min_confidence"],
+)
+def test_fractional_sync_gates_reject_yaml_booleans(field: str) -> None:
+    values = SynchronizationConfig().to_dict()
+    values[field] = True
+    with pytest.raises(SynchronizationError):
+        SynchronizationConfig(**values).validate()
+
+
+def test_motion_guard_kernel_longer_than_signal_fails_cleanly() -> None:
+    frames = np.zeros((1, 3, 182), dtype=np.float32)
+    config = _decision_config(
+        radar_sample_rate_hz=10.0,
+        motion_smoothing_s=10.0,
+    )
+    with pytest.raises(SynchronizationError, match="no radar view"):
+        robust_radar_motion_envelope(frames, config=config)
 
 
 def _content_bound_manual_decision(receipt, *, decision="approve"):
@@ -135,6 +157,103 @@ def test_exact_182_payload_and_target_free_motion_marker_detection():
 
     with pytest.raises(SynchronizationError, match="182"):
         robust_radar_motion_envelope(frames[..., :181], config=config)
+
+
+def test_resample_invalid_zero_boundaries_cannot_become_radar_markers():
+    rng = np.random.default_rng(73)
+    config = _decision_config(
+        radar_sample_rate_hz=10.0,
+        motion_smoothing_s=0.1,
+        radar_marker_merge_s=1.0,
+        radar_marker_z=4.0,
+        radar_marker_prominence_z=1.0,
+    )
+    frames = rng.normal(2.0, 0.002, size=(3, 600, 182)).astype(np.float32)
+    valid = np.ones((3, 600), dtype=np.bool_)
+    # Causal resampling writes invalid intervals as exact zero.  Entering and
+    # leaving this interval must not look like a broad body-motion marker.
+    frames[:, 200:240] = 0.0
+    valid[:, 200:240] = False
+    envelope = robust_radar_motion_envelope(
+        frames, radar_valid_mask=valid, config=config
+    )
+    markers = detect_radar_marker_candidates(envelope, config=config)
+    guard_radius = int(np.ceil(config.motion_smoothing_s * config.radar_sample_rate_hz / 2.0))
+    assert not envelope.valid_mask[200 - guard_radius : 241 + guard_radius].any()
+    assert all(not 19.5 <= marker.time_s <= 24.5 for marker in markers)
+    with pytest.raises(SynchronizationError, match="boolean"):
+        robust_radar_motion_envelope(
+            frames, radar_valid_mask=valid.astype(np.int8), config=config
+        )
+
+
+def test_numeric_zero_remains_available_when_structural_mask_is_true():
+    config = _decision_config(radar_sample_rate_hz=10.0, motion_smoothing_s=0.2)
+    frames = np.zeros((3, 100, 182), dtype=np.float32)
+    valid = np.ones((3, 100), dtype=np.bool_)
+    envelope = robust_radar_motion_envelope(
+        frames, radar_valid_mask=valid, config=config
+    )
+    first_valid = int(np.flatnonzero(envelope.valid_mask)[0])
+    assert first_valid <= 5
+    assert envelope.valid_mask[first_valid:].all()
+    assert not detect_radar_marker_candidates(envelope, config=config)
+
+
+def test_every_valid_smoothed_output_is_invariant_to_invalid_payload_bytes():
+    rng = np.random.default_rng(808)
+    config = _decision_config(
+        radar_sample_rate_hz=10.0,
+        motion_smoothing_s=0.5,
+        radar_marker_z=4.0,
+    )
+    frames = rng.normal(1.0, 0.01, size=(3, 240, 182)).astype(np.float32)
+    valid = np.ones((3, 240), dtype=np.bool_)
+    valid[:, 80:100] = False
+    zero_placeholder = frames.copy()
+    zero_placeholder[:, 80:100] = 0.0
+    hostile_placeholder = frames.copy()
+    hostile_placeholder[:, 80:100] = 1.0e6
+
+    first = robust_radar_motion_envelope(
+        zero_placeholder, radar_valid_mask=valid, config=config
+    )
+    second = robust_radar_motion_envelope(
+        hostile_placeholder, radar_valid_mask=valid, config=config
+    )
+    np.testing.assert_array_equal(first.valid_mask, second.valid_mask)
+    np.testing.assert_array_equal(
+        first.robust_z[first.valid_mask], second.robust_z[second.valid_mask]
+    )
+    assert not first.valid_mask[75:105].any()
+
+
+def test_partial_view_availability_topology_change_is_guarded() -> None:
+    rng = np.random.default_rng(902)
+    config = _decision_config(
+        radar_sample_rate_hz=10.0,
+        motion_smoothing_s=0.5,
+    )
+    frames = rng.normal(0.0, 0.01, size=(3, 240, 182)).astype(np.float32)
+    valid = np.ones((3, 240), dtype=np.bool_)
+    valid[0, 80:120] = False
+    envelope = robust_radar_motion_envelope(
+        frames, radar_valid_mask=valid, config=config
+    )
+    radius = int(
+        np.ceil(config.motion_smoothing_s * config.radar_sample_rate_hz / 2.0)
+    )
+    entry_guard = np.flatnonzero(~envelope.valid_mask[70:90]) + 70
+    exit_guard = np.flatnonzero(~envelope.valid_mask[110:140]) + 110
+    assert (
+        entry_guard.min() < 80 < entry_guard.max()
+        and len(entry_guard) >= 2 * radius + 1
+    )
+    assert (
+        exit_guard.min() < 120 < exit_guard.max()
+        and len(exit_guard) >= 2 * radius + 1
+    )
+    assert envelope.valid_mask[95:105].all()
 
 
 def test_rsp_candidates_union_adaptive_and_fixed_regions():
@@ -251,6 +370,52 @@ def test_equal_quality_distinct_offsets_are_ambiguous_and_fail_closed():
     assert result.confidence == 0.0
 
 
+def test_ambiguity_search_checks_later_dangerous_solution(monkeypatch):
+    radar = _markers([0.0, 100.0, 200.0])
+    rsp = _markers([0.0, 100.0, 200.0], source="fixed_high")
+    hypotheses = [
+        TimeMapping("constant", 0.0),
+        TimeMapping("constant", 10.0),
+        TimeMapping("constant", 20.0),
+    ]
+    solutions = {
+        0.0: synchronization_module._CandidateSolution(
+            hypotheses[0], ((0, 0), (1, 1), (2, 2)), np.zeros(3), 0.0, 0.0, 10.0
+        ),
+        # This first separated candidate is harmless because it has fewer pairs.
+        10.0: synchronization_module._CandidateSolution(
+            hypotheses[1], ((0, 0), (1, 1)), np.zeros(2), 0.0, 0.0, 5.0
+        ),
+        # A later same-count, close-score solution must still trigger ambiguity.
+        20.0: synchronization_module._CandidateSolution(
+            hypotheses[2], ((0, 0), (1, 1), (2, 2)), np.zeros(3), 0.0, 0.0, 9.9
+        ),
+    }
+    monkeypatch.setattr(
+        synchronization_module,
+        "_initial_hypotheses",
+        lambda *args, **kwargs: hypotheses,
+    )
+    monkeypatch.setattr(
+        synchronization_module,
+        "_refine_hypothesis",
+        lambda radar_values, rsp_values, mapping, prior, config: solutions[
+            mapping.offset_s
+        ],
+    )
+    config = _decision_config(
+        prior_tolerance_s=100.0,
+        ambiguity_mapping_separation_s=1.0,
+        ambiguity_score_margin=0.2,
+    )
+    result = estimate_marker_time_mapping(
+        radar, rsp, epoch_prior_offset_s=0.0, config=config
+    )
+    assert result.ambiguous
+    assert result.decision == "manual_review_required"
+    assert result.diagnostics["alternative_mapping"]["offset_s"] == 20.0
+
+
 def test_affine_mapping_index_and_resampling():
     mapping = TimeMapping(mode="affine", offset_s=0.125, scale=1.0 + 200e-6)
     radar_times = np.asarray([-1.0, 0.0, 0.75, 2.0, 20.0])
@@ -299,7 +464,7 @@ def test_receipt_is_canonical_tamper_evident_and_manual_approval_is_bound():
         rationale="Three marker pairs were visually confirmed in both modalities.",
     )
     assert validate_manual_approval(approval, receipt) == approval
-    assert synchronization_is_authorized(receipt, manual_approval=approval)
+    assert not synchronization_is_authorized(receipt, manual_approval=approval)
 
     tampered = copy.deepcopy(receipt)
     tampered["result"]["mapping"]["offset_s"] += 0.1
@@ -357,6 +522,45 @@ def test_receipt_authority_flags_reject_truthy_strings(field, value):
         validate_sync_receipt(tampered)
 
 
+@pytest.mark.parametrize(
+    ("field_path", "value", "message"),
+    [
+        (("result", "confidence"), True, "finite JSON number"),
+        (("result", "confidence"), "0.95", "finite JSON number"),
+        (("result", "mapping", "offset_s"), "2.0", "finite JSON number"),
+        (("result", "radar_markers", 0, "time_s"), False, "finite JSON number"),
+        (("result", "matches", 0, "radar_index"), "0", "JSON integer"),
+        (
+            ("input_bindings", "signals", "sha256"),
+            int("9" * 64),
+            "lowercase SHA-256",
+        ),
+    ],
+)
+def test_receipt_rejects_bool_string_and_nonstring_authority_values(
+    field_path, value, message
+):
+    tampered = copy.deepcopy(_accepted_receipt())
+    target = tampered
+    for key in field_path[:-1]:
+        target = target[key]
+    target[field_path[-1]] = value
+    _rehash(tampered)
+
+    with pytest.raises(SynchronizationError, match=message):
+        validate_sync_receipt(tampered)
+
+
+@pytest.mark.parametrize("value", [True, "2.0"])
+def test_time_mapping_from_dict_rejects_numeric_coercion(value):
+    with pytest.raises(SynchronizationError, match="finite JSON number"):
+        TimeMapping.from_dict(
+            {"mode": "constant", "offset_s": value, "scale": 1.0}
+        )
+    with pytest.raises(SynchronizationError, match="real numbers"):
+        TimeMapping(mode="constant", offset_s=value, scale=1.0)
+
+
 def test_match_indices_times_and_residuals_bind_exactly_to_markers_and_mapping():
     swapped_indices = copy.deepcopy(_accepted_receipt())
     swapped_indices["result"]["matches"][1]["radar_index"], swapped_indices[
@@ -392,7 +596,7 @@ def test_mapping_must_equal_deterministic_proposal_even_if_residuals_are_rehashe
         validate_sync_receipt(tampered)
 
 
-def test_manual_approval_is_required_for_review_only_mapping():
+def test_legacy_manual_approval_cannot_authorize_review_only_mapping():
     config = _decision_config(min_marker_span_s=1_000.0)
     radar = _markers([0.0, 100.0, 200.0])
     rsp = _markers([2.0, 102.0, 202.0], source="fixed_high")
@@ -415,7 +619,8 @@ def test_manual_approval_is_required_for_review_only_mapping():
         reviewed_at_utc="2026-08-30T00:01:00Z",
         rationale="The complete plots and acquisition notes were reviewed.",
     )
-    assert synchronization_is_authorized(receipt, manual_approval=approval)
+    assert validate_manual_approval(approval, receipt) == approval
+    assert not synchronization_is_authorized(receipt, manual_approval=approval)
 
 
 def test_rejected_mapping_cannot_be_manually_approved():
@@ -497,7 +702,7 @@ def test_ambiguous_mapping_cannot_be_manually_approved():
     assert not synchronization_is_authorized(receipt)
 
 
-def test_manual_rejection_revokes_automatically_accepted_mapping():
+def test_manual_rejection_is_retained_but_v1_mapping_never_authorizes():
     config = _decision_config()
     receipt = build_sync_receipt(
         _accepted_result(),
@@ -514,7 +719,7 @@ def test_manual_rejection_revokes_automatically_accepted_mapping():
         rationale="Visual review identified an acquisition mismatch.",
     )
 
-    assert synchronization_is_authorized(receipt)
+    assert not synchronization_is_authorized(receipt)
     assert not synchronization_is_authorized(receipt, manual_approval=rejection)
     with pytest.raises(SynchronizationError, match="review-required"):
         build_manual_approval(
@@ -524,6 +729,41 @@ def test_manual_rejection_revokes_automatically_accepted_mapping():
             reviewed_at_utc="2026-08-30T00:02:00Z",
             rationale="Automatic acceptance does not require a manual approval.",
         )
+
+
+def test_self_consistent_shifted_marker_receipt_remains_diagnostic_only():
+    receipt = build_sync_receipt(
+        _accepted_result(),
+        session_id="SYNTHETIC_SHIFTED",
+        config=_decision_config(),
+        input_bindings={"signals": {"sha256": "e" * 64}},
+        created_at_utc="2026-08-30T00:00:00Z",
+    )
+    shifted = copy.deepcopy(receipt)
+    shift_s = 1_000_000.0
+    for marker in shifted["result"]["radar_markers"]:
+        marker["time_s"] += shift_s
+    for marker in shifted["result"]["rsp_markers"]:
+        marker["time_s"] += shift_s
+    for match in shifted["result"]["matches"]:
+        match["radar_time_s"] += shift_s
+        match["rsp_time_s"] += shift_s
+    shifted["content_sha256"] = canonical_content_sha256(shifted)
+
+    # Internal receipt consistency is intentionally still auditable, but this
+    # self-hashed document cannot prove that markers came from the bound raw
+    # bytes and therefore cannot grant synchronization authority.
+    assert validate_sync_receipt(shifted)["result"]["decision"] == "accepted"
+    assert not synchronization_is_authorized(shifted)
+
+
+def test_pre_replay_semantics_receipt_remains_readable_but_unauthorized():
+    historical = copy.deepcopy(_accepted_receipt())
+    historical["algorithm"].pop("proposal_replay_semantics")
+    _rehash(historical)
+
+    assert validate_sync_receipt(historical)["result"]["decision"] == "accepted"
+    assert not synchronization_is_authorized(historical)
 
 
 def test_config_contract_loads_and_end_to_end_signal_path():
@@ -567,6 +807,19 @@ def test_config_contract_loads_and_end_to_end_signal_path():
     )
 
 
+def test_config_loader_binds_the_exact_consumed_snapshot_hash(tmp_path):
+    source = tmp_path / "sync.yaml"
+    payload = b"expected_payload_bins: 182\n"
+    source.write_bytes(payload)
+
+    loaded = load_synchronization_config(
+        source, expected_sha256=hashlib.sha256(payload).hexdigest()
+    )
+    assert loaded.expected_payload_bins == 182
+    with pytest.raises(SynchronizationError, match="consumed-byte SHA-256 mismatch"):
+        load_synchronization_config(source, expected_sha256="0" * 64)
+
+
 def test_measured_timing_config_binds_exact_radar_metadata_warning_allowlist():
     loaded = load_synchronization_config(
         "configs/sync_marker_affine_measured10_v2.yaml"
@@ -589,3 +842,19 @@ def test_radar_metadata_warning_allowlist_rejects_duplicate_or_empty_content():
         SynchronizationConfig(
             radar_metadata_warning_allowlist={"S07_KDM": [""]}
         ).validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("radar_marker_z", float("nan")),
+        ("ambiguity_score_margin", float("nan")),
+        ("rsp_fixed_high", float("inf")),
+        ("min_marker_pairs", True),
+    ],
+)
+def test_sync_config_rejects_nonfinite_and_wrong_numeric_types(field, value):
+    document = SynchronizationConfig().to_dict()
+    document[field] = value
+    with pytest.raises(SynchronizationError):
+        SynchronizationConfig.from_mapping(document)

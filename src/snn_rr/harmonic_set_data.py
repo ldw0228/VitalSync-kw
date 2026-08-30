@@ -418,12 +418,14 @@ def build_candidate_bank(
     *,
     classical_rr_bpm: np.ndarray,
     classical_confidence: np.ndarray,
+    classical_available: np.ndarray | None = None,
     radar_peaks_bpm: np.ndarray,
     proposal_bpm: np.ndarray | None = None,
     proposal_confidence: np.ndarray | None = None,
     proposal_mask: np.ndarray | None = None,
     proposal_source: np.ndarray | Sequence[str] | None = None,
     radar_peak_confidence: np.ndarray | None = None,
+    radar_mask: np.ndarray | None = None,
     rr_min_bpm: float = RR_MIN_BPM,
     rr_max_bpm: float = RR_MAX_BPM,
     merge_radius_bpm: float = DEFAULT_MERGE_RADIUS_BPM,
@@ -444,6 +446,24 @@ def build_candidate_bank(
     classical_conf = _as_1d(
         classical_confidence, name="classical_confidence", rows=rows
     )
+    if classical_available is None:
+        # This is an explicit compatibility default, not a numeric inference:
+        # callers with a structural timing authority must pass its boolean
+        # decision.  In particular, zero-valued RR/confidence never means
+        # unavailable here.
+        classical_authorized = np.ones(rows, dtype=np.bool_)
+    else:
+        classical_authorized = np.asarray(classical_available)
+        if (
+            classical_authorized.dtype != np.bool_
+            or classical_authorized.shape != (rows,)
+        ):
+            raise ValueError("classical_available must be boolean with shape [rows]")
+    # Keep unavailable fused-classical payloads exact zero.  In particular,
+    # the historical radar-peak confidence fallback below must not smuggle a
+    # fused confidence through a row whose three-radar authority is false.
+    classical = np.where(classical_authorized, classical, 0.0)
+    classical_conf = np.where(classical_authorized, classical_conf, 0.0)
     peaks = np.asarray(radar_peaks_bpm, dtype=np.float64)
     if peaks.ndim != 2 or peaks.shape[0] != rows or not 1 <= peaks.shape[1] <= 3:
         raise ValueError("radar_peaks_bpm must have shape [rows, 1..3]")
@@ -458,6 +478,14 @@ def build_candidate_bank(
     if int(max_candidates) < 1:
         raise ValueError("max_candidates must be positive")
     max_candidates = int(max_candidates)
+    if radar_mask is None:
+        radar_available = np.ones(peaks.shape, dtype=np.bool_)
+    else:
+        radar_available = np.asarray(radar_mask)
+        if radar_available.dtype != np.bool_ or radar_available.shape != peaks.shape:
+            raise ValueError(
+                "radar_mask must be boolean and match radar_peaks_bpm"
+            )
 
     proposals = _as_proposals(proposal_bpm, rows, name="proposal_bpm")
     if proposal_confidence is None:
@@ -545,18 +573,20 @@ def build_candidate_bank(
                     float(proposal_conf[row, proposal]),
                     int(proposal_sources[row, proposal]),
                 )
-        for factor_index, factor in enumerate((1.0, 2.0, 3.0, 4.0)):
-            admit(
-                float(classical[row] * factor),
-                float(classical_conf[row]),
-                int(CandidateSource.CLASSICAL_X1) + factor_index,
-            )
+        if classical_authorized[row]:
+            for factor_index, factor in enumerate((1.0, 2.0, 3.0, 4.0)):
+                admit(
+                    float(classical[row] * factor),
+                    float(classical_conf[row]),
+                    int(CandidateSource.CLASSICAL_X1) + factor_index,
+                )
         for radar in range(peaks.shape[1]):
-            admit(
-                float(peaks[row, radar]),
-                float(peak_conf[row, radar]),
-                int(CandidateSource.RADAR_PEAK_1) + radar,
-            )
+            if radar_available[row, radar]:
+                admit(
+                    float(peaks[row, radar]),
+                    float(peak_conf[row, radar]),
+                    int(CandidateSource.RADAR_PEAK_1) + radar,
+                )
 
         if anchors:
             order = np.argsort(np.asarray(anchors), kind="stable")
@@ -746,7 +776,12 @@ def resolve_joint_radar_mask(
     svd_attributes: np.ndarray | None = None,
     explicit_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Fail closed unless each radar has finite, nonzero RF *and* SVD evidence."""
+    """Resolve structural radar availability without overriding an explicit mask.
+
+    Numeric nonzero checks are retained only as a legacy fallback when no
+    structural mask exists.  When a caller supplies a mask, exact zero remains
+    a valid measured value and only non-finite payloads can invalidate it.
+    """
 
     rf = np.asarray(rf_maps)
     svd = np.asarray(svd_spectra)
@@ -754,21 +789,28 @@ def resolve_joint_radar_mask(
         raise ValueError("RF/SVD inputs must have shapes [N,R,F,X]/[N,R,V,C,F]")
     reduce_rf = tuple(range(2, rf.ndim))
     reduce_svd = tuple(range(2, svd.ndim))
-    rf_ok = np.isfinite(rf).all(axis=reduce_rf) & np.any(rf != 0, axis=reduce_rf)
-    svd_ok = np.isfinite(svd).all(axis=reduce_svd) & np.any(
-        svd != 0, axis=reduce_svd
-    )
-    available = rf_ok & svd_ok
+    rf_finite = np.isfinite(rf).all(axis=reduce_rf)
+    svd_finite = np.isfinite(svd).all(axis=reduce_svd)
+    available = rf_finite & svd_finite
     if svd_attributes is not None:
         attributes = np.asarray(svd_attributes)
         if attributes.shape[:2] != svd.shape[:2] or attributes.ndim != 5:
             raise ValueError("SVD attributes must have shape [N,R,V,C,A]")
         available &= np.isfinite(attributes).all(axis=tuple(range(2, attributes.ndim)))
     if explicit_mask is not None:
-        explicit = np.asarray(explicit_mask, dtype=bool)
+        explicit = np.asarray(explicit_mask)
+        if explicit.dtype != np.bool_:
+            raise ValueError("explicit radar mask must have boolean dtype")
         if explicit.shape != available.shape:
             raise ValueError("explicit radar mask shape mismatch")
         available &= explicit
+    else:
+        # Historical caches did not preserve a structural mask.  Their numeric
+        # inference remains diagnostic/inspection-only and cannot authorize a
+        # new scientific cache or training run.
+        available &= np.any(rf != 0, axis=reduce_rf) & np.any(
+            svd != 0, axis=reduce_svd
+        )
     return available.astype(bool, copy=False)
 
 
@@ -806,14 +848,12 @@ def sample_rf_harmonic_support(
     if radar_mask is None:
         available = np.isfinite(raw).all(axis=(2, 3)) & np.any(raw != 0, axis=(2, 3))
     else:
-        available = np.asarray(radar_mask, dtype=bool)
+        available = np.asarray(radar_mask)
+        if available.dtype != np.bool_:
+            raise ValueError("RF radar mask must have boolean dtype")
         if available.shape != raw.shape[:2]:
             raise ValueError("RF radar mask shape mismatch")
-        available = (
-            available
-            & np.isfinite(raw).all(axis=(2, 3))
-            & np.any(raw != 0, axis=(2, 3))
-        )
+        available = available & np.isfinite(raw).all(axis=(2, 3))
     rows, radars = raw.shape[:2]
     count = candidates.max_candidates
     ratio_count = len(ratio_tuple)
@@ -884,10 +924,8 @@ def _svd_reliability(
         * concentration
         * (1.0 - 0.5 * entropy)
     )
-    has_power = np.asarray(spectra, dtype=np.float32).sum(axis=-1) > 0
     component_mask = (
         np.isfinite(diagnostics).all(axis=-1)
-        & has_power
         & (quality > 0)
         & radar_mask[:, :, None, None]
     )
@@ -958,14 +996,15 @@ def sample_svd_harmonic_support(
             & np.any(selected != 0, axis=(2, 3, 4))
         )
     else:
-        available = np.asarray(radar_mask, dtype=bool)
+        available = np.asarray(radar_mask)
+        if available.dtype != np.bool_:
+            raise ValueError("SVD radar mask must have boolean dtype")
         if available.shape != raw.shape[:2]:
             raise ValueError("SVD radar mask shape mismatch")
         available = (
             available
             & np.isfinite(selected).all(axis=(2, 3, 4))
             & np.isfinite(selected_attrs).all(axis=(2, 3, 4))
-            & np.any(selected != 0, axis=(2, 3, 4))
         )
     safe = np.clip(
         np.nan_to_num(selected, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None
@@ -973,7 +1012,6 @@ def sample_svd_harmonic_support(
     reliability, component_mask, peak_bpm = _svd_reliability(
         safe, np.nan_to_num(selected_attrs), available
     )
-    available &= component_mask.any(axis=(2, 3))
     component_mask &= available[:, :, None, None]
     reliability *= component_mask
     peak_bpm *= component_mask
@@ -1006,9 +1044,10 @@ def sample_svd_harmonic_support(
         sampled *= row_mask[..., None, None]
         sampled *= component_mask[row][None, :, None, :, :]
         output[row] = sampled
+    evidence_available = available & component_mask.any(axis=(2, 3))
     mask = (
         np.asarray(candidates.mask)[:, :, None, None]
-        & available[:, None, :, None]
+        & evidence_available[:, None, :, None]
         & in_band[:, :, None, :]
     )
     return SVDHarmonicSupport(
@@ -1337,11 +1376,12 @@ def iter_compact_node_feature_batches(
         == rows
     ):
         raise ValueError("candidate and evidence row counts do not match")
-    if explicit_radar_mask is not None and np.asarray(explicit_radar_mask).shape != (
-        rows,
-        np.asarray(rf_maps).shape[1],
-    ):
-        raise ValueError("explicit radar mask shape mismatch")
+    if explicit_radar_mask is not None:
+        explicit_array = np.asarray(explicit_radar_mask)
+        if explicit_array.dtype != np.bool_:
+            raise ValueError("explicit radar mask must have boolean dtype")
+        if explicit_array.shape != (rows, np.asarray(rf_maps).shape[1]):
+            raise ValueError("explicit radar mask shape mismatch")
     if int(svd_components) not in (6, 12):
         raise ValueError("svd_components must be 6 or 12")
     if proposer_node_features is not None:
@@ -1360,7 +1400,7 @@ def iter_compact_node_feature_batches(
         explicit = (
             None
             if explicit_radar_mask is None
-            else np.asarray(explicit_radar_mask[row_slice], dtype=bool)
+            else np.asarray(explicit_radar_mask[row_slice])
         )
         selected_svd_for_mask = svd_batch[
             :, :, VERIFIED_SVD_VARIANT_INDICES, : int(svd_components), :

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import hashlib
 import json
@@ -13,6 +14,18 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+
+
+def _checkpoint_pickle_side_effect(path: str) -> None:
+    Path(path).write_text("executed\n", encoding="utf-8")
+
+
+class _MaliciousCheckpointValue:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return _checkpoint_pickle_side_effect, (str(self.path),)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -413,6 +426,84 @@ def test_cache_manifest_output_rejects_link_aliases(
         trainer.verify_cache_manifest_outputs(cache, outer_fold=3)
 
 
+def test_cache_npy_consumes_the_exact_hashed_bytes_during_same_inode_aba(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache, proposer = _synthetic_cache(tmp_path)
+    node_path = cache / "node_features.npy"
+    original_bytes = node_path.read_bytes()
+    changed = np.load(node_path, allow_pickle=False)
+    changed[...] = 999.0
+    changed_stream = trainer.io.BytesIO()
+    np.save(changed_stream, changed, allow_pickle=False)
+    changed_bytes = changed_stream.getvalue()
+    assert len(changed_bytes) == len(original_bytes)
+
+    original_load = trainer.np.load
+    npy_calls = 0
+
+    def adversarial_load(source: object, *args: object, **kwargs: object) -> object:
+        nonlocal npy_calls
+        if isinstance(source, trainer.io.BytesIO):
+            npy_calls += 1
+        if npy_calls == 2:
+            # Change and restore the already-verified source inode exactly
+            # while the node payload is consumed.  The parser must see only
+            # its descriptor-captured byte string.
+            with node_path.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(changed_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                return original_load(source, *args, **kwargs)
+            finally:
+                with node_path.open("r+b") as stream:
+                    stream.seek(0)
+                    stream.write(original_bytes)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(trainer.np, "load", adversarial_load)
+    experiment = trainer.load_experiment(cache, proposer, outer_fold=3, seed=7)
+    observed = np.asarray(experiment.node_features[[0]], np.float32)
+    assert np.count_nonzero(observed == 999.0) == 0
+    assert node_path.read_bytes() == original_bytes
+    # local-index, four forward arrays, and proposer were all opened from
+    # captured bytes rather than a source pathname.
+    assert npy_calls == 6
+
+
+def test_checkpoint_loader_is_weights_only_and_pickle_side_effect_free(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "pickle-side-effect.txt"
+    checkpoint_path = tmp_path / "malicious.pt"
+    torch.save(
+        {
+            "model_state": {},
+            "malicious": _MaliciousCheckpointValue(sentinel),
+        },
+        checkpoint_path,
+    )
+    with pytest.raises(RuntimeError, match="weights-only"):
+        trainer._load_torch_snapshot(checkpoint_path, map_location="cpu")
+    assert not sentinel.exists()
+
+
+def test_prediction_model_authority_is_terminal_without_sealed_pointer(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(campaign_phase="promotion", outer_fold=3, seed=7)
+    with pytest.raises(RuntimeError, match="target-sealed model authority"):
+        trainer._prediction_model_authority(
+            args,
+            pretrain=_authorized(),
+            phase_binding={"phase": "promotion"},
+        )
+
+
 def test_identity_balancing_and_outer_split_are_identity_disjoint(tmp_path: Path) -> None:
     cache, proposer = _synthetic_cache(tmp_path)
     experiment = trainer.load_experiment(cache, proposer, outer_fold=3, seed=7)
@@ -712,7 +803,14 @@ def test_synthetic_train_and_target_free_predict_smoke(tmp_path: Path, monkeypat
     cache, proposer = _synthetic_cache(tmp_path)
     monkeypatch.setattr(trainer, "validate_pretrain_authorization", _authorized)
     output = tmp_path / "train"
-    result = trainer.train(_train_args(cache, proposer, output))
+    train_args = _train_args(cache, proposer, output)
+    result = trainer.train(
+        train_args,
+        admitted_binding={
+            "phase": "discovery",
+            "context": train_args.expected_admitted_context_json,
+        },
+    )
     assert result["status"] == "checkpoint_locked"
     for name in (
         "run_manifest.json", "scaler.json", "history.json", "last.pt", "best.pt",
@@ -767,7 +865,38 @@ def test_synthetic_train_and_target_free_predict_smoke(tmp_path: Path, monkeypat
             "--chunk-windows", "2",
         ]
     )
-    prediction_result = trainer.predict_target_free(predict_args)
+    authorized_checkpoint, _ = trainer._verified_regular_file(
+        output / "best.pt"
+    )
+    authorized_scaler, _ = trainer._verified_regular_file(output / "scaler.json")
+    authorized_input, _ = trainer._verified_regular_file(sanitized)
+    authorized_payload, _ = trainer._load_torch_snapshot(
+        output / "best.pt", map_location="cpu"
+    )
+    synthetic_model_authority = {
+        "schema_version": 1,
+        "index": authorized_checkpoint,
+        "model_source_capability": authorized_scaler,
+        "checkpoint": authorized_checkpoint,
+        "scaler": authorized_scaler,
+        "predict_input": authorized_input,
+        "scientific_signature_sha256": authorized_payload[
+            "scientific_signature_sha256"
+        ],
+        "source_receipt": {"sha256": "f" * 64},
+    }
+    monkeypatch.setattr(
+        trainer,
+        "_prediction_model_authority",
+        lambda *_args, **_kwargs: copy.deepcopy(synthetic_model_authority),
+    )
+    prediction_result = trainer.predict_target_free(
+        predict_args,
+        admitted_binding={
+            "phase": "promotion_prediction",
+            "context": predict_args.expected_admitted_context_json,
+        },
+    )
     assert prediction_result["status"] == "target_free_prediction_complete"
     with np.load(predict_output / "predictions.npz", allow_pickle=False) as predictions:
         assert set(predictions.files) == set(trainer.PREDICTION_KEYS)
@@ -779,6 +908,190 @@ def test_synthetic_train_and_target_free_predict_smoke(tmp_path: Path, monkeypat
     manifest = json.loads((predict_output / "prediction_manifest.json").read_text())
     assert manifest["target_fields_accepted"] is False
     assert manifest["target_fields_emitted"] is False
+    resume_predict_args = trainer.argparse.Namespace(
+        **{**vars(predict_args), "resume": True}
+    )
+    reused = trainer.predict_target_free(
+        resume_predict_args,
+        admitted_binding={
+            "phase": "promotion_prediction",
+            "context": resume_predict_args.expected_admitted_context_json,
+        },
+    )
+    assert reused["status"] == "already_predicted"
+    original_prediction_raw = (predict_output / "predictions.npz").read_bytes()
+    original_assert_bindings = trainer._assert_file_bindings_current
+    reuse_swapped = False
+
+    def swap_completed_prediction_before_return(
+        bindings: dict[str, dict[str, object]],
+    ) -> None:
+        nonlocal reuse_swapped
+        if set(bindings) == {"prediction_manifest", "predictions"}:
+            reuse_swapped = True
+            trainer.atomic_save_npz(
+                predict_output / "predictions.npz", swapped_arrays
+            )
+        original_assert_bindings(bindings)
+
+    # Build the alternate payload before the return-barrier injection.
+    with np.load(predict_output / "predictions.npz", allow_pickle=False) as archive:
+        swapped_arrays = {
+            name: np.asarray(archive[name]).copy() for name in archive.files
+        }
+    swapped_arrays["prediction_bpm"] = (
+        swapped_arrays["prediction_bpm"].astype(np.float32) + 1.0
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_assert_file_bindings_current",
+        swap_completed_prediction_before_return,
+    )
+    with pytest.raises(
+        RuntimeError, match="consumed source drifted|SHA-256 drifted"
+    ):
+        trainer.predict_target_free(
+            resume_predict_args,
+            admitted_binding={
+                "phase": "promotion_prediction",
+                "context": resume_predict_args.expected_admitted_context_json,
+            },
+        )
+    assert reuse_swapped is True
+    trainer._atomic_publish_immutable(
+        predict_output / "predictions.npz",
+        lambda descriptor: trainer._write_all(descriptor, original_prediction_raw),
+    )
+    monkeypatch.setattr(
+        trainer, "_assert_file_bindings_current", original_assert_bindings
+    )
+    checkpoint_copy = tmp_path / "transplanted-best.pt"
+    shutil.copyfile(output / "best.pt", checkpoint_copy)
+    transplanted_predict_args = trainer.argparse.Namespace(
+        **{
+            **vars(resume_predict_args),
+            "checkpoint": checkpoint_copy,
+        }
+    )
+    with pytest.raises(RuntimeError, match="differ from sealed authority"):
+        trainer.predict_target_free(
+            transplanted_predict_args,
+            admitted_binding={
+                "phase": "promotion_prediction",
+                "context": transplanted_predict_args.expected_admitted_context_json,
+            },
+        )
+    original_best_raw = (output / "best.pt").read_bytes()
+    same_unit_checkpoint = dict(authorized_payload)
+    same_unit_state = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in authorized_payload["model_state"].items()
+    }
+    same_unit_tensor = next(
+        value
+        for value in same_unit_state.values()
+        if isinstance(value, torch.Tensor)
+        and value.numel()
+        and value.dtype.is_floating_point
+    )
+    same_unit_tensor.reshape(-1)[0] += 1.0
+    same_unit_checkpoint["model_state"] = same_unit_state
+    trainer.atomic_torch_save(output / "best.pt", same_unit_checkpoint)
+    alternate_checkpoint_args = trainer.argparse.Namespace(
+        **{
+            **vars(predict_args),
+            "output_dir": tmp_path / "alternate-checkpoint-predict",
+        }
+    )
+    with pytest.raises(RuntimeError, match="checkpoint campaign binding drifted"):
+        trainer.predict_target_free(
+            alternate_checkpoint_args,
+            admitted_binding={
+                "phase": "promotion_prediction",
+                "context": alternate_checkpoint_args.expected_admitted_context_json,
+            },
+        )
+    trainer._atomic_publish_immutable(
+        output / "best.pt",
+        lambda descriptor: trainer._write_all(descriptor, original_best_raw),
+    )
+    partial_output = tmp_path / "partial-predict"
+    partial_output.mkdir()
+    partial_prediction = partial_output / "predictions.npz"
+    shutil.copyfile(predict_output / "predictions.npz", partial_prediction)
+    partial_prediction.chmod(0o444)
+    with np.load(predict_output / "predictions.npz", allow_pickle=False) as archive:
+        swapped_arrays = {
+            name: np.asarray(archive[name]).copy() for name in archive.files
+        }
+    swapped_arrays["prediction_bpm"] = (
+        swapped_arrays["prediction_bpm"].astype(np.float32) + 1.0
+    )
+    original_capture = trainer._capture_verified_file
+    swapped = False
+
+    def swap_after_partial_snapshot(
+        path: Path, **kwargs: object
+    ) -> tuple[dict[str, object], bytes]:
+        nonlocal swapped
+        binding, raw = original_capture(path, **kwargs)
+        if path.resolve() == partial_prediction.resolve() and not swapped:
+            swapped = True
+            trainer.atomic_save_npz(partial_prediction, swapped_arrays)
+        return binding, raw
+
+    monkeypatch.setattr(trainer, "_capture_verified_file", swap_after_partial_snapshot)
+    partial_args = trainer.argparse.Namespace(
+        **{
+            **vars(resume_predict_args),
+            "output_dir": partial_output,
+        }
+    )
+    with pytest.raises(RuntimeError, match="SHA-256 drifted"):
+        trainer.predict_target_free(
+            partial_args,
+            admitted_binding={
+                "phase": "promotion_prediction",
+                "context": partial_args.expected_admitted_context_json,
+            },
+        )
+    assert swapped is True
+    assert not (partial_output / "prediction_manifest.json").exists()
+    monkeypatch.setattr(trainer, "_capture_verified_file", original_capture)
+    fresh_swap_output = tmp_path / "fresh-swap-predict"
+    original_atomic_npz = trainer.atomic_save_npz
+    fresh_swapped = False
+
+    def swap_after_fresh_publish(
+        path: Path,
+        arrays: dict[str, np.ndarray],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        nonlocal fresh_swapped
+        binding = original_atomic_npz(path, arrays, **kwargs)
+        if path.resolve() == (fresh_swap_output / "predictions.npz").resolve():
+            fresh_swapped = True
+            original_atomic_npz(path, swapped_arrays)
+        return binding
+
+    monkeypatch.setattr(trainer, "atomic_save_npz", swap_after_fresh_publish)
+    fresh_swap_args = trainer.argparse.Namespace(
+        **{
+            **vars(predict_args),
+            "output_dir": fresh_swap_output,
+        }
+    )
+    with pytest.raises(RuntimeError, match="SHA-256 drifted"):
+        trainer.predict_target_free(
+            fresh_swap_args,
+            admitted_binding={
+                "phase": "promotion_prediction",
+                "context": fresh_swap_args.expected_admitted_context_json,
+            },
+        )
+    assert fresh_swapped is True
+    assert not (fresh_swap_output / "prediction_manifest.json").exists()
+    monkeypatch.setattr(trainer, "atomic_save_npz", original_atomic_npz)
     training_manifest = json.loads((output / "run_manifest.json").read_text())
     scientific = training_manifest["scientific_signature"]
     scientific_sha = trainer.scientific_signature_sha256(scientific)
@@ -792,6 +1105,75 @@ def test_synthetic_train_and_target_free_predict_smoke(tmp_path: Path, monkeypat
     )
     assert set(os.listdir(output)) == trainer._TRAIN_COMPLETED_OUTPUT_FILENAMES
     assert trainer._validate_completed_lock(output) == lock
+    original_lock_raw = (output / "checkpoint_selection_lock.json").read_bytes()
+    original_assert_binding = trainer._assert_file_binding_current
+    lock_swapped = False
+
+    def swap_completed_lock_before_return(binding: dict[str, object]) -> None:
+        nonlocal lock_swapped
+        if binding.get("path") == str(output / "checkpoint_selection_lock.json"):
+            lock_swapped = True
+            trainer.atomic_write_json(
+                output / "checkpoint_selection_lock.json",
+                {**lock, "created_utc": "changed-during-validation"},
+            )
+        original_assert_binding(binding)
+
+    monkeypatch.setattr(
+        trainer, "_assert_file_binding_current", swap_completed_lock_before_return
+    )
+    with pytest.raises(RuntimeError, match="SHA-256 drifted"):
+        trainer._validate_completed_lock(output)
+    assert lock_swapped is True
+    trainer._atomic_publish_immutable(
+        output / "checkpoint_selection_lock.json",
+        lambda descriptor: trainer._write_all(descriptor, original_lock_raw),
+    )
+    monkeypatch.setattr(
+        trainer, "_assert_file_binding_current", original_assert_binding
+    )
+    resumed_context = {
+        **train_args.expected_admitted_context_json,
+        "resume": True,
+    }
+    resumed_train_args = trainer.argparse.Namespace(
+        **{
+            **vars(train_args),
+            "resume": True,
+            "expected_admitted_context_json": resumed_context,
+        }
+    )
+    completed_reuse = trainer.train(
+        resumed_train_args,
+        admitted_binding={"phase": "discovery", "context": resumed_context},
+    )
+    assert completed_reuse["status"] == "already_complete"
+
+    def changed_authority(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            **_authorized(),
+            "pretrain_authorization_file_sha256": "b" * 64,
+        }
+
+    monkeypatch.setattr(
+        trainer, "validate_pretrain_authorization", changed_authority
+    )
+    with pytest.raises(RuntimeError, match="configuration/input binding differs"):
+        trainer.train(
+            resumed_train_args,
+            admitted_binding={"phase": "discovery", "context": resumed_context},
+        )
+    monkeypatch.setattr(trainer, "validate_pretrain_authorization", _authorized)
+    wrong_current_context = copy.deepcopy(lock["reuse_context"])
+    wrong_current_context["seed"] = 8
+    with pytest.raises(RuntimeError, match="current exact reuse context"):
+        trainer._validate_completed_lock(
+            output, expected_reuse_context=wrong_current_context
+        )
+    transplanted_output = tmp_path / "transplanted-train"
+    shutil.copytree(output, transplanted_output)
+    with pytest.raises(RuntimeError, match="reuse context binding drifted"):
+        trainer._validate_completed_lock(transplanted_output)
     unknown = output / "unknown.bin"
     unknown.write_bytes(b"unknown")
     unknown.chmod(0o444)
@@ -826,6 +1208,54 @@ def test_synthetic_train_and_target_free_predict_smoke(tmp_path: Path, monkeypat
         "maximum_same_group_retries": 14,
         "minimum_scale": 1.0,
     }
+
+
+def test_final_validation_rejects_best_checkpoint_swap_after_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache, proposer = _synthetic_cache(tmp_path)
+    output = tmp_path / "train"
+    args = _train_args(cache, proposer, output)
+    monkeypatch.setattr(trainer, "validate_pretrain_authorization", _authorized)
+    original_predict = trainer.predict_experiment_positions
+    prediction_calls = 0
+
+    def adversarial_predict(*call_args: object, **call_kwargs: object) -> object:
+        nonlocal prediction_calls
+        result = original_predict(*call_args, **call_kwargs)
+        prediction_calls += 1
+        if prediction_calls == 2:
+            checkpoint, _ = trainer._load_torch_snapshot(
+                output / "best.pt", map_location="cpu", required_mode=0o444
+            )
+            replacement = dict(checkpoint)
+            state = {
+                name: value.clone() if isinstance(value, torch.Tensor) else value
+                for name, value in checkpoint["model_state"].items()
+            }
+            tensor = next(
+                value
+                for value in state.values()
+                if isinstance(value, torch.Tensor)
+                and value.numel()
+                and value.dtype.is_floating_point
+            )
+            tensor.reshape(-1)[0] += 1.0
+            replacement["model_state"] = state
+            trainer.atomic_torch_save(output / "best.pt", replacement)
+        return result
+
+    monkeypatch.setattr(trainer, "predict_experiment_positions", adversarial_predict)
+    with pytest.raises(RuntimeError, match="SHA-256 drifted"):
+        trainer.train(
+            args,
+            admitted_binding={
+                "phase": "discovery",
+                "context": args.expected_admitted_context_json,
+            },
+        )
+    assert prediction_calls == 2
+    assert not (output / "checkpoint_selection_lock.json").exists()
 
 
 def test_chunk_round_padding_forward_loss_state_and_gradient_equivalence(
@@ -1326,6 +1756,148 @@ def test_trainer_bridges_explicit_capability_phase_and_context(
     assert observed["expected_outer_fold"] == 3
 
 
+@pytest.mark.parametrize(
+    ("entry_name", "execution_phase", "context"),
+    (
+        (
+            "train",
+            "discovery",
+            {
+                "outer_fold": 3,
+                "seed": 7,
+                "variant": "H0_no_factor",
+                "execution_number": 0,
+                "resume": False,
+            },
+        ),
+        (
+            "predict_target_free",
+            "promotion_prediction",
+            {
+                "outer_fold": 3,
+                "seed": 7,
+                "variant": "H0_no_factor",
+                "release_mode": "hard_source_argmax",
+                "attempt_number": 0,
+            },
+        ),
+    ),
+)
+def test_imported_real_entries_reject_forged_pretrain_before_side_effects(
+    entry_name: str,
+    execution_phase: str,
+    context: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / entry_name
+    capability = tmp_path / "capability.json"
+    args = SimpleNamespace(
+        campaign_phase="discovery",
+        outer_fold=3,
+        seed=7,
+        variant="H0_no_factor",
+        release_mode="hard_source_argmax",
+        resume=False,
+        promotion_authorization=None,
+        target_sealed_capability_receipt=capability,
+        expected_admitted_context_json=context,
+        output_dir=output,
+        cache=tmp_path / "must_not_stat_cache",
+        proposer_stack=tmp_path / "must_not_stat_proposer",
+        predict_input=tmp_path / "must_not_open_input.npz",
+        checkpoint=tmp_path / "must_not_open_checkpoint.pt",
+        scaler=tmp_path / "must_not_open_scaler.json",
+        device="cuda",
+    )
+    binding = {"phase": execution_phase, "context": context}
+    fresh = _authorized()
+    forged = dict(fresh)
+    # Strict JSON comparison must not inherit Python's True == 1 alias.
+    forged["training_authorized"] = 1
+    observed: dict[str, object] = {}
+
+    def fresh_validation(*call_args: object, **call_kwargs: object) -> dict[str, object]:
+        observed["args"] = call_args
+        observed["kwargs"] = call_kwargs
+        return dict(fresh)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("entry crossed its authorization boundary")
+
+    monkeypatch.setattr(trainer, "validate_pretrain_authorization", fresh_validation)
+    monkeypatch.setattr(trainer, "validate_phase_authorization", forbidden)
+    monkeypatch.setattr(trainer, "load_experiment", forbidden)
+    monkeypatch.setattr(trainer, "load_sanitized_inference_input", forbidden)
+    monkeypatch.setattr(trainer, "seed_everything", forbidden)
+    monkeypatch.setattr(trainer, "build_model", forbidden)
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", forbidden)
+
+    entry = getattr(trainer, entry_name)
+    with pytest.raises(RuntimeError, match="differs from fresh entry validation"):
+        entry(args, pretrain=forged, admitted_binding=binding)
+
+    assert observed["args"] == (binding,)
+    assert observed["kwargs"] == {
+        "target_sealed_capability_receipt": capability.resolve(),
+        "expected_phase": execution_phase,
+        "expected_context": context,
+        "expected_outer_fold": 3,
+    }
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("entry_name", "execution_phase"),
+    (("train", "discovery"), ("predict_target_free", "promotion_prediction")),
+)
+def test_imported_real_entries_reject_admitted_context_drift_before_validation(
+    entry_name: str,
+    execution_phase: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = {
+        "outer_fold": 3,
+        "seed": 7,
+        "variant": "H0_no_factor",
+        **(
+            {"execution_number": 0, "resume": False}
+            if entry_name == "train"
+            else {
+                "release_mode": "hard_source_argmax",
+                "attempt_number": 0,
+            }
+        ),
+    }
+    output = tmp_path / entry_name
+    args = SimpleNamespace(
+        campaign_phase="discovery",
+        outer_fold=3,
+        seed=7,
+        variant="H0_no_factor",
+        release_mode="hard_source_argmax",
+        resume=False,
+        promotion_authorization=None,
+        target_sealed_capability_receipt=tmp_path / "capability.json",
+        expected_admitted_context_json=context,
+        output_dir=output,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("authorization bytes opened after context drift")
+
+    monkeypatch.setattr(trainer, "validate_pretrain_authorization", forbidden)
+    bad_binding = {
+        "phase": execution_phase,
+        "context": {**context, "seed": 8},
+    }
+    entry = getattr(trainer, entry_name)
+    with pytest.raises(RuntimeError, match="lifecycle scope is invalid"):
+        entry(args, pretrain=_authorized(), admitted_binding=bad_binding)
+    assert not output.exists()
+
+
 def test_expected_admitted_context_parser_rejects_duplicate_keys() -> None:
     with pytest.raises(trainer.argparse.ArgumentTypeError, match="duplicate"):
         trainer._parse_expected_admitted_context('{"seed":1,"seed":2}')
@@ -1336,6 +1908,15 @@ def test_efficiency_benchmark_returns_only_strict_target_free_timing_telemetry(
 ) -> None:
     cache, proposer = _synthetic_cache(tmp_path, seed=20260828, outer_fold=3)
     monkeypatch.setattr(trainer, "validate_pretrain_authorization", _authorized)
+    expected_context = {
+        "campaign_revision": "V8R4",
+        "infrastructure_revision": "V8R4A",
+        "authorization_generation": "CONTEXT1",
+        "benchmark_id": "v8_hfr_2epoch_no_accuracy_metric_efficiency",
+        "outer_fold": 3,
+        "seed": 20260828,
+        "variant": "H0_no_factor",
+    }
     args = trainer.parse_args(
         [
             "--mode", "efficiency_benchmark",
@@ -1343,18 +1924,7 @@ def test_efficiency_benchmark_returns_only_strict_target_free_timing_telemetry(
             "--proposer-stack", str(proposer),
             "--output-dir", str(tmp_path / "must_remain_empty"),
             "--target-sealed-capability-receipt", str(tmp_path / "capability.json"),
-            "--expected-admitted-context-json", json.dumps(
-                {
-                    "campaign_revision": "V8R4",
-                    "infrastructure_revision": "V8R4A",
-                    "authorization_generation": "CONTEXT1",
-                    "benchmark_id": "v8_hfr_2epoch_no_accuracy_metric_efficiency",
-                    "outer_fold": 3,
-                    "seed": 20260828,
-                    "variant": "H0_no_factor",
-                },
-                sort_keys=True,
-            ),
+            "--expected-admitted-context-json", json.dumps(expected_context, sort_keys=True),
             "--outer-fold", "3",
             "--seed", "20260828",
             "--variant", "H0_no_factor",
@@ -1366,7 +1936,8 @@ def test_efficiency_benchmark_returns_only_strict_target_free_timing_telemetry(
         args,
         admitted_binding={
             "classification": "verified_v8_gpu_admitted_child_lifecycle",
-            "execution_phase": "efficiency_benchmark",
+            "phase": "efficiency_benchmark",
+            "context": expected_context,
             "invocation_sha256": "cd" * 32,
         },
     )
@@ -1404,6 +1975,73 @@ def test_efficiency_benchmark_returns_only_strict_target_free_timing_telemetry(
         assert epoch["validation_ns"] > 0
         assert epoch["total_ns"] == epoch["train_ns"] + epoch["validation_ns"]
     assert [epoch["warmup"] for epoch in telemetry["epochs"]] == [True, False]
+
+
+def test_imported_efficiency_rejects_forged_pretrain_before_cache_or_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = {
+        "campaign_revision": "V8R4",
+        "infrastructure_revision": "V8R4A",
+        "authorization_generation": "CONTEXT1",
+        "benchmark_id": "v8_hfr_2epoch_no_accuracy_metric_efficiency",
+        "outer_fold": 3,
+        "seed": 20260828,
+        "variant": "H0_no_factor",
+    }
+    args = trainer.parse_args(
+        [
+            "--mode", "efficiency_benchmark",
+            "--cache", str(tmp_path / "must_not_open_cache"),
+            "--proposer-stack", str(tmp_path / "must_not_open_proposer"),
+            "--output-dir", str(tmp_path / "must_not_exist"),
+            "--target-sealed-capability-receipt", str(tmp_path / "capability.json"),
+            "--expected-admitted-context-json", json.dumps(context, sort_keys=True),
+            "--outer-fold", "3",
+            "--seed", "20260828",
+            "--variant", "H0_no_factor",
+            "--epochs", "2",
+            "--device", "cuda",
+        ]
+    )
+    binding = {
+        "classification": "verified_v8_gpu_admitted_child_lifecycle",
+        "phase": "efficiency_benchmark",
+        "context": context,
+        "invocation_sha256": "ef" * 32,
+    }
+    fresh = _authorized()
+    forged = dict(fresh)
+    forged["training_authorized"] = 1
+    observed: dict[str, object] = {}
+
+    def fresh_validation(*call_args: object, **call_kwargs: object) -> dict[str, object]:
+        observed["args"] = call_args
+        observed["kwargs"] = call_kwargs
+        return dict(fresh)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("benchmark crossed its authorization boundary")
+
+    monkeypatch.setattr(trainer, "validate_pretrain_authorization", fresh_validation)
+    monkeypatch.setattr(trainer, "load_experiment", forbidden)
+    monkeypatch.setattr(trainer, "seed_everything", forbidden)
+    monkeypatch.setattr(trainer.torch.cuda, "is_available", forbidden)
+
+    with pytest.raises(RuntimeError, match="differs from fresh entry validation"):
+        trainer.run_efficiency_benchmark(
+            args, admitted_binding=binding, pretrain=forged
+        )
+    assert observed["args"] == (binding,)
+    assert observed["kwargs"] == {
+        "target_sealed_capability_receipt": (
+            tmp_path / "capability.json"
+        ).resolve(),
+        "expected_phase": "efficiency_benchmark",
+        "expected_context": context,
+        "expected_outer_fold": 3,
+    }
+    assert not (tmp_path / "must_not_exist").exists()
 
 
 # V8R4 authorization additions.  These live in the pre-authorized trainer
@@ -1516,7 +2154,7 @@ def test_v8r4a_atomic_replace_changes_inode_but_never_mode(tmp_path: Path) -> No
     assert json.loads(path.read_text()) == {"epoch": 2}
 
 
-def test_v8r4a_failed_atomic_writer_leaves_no_named_temporary(
+def test_v8r4a_failed_atomic_writer_preserves_residue_for_quarantine(
     tmp_path: Path,
 ) -> None:
     def fail_after_write(descriptor: int) -> None:
@@ -1525,10 +2163,57 @@ def test_v8r4a_failed_atomic_writer_leaves_no_named_temporary(
 
     with pytest.raises(RuntimeError, match="injected"):
         trainer._atomic_publish_immutable(tmp_path / "last.pt", fail_after_write)
-    assert list(tmp_path.iterdir()) == []
+    residues = list(tmp_path.glob(".last.pt.v8r4a-tmp-*"))
+    assert len(residues) == 1
+    residue = residues[0]
+    assert residue.read_bytes() == b"partial"
+    assert residue.stat().st_mode & 0o777 == 0o444
+    assert residue.stat().st_nlink == 1
+    with pytest.raises(RuntimeError, match="no files were deleted"):
+        trainer.cleanup_stale_atomic_temporaries(tmp_path)
+    assert residue.read_bytes() == b"partial"
 
 
-def test_v8r4a_stale_cleanup_removes_only_exact_safe_pattern(
+def test_v8r4a_failed_atomic_writer_never_unlinks_swapped_path(
+    tmp_path: Path,
+) -> None:
+    moved = tmp_path / "descriptor-owned-residue"
+    observed_temporary: list[Path] = []
+
+    def swap_path_then_fail(descriptor: int) -> None:
+        os.write(descriptor, b"descriptor-owned")
+        candidates = list(tmp_path.glob(".last.pt.v8r4a-tmp-*"))
+        assert len(candidates) == 1
+        temporary = candidates[0]
+        observed_temporary.append(temporary)
+        temporary.rename(moved)
+        temporary.write_bytes(b"unrelated-sentinel")
+        temporary.chmod(0o444)
+        raise RuntimeError("injected path swap")
+
+    with pytest.raises(RuntimeError, match="path swap"):
+        trainer._atomic_publish_immutable(tmp_path / "last.pt", swap_path_then_fail)
+
+    assert moved.read_bytes() == b"descriptor-owned"
+    assert moved.stat().st_mode & 0o777 == 0o444
+    assert len(observed_temporary) == 1
+    assert observed_temporary[0].read_bytes() == b"unrelated-sentinel"
+
+
+def test_atomic_npz_returns_committed_inode_binding_and_detects_replacement(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "predictions.npz"
+    first = trainer.atomic_save_npz(
+        path, {"value": np.asarray([1], dtype=np.int64)}
+    )
+    assert first == trainer._verified_regular_file(path)[0]
+    trainer.atomic_save_npz(path, {"value": np.asarray([2], dtype=np.int64)})
+    with pytest.raises(RuntimeError, match="SHA-256 drifted"):
+        trainer._assert_file_binding_current(first)
+
+
+def test_v8r4a_stale_cleanup_never_claims_filename_only_ownership(
     tmp_path: Path,
 ) -> None:
     stale = tmp_path / (".last.pt.v8r4a-tmp-" + "a" * 32)
@@ -1541,10 +2226,11 @@ def test_v8r4a_stale_cleanup_removes_only_exact_safe_pattern(
     malformed.write_bytes(b"keep")
     malformed.chmod(0o444)
 
-    removed = trainer.cleanup_stale_atomic_temporaries(tmp_path)
+    with pytest.raises(RuntimeError, match="no files were deleted"):
+        trainer.cleanup_stale_atomic_temporaries(tmp_path)
 
-    assert removed == (stale.name,)
-    assert not stale.exists()
+    assert stale.exists()
+    assert stale.read_bytes() == b"partial"
     assert unknown.exists()
     assert malformed.exists()
 
@@ -1578,6 +2264,7 @@ def test_v8r4_resume_checkpoint_epoch_rejects_v8r3() -> None:
         "checkpoint_compatibility": "v8r4_nonouter_training_validation_pack_only",
         "run_signature_sha256": "0" * 64,
         "scientific_signature_sha256": "1" * 64,
+        "reuse_context_sha256": "3" * 64,
         "scaler_sha256": "2" * 64,
         "epoch": 1,
         "stale": 0,
@@ -1588,7 +2275,13 @@ def test_v8r4_resume_checkpoint_epoch_rejects_v8r3() -> None:
         "optimizer_state": {},
         "gradient_scaler_state": {},
         "python_rng_state": (),
-        "numpy_rng_state": (),
+        "numpy_rng_state": {
+            "bit_generator": "MT19937",
+            "keys": torch.zeros(624, dtype=torch.int64),
+            "position": 0,
+            "has_gauss": 0,
+            "cached_gaussian": 0.0,
+        },
         "torch_rng_state": torch.zeros(1, dtype=torch.uint8),
         "cuda_rng_state_all": [],
     }

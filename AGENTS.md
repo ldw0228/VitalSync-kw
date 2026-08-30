@@ -30,14 +30,20 @@ gates and an independent prospective cohort, independent reference, target
 device, fault campaign, calibration, shadow/canary, and rollback validation
 also pass.
 
-Authoritative summaries:
+Current authority order:
 
+- `artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md`
 - `artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md`
 - `artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md`
 - `README.md`
 - `REPORT.md`
-- `artifacts/COMMERCIAL_SNN_GOAL_V2.md`
-- `artifacts/COMMERCIAL_SNN_CONTINUOUS_EXECUTION_PLAN_V4.md`
+
+Goal v3 and the 2026-08-31 progress report govern the current source
+generation. Goal v2, earlier execution plans/progress reports, existing release
+manifests, and `artifacts/commercial_goal_report.json` are immutable historical
+evidence only. They do not authorize current training, evaluation, or release.
+If an older document conflicts with Goal v3 or the current progress report,
+follow the two current documents and preserve the conflict for audit.
 
 ## 2. Non-negotiable scientific invariants
 
@@ -205,9 +211,43 @@ Current execution boundary:
 - V8R5 is a proposal, not measured evidence.
 
 Do not manually create those three CONTEXT1 artifacts or start production
-training around their fail-closed guards. Continue only through the declared
-validator/runtime issuance flow after an independent audit and real-bubblewrap
-verification.
+training around their fail-closed guards. The current CONTEXT1 validator is a
+terminal fail-closed generation: no independently governed external test
+issuer/runner trust root or signature verifier is implemented. Local JSON,
+self-hash, self-signature, monkeypatching constants, or a real-bubblewrap pass
+cannot issue the trio. Continuation requires a new governed source generation
+with an external trust anchor and verifier; it is not a command available in
+this snapshot.
+
+### AxisRiskRouterSNN V8R5
+
+V8R5 is a separately versioned, unmeasured successor proposal using the frozen
+571-wide layout. It is not ancestry-independent: it explicitly reuses the
+governed feature-layout contract and `EpisodeSpikingCell`, with both source
+dependencies hash-bound in its receipt. Its 228,838-parameter source joins
+every evidence value and per-feature availability bit with
+radar/ratio/branch/candidate coordinates before pooling, uses bidirectional
+axial attention, seven directed harmonic relations, two PLIF graph blocks, a
+causal PLIF→ALIF state, disjoint value/route/risk heads, explicit classical-RR
+availability, and soft expected-risk training with inference-only hard
+routing. A concrete format-v2 cache validator is implemented but always
+returns `training_authorized: false`. Synthetic correctness tests do not
+authorize training or prove accuracy. The config remains
+`training_authorized: false` and `commercial_claim_allowed: false`.
+
+The checkpoint contract stores canonical tensor-only source/config/layout/
+dependency and runtime-structure receipts, rejects partial/assigning/nonfinite
+loads before mutation, and fail-closes nonfinite learned experts or temporal
+state to a finite classical fallback or exact-zero unavailable output. These
+guards still do not prove the bytes actually compiled before import; protected
+execution requires the externally governed isolated-source launcher described
+in Goal v3.
+
+The current source also closes diagnostic-cache training entry points,
+revalidates imported V3R1 train/predict entries independently, preserves
+timing masks and cache provenance in custom prediction, and prevents invalid
+resampling intervals from becoming synchronization motion markers. These are
+scientific-integrity improvements, not new performance evidence.
 
 ## 7. Tests and verification
 
@@ -222,12 +262,16 @@ The backup-time snapshot remains recorded in
 `restore/backup_validation_2026-08-30.json`: 688 passed, 4 skipped, and 2
 order/precision-sensitive failures. The current source removes import-time
 Torch thread mutations and uses fixed-order accumulation for the affected SVD
-projection. On 2026-08-31 the current 1,441-test suite passed twice
-consecutively: 1,437 passed and 4 real-bubblewrap tests skipped in the managed
-namespace. The same four bubblewrap tests then passed 4/4 in a capable host
-context. Do not rewrite the historical snapshot; use the 2026-08-31 progress
-report as the evidence for the current source generation. A passing unit suite
-still does not authorize a new scientific run.
+projection. An earlier intermediate 2026-08-31 generation collected 1,545
+tests, passed 1,541 twice, skipped four real-bubblewrap tests in the managed
+namespace, and then passed those four tests in a capable host context. The
+final 2026-08-31 source generation collects 1,766 tests and passed two
+consecutive full-suite runs with 1,762 passed and the same four managed-host
+bubblewrap skips; those four tests then passed 4/4 in a capable host context.
+The active V8R4 fixed collection is exactly 739 node IDs with semantic SHA-256
+`b9b192c084d3f6d69094657bceb9047e368c12cac4e4420c2f75ef3c7fc39df4`.
+Do not rewrite the backup snapshot. A passing unit suite still does not
+authorize a new scientific run.
 
 For changes touching split, target firewall, sealed packs, authorization,
 ledger, or sandbox code, run the corresponding focused tests first and then
@@ -272,11 +316,16 @@ It excludes:
 - the 15 GB derived cache tree
 - redundant development/smoke/failed-model tensor payloads
 
-The backup supports source recovery, result inspection, immediate inference
-with selected checkpoints, full retraining after cache regeneration, and
-forensic recovery of the exact V8R4 continuation state. Existing V8R4 receipts
+The backup supports source recovery, result inspection, immediate historical
+inference with selected checkpoints, legacy-result reproduction after cache
+regeneration, and forensic recovery of the exact V8R4 continuation state.
+That restoration/retraining capability is not current scientific authorization;
+new attempts must use a new versioned root and obey the current acquisition and
+training guards. Existing V8R4 receipts
 bind absolute paths, interpreter hashes, source bytes, and file modes. Restore
 to `/home/hwiseong/Documents/SnnProject` when exact continuation is required;
-at any other path, issue a new context generation through the validators and
-never edit an old receipt. The backup does not make CUDA execution bitwise
-deterministic across different hardware.
+at any other path, retain the old state as historical evidence. The present
+terminal fail-closed validator cannot issue a replacement context; a new
+externally governed trust-root/verifier generation is required. Never edit an
+old receipt. The backup does not make CUDA execution bitwise deterministic
+across different hardware.

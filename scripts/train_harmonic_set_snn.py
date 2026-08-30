@@ -22,6 +22,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import sys
 import tempfile
 from typing import Any, Iterator, Mapping, Sequence
@@ -68,6 +69,28 @@ MARGIN_THRESHOLDS = (0.00, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 1.10)
 ENTROPY_THRESHOLDS = (0.10, 0.25, 0.50, 0.75, 1.00, 1.50, 10.0)
 QUALITY_THRESHOLDS = (0.00, 0.25, 0.50, 0.75)
 CORRECTION_PULLS = (0.25, 0.50, 0.75, 1.00)
+
+_HARMONIC_RATIO_BY_TOKEN: dict[str, float] = {
+    "r1_4": 0.25,
+    "r1_3": 1.0 / 3.0,
+    "r1_2": 0.5,
+    "r1": 1.0,
+    "r2": 2.0,
+    "r3": 3.0,
+    "r4": 4.0,
+}
+_RATIO_TOKEN_PATTERN = "|".join(
+    sorted(_HARMONIC_RATIO_BY_TOKEN, key=len, reverse=True)
+)
+_RF_FEATURE_PATTERN = re.compile(
+    rf"^rf_radar([123])_({_RATIO_TOKEN_PATTERN})_"
+    r"(raw_power|candidate_iq_phase_power)_.+$"
+)
+_SVD_FEATURE_PATTERN = re.compile(
+    rf"^svd_radar([123])_({_RATIO_TOKEN_PATTERN})_.+$"
+)
+_HARMONIC_RR_MIN_BPM = 6.0
+_HARMONIC_RR_MAX_BPM = 45.0
 
 # The confidence dimensions below are deliberately a small set of *joint*
 # profiles rather than another Cartesian product.  This keeps the frozen
@@ -340,17 +363,39 @@ class RobustNodeScaler:
     scale: np.ndarray
     fit_positions_sha256: str
 
-    def transform(self, values: np.ndarray) -> np.ndarray:
-        transformed = (np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0) - self.center) / self.scale
-        return np.clip(transformed, -8.0, 8.0).astype(np.float32, copy=False)
+    def transform(self, values: np.ndarray, availability: np.ndarray) -> np.ndarray:
+        raw = np.asarray(values)
+        mask = np.asarray(availability)
+        if raw.ndim != 3 or raw.shape != mask.shape or mask.dtype != np.bool_:
+            raise ValueError(
+                "node values and boolean structural availability must share [N,K,F]"
+            )
+        if not np.isfinite(raw[mask]).all():
+            raise ValueError("structurally available node features must be finite")
+        transformed = (
+            np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0) - self.center
+        ) / self.scale
+        transformed = np.clip(transformed, -8.0, 8.0).astype(
+            np.float32, copy=False
+        )
+        transformed = np.where(mask, transformed, np.float32(0.0))
+        if np.count_nonzero(transformed[~mask]):
+            raise RuntimeError("scaling resurrected an unavailable structural cell")
+        return transformed
 
     def record(self) -> dict[str, Any]:
         return {
             "center": self.center.reshape(-1).tolist(),
             "scale": self.scale.reshape(-1).tolist(),
             "fit_positions_sha256": self.fit_positions_sha256,
-            "fit_scope": "candidate-masked nodes from outer-training identities only",
-            "method": "median and max(IQR/1.349, 1e-4)",
+            "fit_scope": (
+                "structurally-available feature cells from outer-training "
+                "identities only"
+            ),
+            "method": (
+                "per-feature median and max(IQR/1.349, 1e-4), then exact-zero "
+                "structural remasking"
+            ),
         }
 
 
@@ -366,6 +411,8 @@ class Experiment:
     base_std: np.ndarray
     base_available: np.ndarray
     manifest: dict[str, Any]
+    feature_names: tuple[str, ...]
+    node_availability: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,9 +485,45 @@ def seed_everything(seed: int, deterministic: bool) -> None:
 def _load_manifest(root: Path) -> dict[str, Any]:
     path = root / "manifest.json"
     document = json.loads(path.read_text(encoding="utf-8"))
-    if not document.get("complete") or int(document.get("format_version", -1)) != 1:
+    if (
+        not document.get("complete")
+        or int(document.get("format_version", -1)) != 2
+        or document.get("schema") != "snn_rr.harmonic_candidate_cache.v2"
+    ):
         raise RuntimeError("harmonic cache manifest is incomplete or incompatible")
-    return document
+    recorded_content = document.get("content_sha256")
+    if recorded_content is not None:
+        payload = dict(document)
+        payload.pop("content_sha256", None)
+        if not isinstance(recorded_content, str) or recorded_content != sha256_json(
+            payload
+        ):
+            raise RuntimeError("harmonic cache manifest hash mismatch")
+    if document.get("trainable") is not True:
+        raise RuntimeError(
+            "harmonic cache is inspection-only; verified nested-proposer "
+            "training authority is absent"
+        )
+    acquisition = document.get("acquisition_v2")
+    if acquisition is not None:
+        # This legacy HCES trainer has no versioned verifier for acquisition-v2
+        # nested proposer/scaler authority.  Self-asserted trainable fields must
+        # therefore never promote such a cache; a successor trainer/receipt is
+        # required before scientific training can be enabled.
+        raise RuntimeError(
+            "acquisition-v2 harmonic caches are inspection-only in this trainer; "
+            "versioned nested-proposer training authority is absent"
+        )
+    # Historical HCES manifests predate a verifier that can prove proposer and
+    # fallback predictions are label-free, identity-disjoint nested OOF.  A
+    # self-asserted ``trainable: true`` or classification string cannot create
+    # that authority.  Keep this legacy entry point closed until a separately
+    # versioned verifier validates a governed authority artifact and exact
+    # array inventory; locked historical evidence remains inspectable.
+    raise RuntimeError(
+        "harmonic scientific training is disabled: no versioned nested "
+        "proposer/fallback/scaler authority verifier is implemented"
+    )
 
 
 def _choose_column(frame: pd.DataFrame, names: Sequence[str]) -> str | None:
@@ -460,6 +543,12 @@ def load_experiment(cache_root: Path, fallback_csv: Path) -> Experiment:
         raise RuntimeError("cache_index must be a unique contiguous row binding")
 
     node_features = np.load(root / "node_features.npy", mmap_mode="r", allow_pickle=False)
+    node_availability_path = root / "node_feature_availability.npy"
+    node_availability = (
+        np.load(node_availability_path, mmap_mode="r", allow_pickle=False)
+        if node_availability_path.is_file()
+        else None
+    )
     candidate_rr = np.load(root / "candidate_bpm.npy", mmap_mode="r", allow_pickle=False)
     candidate_mask = np.load(root / "candidate_mask.npy", mmap_mode="r", allow_pickle=False)
     radar_mask = np.load(root / "joint_radar_mask.npy", mmap_mode="r", allow_pickle=False)
@@ -467,6 +556,66 @@ def load_experiment(cache_root: Path, fallback_csv: Path) -> Experiment:
         raise RuntimeError("cache forward-array candidate shapes disagree")
     if node_features.shape[0] != len(metadata) or radar_mask.shape[0] != len(metadata):
         raise RuntimeError("cache forward-array rows disagree with metadata")
+    if (
+        node_features.dtype != np.float32
+        or not np.issubdtype(candidate_rr.dtype, np.floating)
+        or candidate_mask.dtype != np.bool_
+        or radar_mask.dtype != np.bool_
+        or radar_mask.shape != (len(metadata), 3)
+    ):
+        raise RuntimeError("cache forward-array dtype/structural schema drifted")
+    candidate_rr_array = np.asarray(candidate_rr)
+    candidate_mask_array = np.asarray(candidate_mask)
+    if np.any(
+        candidate_mask_array
+        & (
+            ~np.isfinite(candidate_rr_array)
+            | (candidate_rr_array < _HARMONIC_RR_MIN_BPM)
+            | (candidate_rr_array > _HARMONIC_RR_MAX_BPM)
+        )
+    ):
+        raise RuntimeError("available candidate RR is non-finite or out of bounds")
+    if node_availability is not None:
+        if (
+            node_availability.dtype != np.bool_
+            or node_availability.shape != node_features.shape
+        ):
+            raise RuntimeError(
+                "node feature availability must be boolean and match node features"
+            )
+        for start in range(0, len(metadata), 256):
+            stop = min(start + 256, len(metadata))
+            feature_chunk = np.asarray(node_features[start:stop])
+            availability_chunk = np.asarray(node_availability[start:stop])
+            candidate_chunk = candidate_mask_array[start:stop]
+            if np.any(availability_chunk & ~candidate_chunk[..., None]):
+                raise RuntimeError(
+                    "padded candidate has structurally available node features"
+                )
+            if np.count_nonzero(feature_chunk[~availability_chunk]):
+                raise RuntimeError(
+                    "structurally unavailable cached node feature is nonzero"
+                )
+    feature_names_path = root / "feature_names.json"
+    if feature_names_path.is_file():
+        feature_document = json.loads(feature_names_path.read_text(encoding="utf-8"))
+        raw_names = feature_document.get("node_feature_names")
+        if not (
+            isinstance(raw_names, list)
+            and len(raw_names) == node_features.shape[-1]
+            and all(isinstance(name, str) and name for name in raw_names)
+            and len(set(raw_names)) == len(raw_names)
+        ):
+            raise RuntimeError("harmonic cache feature-name schema is invalid")
+        feature_names = tuple(raw_names)
+    else:
+        # Historical synthetic/legacy caches predate the explicit name file.
+        # Their features are candidate-level only; acquisition-v2 always has a
+        # bound schema and has already failed closed above.
+        feature_names = tuple(
+            f"legacy_candidate_feature_{index}"
+            for index in range(node_features.shape[-1])
+        )
 
     fallback = pd.read_csv(fallback_csv)
     if "cache_index" not in fallback or fallback["cache_index"].duplicated().any():
@@ -494,6 +643,7 @@ def load_experiment(cache_root: Path, fallback_csv: Path) -> Experiment:
         candidate_rr=candidate_rr, candidate_mask=candidate_mask,
         radar_mask=radar_mask, base_prediction=base_prediction,
         base_std=base_std, base_available=base_available, manifest=manifest,
+        feature_names=feature_names, node_availability=node_availability,
     )
 
 
@@ -501,17 +651,104 @@ def _positions_sha256(positions: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(positions, dtype=np.int64).view(np.uint8)).hexdigest()
 
 
+def structural_node_availability(
+    experiment: Experiment, positions: np.ndarray
+) -> np.ndarray:
+    """Return explicit per-feature availability without inspecting numeric values."""
+
+    position = np.asarray(positions, dtype=np.int64)
+    if experiment.node_availability is not None:
+        availability = np.asarray(experiment.node_availability[position])
+        if (
+            availability.dtype != np.bool_
+            or availability.shape
+            != np.asarray(experiment.node_features[position]).shape
+        ):
+            raise RuntimeError("persisted node availability schema drifted")
+        return availability.copy()
+    candidate = np.asarray(experiment.candidate_mask[position])
+    radar = np.asarray(experiment.radar_mask[position])
+    if candidate.dtype != np.bool_ or radar.dtype != np.bool_:
+        raise RuntimeError("candidate/radar structural masks must be boolean")
+    if radar.shape != (len(position), 3):
+        raise RuntimeError("radar structural mask must have shape [N,3]")
+    candidate_rr = np.asarray(experiment.candidate_rr[position])
+    if candidate_rr.shape != candidate.shape or not np.issubdtype(
+        candidate_rr.dtype, np.number
+    ):
+        raise RuntimeError("candidate RR must be numeric and match candidate mask")
+    available_rr = (
+        np.isfinite(candidate_rr)
+        & (candidate_rr >= _HARMONIC_RR_MIN_BPM)
+        & (candidate_rr <= _HARMONIC_RR_MAX_BPM)
+    )
+    if np.any(candidate & ~available_rr):
+        raise RuntimeError("available candidates require finite in-band RR")
+    availability = np.broadcast_to(
+        candidate[..., None],
+        (*candidate.shape, len(experiment.feature_names)),
+    ).copy()
+    for feature_index, name in enumerate(experiment.feature_names):
+        if name == "previous_candidate_gap_bpm":
+            cell_available = np.zeros_like(candidate)
+            cell_available[:, 1:] = candidate[:, 1:] & candidate[:, :-1]
+            availability[..., feature_index] = cell_available
+            continue
+        if name == "next_candidate_gap_bpm":
+            cell_available = np.zeros_like(candidate)
+            cell_available[:, :-1] = candidate[:, :-1] & candidate[:, 1:]
+            availability[..., feature_index] = cell_available
+            continue
+        rf_match = _RF_FEATURE_PATTERN.fullmatch(name)
+        svd_match = _SVD_FEATURE_PATTERN.fullmatch(name)
+        if rf_match is None and svd_match is None:
+            if name.startswith(("rf_", "svd_")):
+                raise RuntimeError(
+                    f"unrecognized harmonic structural feature name: {name}"
+                )
+            continue
+        match = rf_match if rf_match is not None else svd_match
+        assert match is not None
+        radar_index = int(match.group(1)) - 1
+        ratio = _HARMONIC_RATIO_BY_TOKEN[match.group(2)]
+        ratio_rr = candidate_rr.astype(np.float64, copy=False) * ratio
+        cell_available = (
+            candidate
+            & radar[:, None, radar_index]
+            & np.isfinite(ratio_rr)
+            & (ratio_rr >= _HARMONIC_RR_MIN_BPM)
+            & (ratio_rr <= _HARMONIC_RR_MAX_BPM)
+        )
+        if rf_match is not None and rf_match.group(3) != "raw_power":
+            # The historical 540-wide cache reserved the IQ branch but never
+            # supplied independently validated IQ evidence.
+            cell_available = np.zeros_like(cell_available)
+        elif rf_match is not None and name.endswith("_cross_radar_consensus"):
+            peer_indices = [index for index in range(3) if index != radar_index]
+            cell_available &= radar[:, None, peer_indices].any(axis=2)
+        availability[..., feature_index] = cell_available
+    return np.asarray(availability, dtype=np.bool_)
+
+
 def fit_robust_scaler(experiment: Experiment, train_positions: np.ndarray) -> RobustNodeScaler:
     position = np.asarray(train_positions, dtype=np.int64)
-    mask = np.asarray(experiment.candidate_mask[position], dtype=bool)
-    values = np.asarray(experiment.node_features[position], dtype=np.float32)[mask]
-    if values.ndim != 2 or len(values) == 0:
+    values = np.asarray(experiment.node_features[position], dtype=np.float32)
+    availability = structural_node_availability(experiment, position)
+    if values.ndim != 3 or not availability.any():
         raise RuntimeError("outer-training identities contain no candidate nodes")
-    center = np.nanmedian(values, axis=0).astype(np.float32)
-    q25, q75 = np.nanpercentile(values, [25.0, 75.0], axis=0)
-    scale = np.maximum((q75 - q25) / 1.349, 1.0e-4).astype(np.float32)
-    center = np.nan_to_num(center, nan=0.0)
-    scale = np.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0)
+    flat_values = values.reshape(-1, values.shape[-1])
+    flat_available = availability.reshape(-1, availability.shape[-1])
+    center = np.zeros(values.shape[-1], dtype=np.float32)
+    scale = np.ones(values.shape[-1], dtype=np.float32)
+    for feature in range(values.shape[-1]):
+        observed = flat_values[flat_available[:, feature], feature]
+        if not len(observed):
+            continue
+        if not np.isfinite(observed).all():
+            raise RuntimeError("available outer-training feature is non-finite")
+        center[feature] = np.float32(np.median(observed))
+        q25, q75 = np.percentile(observed, [25.0, 75.0])
+        scale[feature] = np.float32(max((q75 - q25) / 1.349, 1.0e-4))
     return RobustNodeScaler(center.reshape(1, 1, -1), scale.reshape(1, 1, -1), _positions_sha256(position))
 
 
@@ -612,7 +849,11 @@ def _batch_for_positions(
     warmup_windows: int = WARMUP_WINDOWS,
 ) -> dict[str, Tensor]:
     position = np.asarray(position, dtype=np.int64).copy()
-    node = scaler.transform(np.asarray(experiment.node_features[position], dtype=np.float32))
+    availability = structural_node_availability(experiment, position)
+    node = scaler.transform(
+        np.asarray(experiment.node_features[position], dtype=np.float32),
+        availability,
+    )
     candidate = np.asarray(experiment.candidate_rr[position], dtype=np.float32).copy()
     candidate_mask = np.asarray(experiment.candidate_mask[position], dtype=bool).copy()
     radar = np.asarray(experiment.radar_mask[position], dtype=bool).copy()
@@ -2243,7 +2484,6 @@ def _save_predictions(output_dir: Path, name: str, prediction: Predictions, metr
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
-    seed_everything(int(args.seed), bool(args.deterministic))
     anchor_enabled = str(args.anchor_residual_mode) == "causal_posterior"
     objective = resolve_iteration_objective(
         int(args.adaptive_iteration),
@@ -2257,6 +2497,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         anchor_gate_weight=args.anchor_gate_weight,
     )
     output_dir = args.output_dir.expanduser().resolve()
+    # Cache authority is established before RNG/CUDA/model/scaler/output side
+    # effects.  In particular, acquisition-v2 diagnostic caches cannot create
+    # even an empty run directory.
+    experiment = load_experiment(args.cache, args.fallback_oof)
+    seed_everything(int(args.seed), bool(args.deterministic))
     if (
         output_dir.exists()
         and any(output_dir.iterdir())
@@ -2267,7 +2512,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "output directory is non-empty; use a new directory, --resume, or --recover-prelock"
         )
     output_dir.mkdir(parents=True, exist_ok=True)
-    experiment = load_experiment(args.cache, args.fallback_oof)
     train_positions, validation_positions, validation_fold = split_positions(experiment.metadata, int(args.fold))
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():

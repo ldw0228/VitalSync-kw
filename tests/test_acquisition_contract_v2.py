@@ -13,6 +13,7 @@ import snn_rr.acquisition_contract as acquisition_contract_module
 from snn_rr.acquisition_contract import (
     ACQUISITION_SCHEMA,
     AcquisitionContractError,
+    assign_stage_window,
     load_acquisition_cohort_authority,
     load_acquisition_reconstruction,
 )
@@ -50,6 +51,10 @@ _SPREADSHEET_PATH = _PROJECT_ROOT / "HAI_EXPERIMENT" / "Dataset_issue.xlsx"
 _DATASET_ROOT = _PROJECT_ROOT / "HAI_EXPERIMENT"
 _DISCOVERED_DATASET = build_dataset_manifest(_DATASET_ROOT)
 _REAL_RAW_GRAPH_VALIDATOR = acquisition_contract_module._validate_v2_raw_input_graph
+_REAL_SYNC_AUTHORIZER = acquisition_contract_module.synchronization_is_authorized
+_REAL_PROTOCOL_VERIFIER = (
+    acquisition_contract_module._protocol_decode_has_independent_verification
+)
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +66,19 @@ def _reuse_stable_dataset_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "snn_rr.acquisition_contract._validate_v2_raw_input_graph",
         lambda *_args, **_kwargs: None,
+    )
+    # Most fixtures exercise the successor/strict-cache path and therefore
+    # model independent verifier success explicitly.  Production v1/v2
+    # behavior is covered separately below and remains fail-closed.
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "synchronization_is_authorized",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "_protocol_decode_has_independent_verification",
+        lambda *_args, **_kwargs: True,
     )
 
 
@@ -394,14 +412,23 @@ def _session_document(
             "annotation_inference_feature_allowed": False,
             "stages": [
                 {
-                    "stage_id": "phase1",
-                    "name": "synthetic_stage",
+                    "stage_id": f"phase{index + 1}",
+                    "name": (
+                        "angled_seated_respiration",
+                        "breathing_challenge_and_exercise_recovery",
+                        "pickup_two_courses",
+                        "fall_scenarios_two_courses",
+                        "sixteen_cell_timed_course",
+                        "continuous_round_trip",
+                        "assigned_free_action",
+                    )[index],
                     "status": "auto",
                     "confidence": 0.95,
-                    "start": {"time_s": 0.0},
-                    "end": {"time_s": 120.0},
-                    "duration_s": 120.0,
+                    "start": {"time_s": float(index * 10)},
+                    "end": {"time_s": float((index + 1) * 10)},
+                    "duration_s": 10.0,
                 }
+                for index in range(7)
             ],
         },
         "protocol_contract": {
@@ -594,6 +621,62 @@ def test_v2_content_bound_full_cohort_fixture_is_scientifically_eligible(
     assert loaded.full_cohort_complete
     assert loaded.scientific_eligible
     assert all(contract.strict_cache_eligible for contract in loaded.sessions.values())
+
+
+def test_current_v2_receipts_retain_history_but_grant_no_effective_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, root, _ = _build_reconstruction(tmp_path)
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "synchronization_is_authorized",
+        _REAL_SYNC_AUTHORIZER,
+    )
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "_protocol_decode_has_independent_verification",
+        _REAL_PROTOCOL_VERIFIER,
+    )
+
+    loaded = load_acquisition_reconstruction(path)
+
+    assert root["scientific_eligible"] is True
+    assert loaded.manifest["scientific_eligible"] is True
+    assert not loaded.scientific_eligible
+    assert all(not contract.authorized for contract in loaded.sessions.values())
+    assert all(not contract.alignment_eligible for contract in loaded.sessions.values())
+    assert all(not contract.stage_metric_eligible for contract in loaded.sessions.values())
+    assert all(not contract.strict_cache_eligible for contract in loaded.sessions.values())
+    assert all(not contract.scientific_eligible for contract in loaded.sessions.values())
+    assignment = assign_stage_window(loaded.sessions["S01_CMS"], 3.0, 7.0)
+    assert assignment.stage_status == "auto"
+    assert not assignment.eligible_for_stage_metrics
+    assert assignment.reason == "stage_metrics_not_authorized"
+
+
+def test_unreplayed_shifted_stage_decode_cannot_authorize_stage_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, root, sessions = _build_reconstruction(tmp_path)
+    protocol = sessions["S01_CMS"]["protocol"]
+    for stage in protocol["stages"]:
+        stage["start"]["time_s"] += 1.0
+        stage["end"]["time_s"] += 1.0
+    protocol["duration_s"] += 1.0
+    _reseal_bundle(path, root, sessions)
+    # Isolate the stage boundary: model a successful independent sync replay,
+    # while keeping the current generation's absent protocol replay verifier.
+    monkeypatch.setattr(
+        acquisition_contract_module,
+        "_protocol_decode_has_independent_verification",
+        _REAL_PROTOCOL_VERIFIER,
+    )
+
+    loaded = load_acquisition_reconstruction(path)
+    contract = loaded.sessions["S01_CMS"]
+    assert contract.authorized
+    assert contract.alignment_eligible
+    assert not contract.stage_metric_eligible
 
 
 def test_v2_explicit_all_session_filter_remains_diagnostic(tmp_path: Path) -> None:
@@ -1084,6 +1167,7 @@ def test_v2_retained_plateau_is_accepted_only_as_structurally_masked_diagnostic(
     radar["measured_timing_eligible"] = False
     session["eligibility"]["measured_timing_eligible"] = False
     session["eligibility"]["alignment_eligible"] = False
+    session["eligibility"]["stage_metric_eligible"] = False
     session["eligibility"]["strict_cache_eligible"] = False
     session["scientific_eligible"] = False
     root["sessions"][0]["scientific_eligible"] = False
@@ -1095,3 +1179,55 @@ def test_v2_retained_plateau_is_accepted_only_as_structurally_masked_diagnostic(
 
     assert not loaded.scientific_eligible
     assert not loaded.sessions["S01_CMS"].measured_timing_eligible
+
+
+@pytest.mark.parametrize(
+    "mutation", ["delete", "zero", "eight", "reorder", "rename", "overall"]
+)
+def test_v2_protocol_must_match_exact_ordered_seven_stage_contract(
+    tmp_path: Path, mutation: str
+) -> None:
+    path, root, sessions = _build_reconstruction(tmp_path)
+    protocol = sessions["S01_CMS"]["protocol"]
+    if mutation == "delete":
+        protocol["stages"].pop()
+    elif mutation == "zero":
+        protocol["stages"].clear()
+    elif mutation == "eight":
+        protocol["stages"].append(dict(protocol["stages"][-1]))
+    elif mutation == "reorder":
+        protocol["stages"][0], protocol["stages"][1] = (
+            protocol["stages"][1],
+            protocol["stages"][0],
+        )
+    elif mutation == "rename":
+        protocol["stages"][0]["name"] = "forged_stage_name"
+    else:
+        protocol["status"] = "review"
+    _reseal_bundle(path, root, sessions)
+    with pytest.raises(AcquisitionContractError):
+        load_acquisition_reconstruction(path)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value"),
+    [
+        (("duration_s",), "1265.0"),
+        (("confidence",), True),
+        (("stages", 0, "confidence"), "0.95"),
+        (("stages", 0, "start", "time_s"), True),
+        (("stages", 0, "duration_s"), "180.0"),
+    ],
+)
+def test_v2_protocol_rejects_bool_and_string_numeric_coercion(
+    tmp_path: Path, field_path: tuple[object, ...], value: object
+) -> None:
+    path, root, sessions = _build_reconstruction(tmp_path)
+    target = sessions["S01_CMS"]["protocol"]
+    for key in field_path[:-1]:
+        target = target[key]
+    target[field_path[-1]] = value
+    _reseal_bundle(path, root, sessions)
+
+    with pytest.raises(AcquisitionContractError, match="must be a finite number"):
+        load_acquisition_reconstruction(path)

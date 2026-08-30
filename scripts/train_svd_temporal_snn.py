@@ -31,6 +31,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -74,6 +75,42 @@ class TemporalSessionArrays:
     radar_timing_valid_mask: np.ndarray | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _TemporalTrainingViewReceipt:
+    schema_version: int
+    base_receipt_id: int
+    experiment_object_id: int
+    base_experiment_object_id: int
+    sessions_list_object_id: int
+    provenance_object_id: int
+    provenance_sha256: str
+    session_object_ids: tuple[int, ...]
+    source_pipeline_sha256: str
+    arrays_for_position_function_id: int
+    structural_mask_function_id: int
+
+
+_ISSUED_TEMPORAL_TRAINING_VIEW_RECEIPTS: dict[
+    int,
+    tuple[
+        _TemporalTrainingViewReceipt,
+        "TemporalAlignedExperiment",
+        shared.AlignedSVDExperiment,
+    ],
+] = {}
+
+
+def _current_temporal_training_source_sha256() -> str:
+    paths = (
+        *shared._training_source_paths(),
+        Path(__file__).resolve(),
+        SOURCE_ROOT / "snn_rr" / "svd_temporal_models.py",
+    )
+    return hashlib.sha256(
+        "".join(shared.sha256_file(path) for path in paths).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass(slots=True)
 class TemporalAlignedExperiment:
     cache_root: Path
@@ -83,6 +120,9 @@ class TemporalAlignedExperiment:
     sessions: list[TemporalSessionArrays]
     root_manifest: dict[str, Any]
     provenance: dict[str, Any]
+    training_authority_receipt: shared._SVDTrainingAuthorityReceipt | None = None
+    _base_authority_experiment: shared.AlignedSVDExperiment | None = None
+    _temporal_view_receipt: _TemporalTrainingViewReceipt | None = None
 
     def arrays_for_position(self, position: int) -> tuple[np.ndarray, np.ndarray]:
         row = self.metadata.iloc[int(position)]
@@ -421,6 +461,7 @@ def load_temporal_aligned_experiment(
     *,
     base_oof_provenance: Path | None = None,
     verify_file_hashes: bool = True,
+    historical_legacy_reproduction: bool = False,
 ) -> TemporalAlignedExperiment:
     """Bind valid-only component signals to the already frozen base OOF."""
 
@@ -430,6 +471,8 @@ def load_temporal_aligned_experiment(
         oof_npz,
         base_oof_provenance=base_oof_provenance,
         verify_file_hashes=verify_file_hashes,
+        load_legacy_component_signals=True,
+        historical_legacy_reproduction=historical_legacy_reproduction,
     )
     _validate_acquisition_v2_training_scope(
         base.root_manifest,
@@ -447,8 +490,9 @@ def load_temporal_aligned_experiment(
             )
         component_signals = source_session.component_signals
         if component_signals is None:
-            component_signals = np.load(
-                signal_path, mmap_mode="r", allow_pickle=False
+            raise RuntimeError(
+                "shared SVD loader did not bind component signals for "
+                f"{source_session.session_id}"
             )
         expected_shape = (
             len(source_session.metadata),
@@ -531,7 +575,7 @@ def load_temporal_aligned_experiment(
             ),
         }
     )
-    return TemporalAlignedExperiment(
+    experiment = TemporalAlignedExperiment(
         cache_root=base.cache_root,
         oof_csv=base.oof_csv,
         oof_npz=base.oof_npz,
@@ -539,13 +583,117 @@ def load_temporal_aligned_experiment(
         sessions=sessions,
         root_manifest=base.root_manifest,
         provenance=provenance,
+        training_authority_receipt=base.training_authority_receipt,
+        _base_authority_experiment=base,
     )
+    view_receipt = _TemporalTrainingViewReceipt(
+        schema_version=1,
+        base_receipt_id=id(base.training_authority_receipt),
+        experiment_object_id=id(experiment),
+        base_experiment_object_id=id(base),
+        sessions_list_object_id=id(experiment.sessions),
+        provenance_object_id=id(experiment.provenance),
+        provenance_sha256=shared._canonical_sha256(experiment.provenance),
+        session_object_ids=tuple(id(session) for session in experiment.sessions),
+        source_pipeline_sha256=_current_temporal_training_source_sha256(),
+        arrays_for_position_function_id=id(
+            TemporalAlignedExperiment.arrays_for_position
+        ),
+        structural_mask_function_id=id(
+            TemporalAlignedExperiment.structural_radar_mask_for_position
+        ),
+    )
+    _ISSUED_TEMPORAL_TRAINING_VIEW_RECEIPTS[id(view_receipt)] = (
+        view_receipt,
+        experiment,
+        base,
+    )
+    experiment._temporal_view_receipt = view_receipt
+    return experiment
 
 
 # Audit-friendly aliases.
 load_aligned_experiment = load_temporal_aligned_experiment
 make_outer_split = shared.make_outer_split
 promotion_decision = shared.promotion_decision
+
+
+def _assert_temporal_training_authority(
+    experiment: TemporalAlignedExperiment,
+    *,
+    historical_legacy_reproduction: bool = False,
+) -> None:
+    """Replay shared authority and bind the temporal view to that exact load."""
+
+    base = experiment._base_authority_experiment
+    receipt = experiment.training_authority_receipt
+    view_receipt = experiment._temporal_view_receipt
+    issued_view = (
+        _ISSUED_TEMPORAL_TRAINING_VIEW_RECEIPTS.get(id(view_receipt))
+        if type(view_receipt) is _TemporalTrainingViewReceipt
+        else None
+    )
+    if (
+        type(experiment) is not TemporalAlignedExperiment
+        or type(base) is not shared.AlignedSVDExperiment
+        or receipt is None
+        or receipt is not base.training_authority_receipt
+        or type(view_receipt) is not _TemporalTrainingViewReceipt
+        or view_receipt.schema_version != 1
+        or issued_view is None
+        or issued_view[0] is not view_receipt
+        or issued_view[1] is not experiment
+        or issued_view[2] is not base
+        or view_receipt.base_receipt_id != id(receipt)
+        or view_receipt.experiment_object_id != id(experiment)
+        or view_receipt.base_experiment_object_id != id(base)
+        or view_receipt.source_pipeline_sha256
+        != _current_temporal_training_source_sha256()
+        or view_receipt.arrays_for_position_function_id
+        != id(TemporalAlignedExperiment.arrays_for_position)
+        or view_receipt.structural_mask_function_id
+        != id(TemporalAlignedExperiment.structural_radar_mask_for_position)
+    ):
+        raise RuntimeError(
+            "temporal SVD training requires the loader-issued shared authority receipt"
+        )
+    shared._assert_training_cache_authority(
+        base,
+        historical_legacy_reproduction=historical_legacy_reproduction,
+    )
+    if not (
+        experiment.cache_root.resolve() == base.cache_root.resolve()
+        and experiment.oof_csv.resolve() == base.oof_csv.resolve()
+        and experiment.oof_npz.resolve() == base.oof_npz.resolve()
+        and experiment.metadata is base.metadata
+        and experiment.root_manifest is base.root_manifest
+        and experiment.provenance.get("row_binding_sha256")
+        == base.provenance.get("row_binding_sha256")
+        and type(experiment.sessions) is list
+        and all(type(session) is TemporalSessionArrays for session in experiment.sessions)
+        and id(experiment.sessions) == view_receipt.sessions_list_object_id
+        and id(experiment.provenance) == view_receipt.provenance_object_id
+        and shared._canonical_sha256(experiment.provenance)
+        == view_receipt.provenance_sha256
+        and tuple(id(session) for session in experiment.sessions)
+        == view_receipt.session_object_ids
+        and len(experiment.sessions) == len(base.sessions)
+    ):
+        raise RuntimeError("temporal SVD view differs from its authorized base load")
+    for temporal, source in zip(experiment.sessions, base.sessions, strict=True):
+        if not (
+            temporal.session_id == source.session_id
+            and temporal.component_signals is source.component_signals
+            and temporal.attributes is source.attributes
+            and temporal.metadata is source.metadata
+            and temporal.manifest is source.manifest
+            and temporal.radar_timing_valid_mask is source.radar_timing_valid_mask
+            and temporal.component_signals_sha256
+            == source.files_sha256.get("component_signals")
+        ):
+            raise RuntimeError(
+                f"temporal SVD session view is not source-bound: {temporal.session_id}"
+            )
 
 
 def fit_temporal_signal_normalizer(
@@ -1196,7 +1344,19 @@ def _prediction_arrays(
 
 
 def _load_prediction(path: Path) -> TemporalPredictionResult:
-    with np.load(path, allow_pickle=False) as archive:
+    _binding, payload = shared._snapshot_training_file_payload(path)
+    return _load_prediction_payload(payload)
+
+
+def _load_prediction_payload(payload: bytes) -> TemporalPredictionResult:
+    with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+        missing = sorted(
+            set(TemporalPredictionResult.__dataclass_fields__) - set(archive.files)
+        )
+        if missing:
+            raise RuntimeError(
+                f"temporal prediction archive is missing fields: {missing}"
+            )
         return TemporalPredictionResult(
             **{
                 name: np.asarray(archive[name])
@@ -1371,6 +1531,98 @@ def _model_kwargs(
     return kwargs
 
 
+def _fold_split_record(
+    experiment: TemporalAlignedExperiment,
+    fold: int,
+    split: FoldSplit,
+) -> dict[str, Any]:
+    return {
+        "outer_test_fold": int(fold),
+        "validation_fold": int(split.validation_fold),
+        "weight_fit_folds": sorted(
+            set(range(N_FOLDS)) - {fold, split.validation_fold}
+        ),
+        "train_rows": int(len(split.train)),
+        "validation_rows": int(len(split.validation)),
+        "test_rows": int(len(split.test)),
+        "train_identities": list(split.train_identities),
+        "validation_identities": list(split.validation_identities),
+        "test_identities": list(split.test_identities),
+        "identity_overlap_asserted_empty": True,
+        "test_policy": (
+            "outer-test rows define the partition only; no test label, metric, "
+            "protocol, normalizer statistic, threshold, or prediction is accessed "
+            "before selection lock"
+        ),
+    }
+
+
+def _fold_row_authority_sha256(
+    experiment: TemporalAlignedExperiment, split: FoldSplit
+) -> str:
+    columns = ["cache_index", "identity", "fold", "rr_bpm", "prediction_bpm"]
+    return shared._dataframe_training_sha256(
+        experiment.metadata.iloc[np.asarray(split.test, dtype=np.int64)]
+        .loc[:, columns]
+        .copy()
+    )
+
+
+def _validate_temporal_prediction_binding(
+    result: TemporalPredictionResult,
+    *,
+    experiment: TemporalAlignedExperiment,
+    fold: int,
+    split: FoldSplit,
+) -> None:
+    if type(result) is not TemporalPredictionResult:
+        raise RuntimeError("temporal fold result has an invalid exact type")
+    position = np.asarray(result.position)
+    if (
+        position.ndim != 1
+        or position.dtype.kind not in "iu"
+        or not len(position)
+        or len(np.unique(position)) != len(position)
+        or np.any(position < 0)
+        or np.any(position >= len(experiment.metadata))
+    ):
+        raise RuntimeError("temporal fold result positions are invalid")
+    position = position.astype(np.int64, copy=False)
+    permitted = set(map(int, np.asarray(split.test, dtype=np.int64)))
+    if not set(map(int, position)) <= permitted:
+        raise RuntimeError("temporal fold result contains rows outside its outer fold")
+    metadata = experiment.metadata.iloc[position]
+    if not np.all(metadata["fold"].to_numpy(dtype=np.int64) == int(fold)):
+        raise RuntimeError("temporal fold result row/fold binding mismatch")
+    result_cache_index = np.asarray(result.cache_index)
+    if result_cache_index.dtype.kind not in "iu" or not np.array_equal(
+        result_cache_index.astype(np.int64, copy=False),
+        metadata["cache_index"].to_numpy(dtype=np.int64),
+    ):
+        raise RuntimeError("temporal fold result cache_index binding mismatch")
+    shared._assert_close_numbers(
+        result.target,
+        metadata["rr_bpm"],
+        "temporal fold result target",
+        atol=5e-5,
+    )
+    shared._assert_close_numbers(
+        result.base_prediction,
+        metadata["prediction_bpm"],
+        "temporal fold result base prediction",
+        atol=5e-5,
+    )
+    count = len(position)
+    for name in TemporalPredictionResult.__dataclass_fields__:
+        value = np.asarray(getattr(result, name))
+        if value.ndim < 1 or len(value) != count:
+            raise RuntimeError(f"temporal fold result {name} row count mismatch")
+        if value.dtype.hasobject or (
+            value.dtype.kind in "fc" and not np.isfinite(value).all()
+        ):
+            raise RuntimeError(f"temporal fold result {name} is non-finite")
+
+
 def _loss_kwargs(args: argparse.Namespace) -> dict[str, float]:
     names = (
         "posterior_nll_weight",
@@ -1392,6 +1644,13 @@ def _loss_kwargs(args: argparse.Namespace) -> dict[str, float]:
 
 def _completed_fold_result(
     fold_dir: Path,
+    *,
+    experiment: TemporalAlignedExperiment,
+    fold: int,
+    split: FoldSplit,
+    split_record: Mapping[str, Any],
+    run_signature: str,
+    source_binding_sha256: str,
 ) -> tuple[TemporalPredictionResult, bool, dict[str, Any]] | None:
     completion_path = fold_dir / "test_evaluation_manifest.json"
     prediction_path = fold_dir / "test_predictions.npz"
@@ -1400,23 +1659,121 @@ def _completed_fold_result(
         return None
     if not (prediction_path.is_file() and report_path.is_file()):
         raise RuntimeError("test completion marker exists without complete test artifacts")
-    completion = json.loads(completion_path.read_text(encoding="utf-8"))
-    if int(completion.get("test_fold_evaluation_invocations", -1)) != 1:
+    completion = shared._read_strict_json(
+        completion_path, label="temporal completed-fold manifest"
+    )
+    expected_context = {
+        "outer_fold": int(fold),
+        "run_signature": run_signature,
+        "source_binding_sha256": source_binding_sha256,
+        "split_sha256": _canonical_sha256(dict(split_record)),
+        "test_row_authority_sha256": _fold_row_authority_sha256(
+            experiment, split
+        ),
+    }
+    for name, value in expected_context.items():
+        if completion.get(name) != value:
+            raise RuntimeError(f"completed outer-test artifact failed {name} binding")
+    if type(completion.get("test_fold_evaluation_invocations")) is not int or (
+        completion.get("test_fold_evaluation_invocations") != 1
+    ):
         raise RuntimeError("outer test evaluation count is not exactly one")
     selection_lock_path = fold_dir / "selection_lock.json"
     if not selection_lock_path.is_file():
         raise RuntimeError("test completion marker lacks its validation selection lock")
+    selection_binding, selection_payload = shared._snapshot_training_file_payload(
+        selection_lock_path
+    )
+    prediction_binding, prediction_payload = shared._snapshot_training_file_payload(
+        prediction_path
+    )
+    report_binding, report_payload = shared._snapshot_training_file_payload(
+        report_path
+    )
     expected_hashes = {
-        "selection_lock_sha256": shared.sha256_file(selection_lock_path),
-        "test_predictions_npz_sha256": shared.sha256_file(prediction_path),
-        "test_predictions_json_sha256": shared.sha256_file(report_path),
+        "selection_lock_sha256": selection_binding.sha256,
+        "test_predictions_npz_sha256": prediction_binding.sha256,
+        "test_predictions_json_sha256": report_binding.sha256,
     }
     for name, value in expected_hashes.items():
         if completion.get(name) != value:
             raise RuntimeError(f"completed outer-test artifact failed {name} binding")
-    test = _load_prediction(prediction_path)
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    selection_lock = shared._decode_strict_json_payload(
+        selection_payload, label="temporal completed-fold selection lock"
+    )
+    checkpoint_path = fold_dir / "temporal_best.pt"
+    if not checkpoint_path.is_file():
+        raise RuntimeError("completed outer-test artifact lacks its best checkpoint")
+    checkpoint_binding, checkpoint_payload = shared._snapshot_training_file_payload(
+        checkpoint_path
+    )
+    checkpoint_sha256 = checkpoint_binding.sha256
+    for name, value in {
+        "outer_fold": int(fold),
+        "run_signature": run_signature,
+        "source_binding_sha256": source_binding_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+    }.items():
+        if selection_lock.get(name) != value or completion.get(name) != value:
+            raise RuntimeError(
+                f"completed outer-test selection failed {name} binding"
+            )
+    checkpoint = torch.load(
+        io.BytesIO(checkpoint_payload), map_location="cpu", weights_only=True
+    )
+    checkpoint_split = (
+        checkpoint.get("split") if isinstance(checkpoint, Mapping) else None
+    )
+    if (
+        not isinstance(checkpoint, Mapping)
+        or checkpoint.get("fold") != int(fold)
+        or checkpoint.get("run_signature") != run_signature
+        or checkpoint.get("source_binding_sha256") != source_binding_sha256
+        or not isinstance(checkpoint_split, Mapping)
+        or tuple(checkpoint_split.get("train_identities", ()))
+        != tuple(split.train_identities)
+        or tuple(checkpoint_split.get("validation_identities", ()))
+        != tuple(split.validation_identities)
+        or tuple(checkpoint_split.get("test_identities", ()))
+        != tuple(split.test_identities)
+    ):
+        raise RuntimeError("completed outer-test checkpoint context mismatch")
+
+    if prediction_binding.sha256 != completion.get("test_predictions_npz_sha256"):
+        raise RuntimeError("completed outer-test prediction snapshot mismatch")
+    test = _load_prediction_payload(prediction_payload)
+    _validate_temporal_prediction_binding(
+        test, experiment=experiment, fold=fold, split=split
+    )
+    report = shared._decode_strict_json_payload(
+        report_payload, label="temporal completed-fold prediction report"
+    )
+    if (
+        report.get("outer_fold") != int(fold)
+        or report.get("run_signature") != run_signature
+        or report.get("source_binding_sha256") != source_binding_sha256
+        or report.get("checkpoint_sha256") != checkpoint_sha256
+        or report.get("selection_lock_sha256")
+        != completion.get("selection_lock_sha256")
+        or report.get("split") != dict(split_record)
+        or report.get("selection") != selection_lock.get("decision")
+    ):
+        raise RuntimeError("completed outer-test report context mismatch")
     promoted = bool(report["promoted"])
+    selection_decision = selection_lock.get("decision")
+    if (
+        type(report.get("promoted")) is not bool
+        or not isinstance(selection_decision, Mapping)
+        or type(selection_decision.get("promoted")) is not bool
+        or promoted != selection_decision.get("promoted")
+        or selection_lock.get("locked_final_action")
+        != ("candidate" if promoted else "base_only_fallback")
+        or type(completion.get("test_rows_expected")) is not int
+        or completion.get("test_rows_expected") != len(split.test)
+        or type(completion.get("test_rows_evaluated")) is not int
+        or completion.get("test_rows_evaluated") != len(test.position)
+    ):
+        raise RuntimeError("completed outer-test decision/row binding mismatch")
     return test, promoted, {
         "split": report.get("split"),
         "selection": report.get("selection"),
@@ -1433,15 +1790,32 @@ def train_fold(
     device: torch.device,
     run_signature: str,
 ) -> tuple[TemporalPredictionResult, bool, dict[str, Any]]:
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     fold_dir = Path(args.output_dir) / f"fold_{fold}"
-    fold_dir.mkdir(parents=True, exist_ok=True)
-    completed = _completed_fold_result(fold_dir)
+    split = shared.make_outer_split(experiment.metadata, fold)
+    split_record = _fold_split_record(experiment, fold, split)
+    source_binding_sha256 = _source_binding(experiment)
+    completed = _completed_fold_result(
+        fold_dir,
+        experiment=experiment,
+        fold=fold,
+        split=split,
+        split_record=split_record,
+        run_signature=run_signature,
+        source_binding_sha256=source_binding_sha256,
+    )
     if completed is not None:
         if not args.resume:
             raise RuntimeError(
                 f"fold {fold} outer test was already evaluated; pass --resume to reuse it"
             )
         return completed
+    fold_dir.mkdir(parents=True, exist_ok=True)
     test_started_path = fold_dir / "test_evaluation_started.json"
     if test_started_path.exists():
         raise RuntimeError(
@@ -1449,25 +1823,6 @@ def train_fold(
             "use a new output directory rather than evaluating the test fold twice"
         )
 
-    split = shared.make_outer_split(experiment.metadata, fold)
-    split_record = {
-        "outer_test_fold": int(fold),
-        "validation_fold": int(split.validation_fold),
-        "weight_fit_folds": sorted(
-            set(range(N_FOLDS)) - {fold, split.validation_fold}
-        ),
-        "train_rows": int(len(split.train)),
-        "validation_rows": int(len(split.validation)),
-        "test_rows": int(len(split.test)),
-        "train_identities": list(split.train_identities),
-        "validation_identities": list(split.validation_identities),
-        "test_identities": list(split.test_identities),
-        "identity_overlap_asserted_empty": True,
-        "test_policy": (
-            "outer-test rows define the partition only; no test label, metric, protocol, "
-            "normalizer statistic, threshold, or prediction is accessed before selection lock"
-        ),
-    }
     atomic_write_json(fold_dir / "split.json", split_record)
 
     normalizer = fit_temporal_signal_normalizer(
@@ -1531,7 +1886,6 @@ def train_fold(
     amp_scaler = torch.amp.GradScaler(
         device.type, enabled=args.amp and device.type == "cuda"
     )
-    source_binding_sha256 = _source_binding(experiment)
     best_score = math.inf
     best_epoch = -1
     stale_epochs = 0
@@ -1540,7 +1894,12 @@ def train_fold(
     best_path = fold_dir / "temporal_best.pt"
     resume_path = Path(args.resume_from) if args.resume_from else last_path
     if args.resume and resume_path.is_file():
-        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        _resume_binding, resume_payload = shared._snapshot_training_file_payload(
+            resume_path
+        )
+        checkpoint = torch.load(
+            io.BytesIO(resume_payload), map_location=device, weights_only=True
+        )
         _validate_checkpoint(
             checkpoint,
             fold=fold,
@@ -1647,7 +2006,10 @@ def train_fold(
             break
     if not best_path.is_file():
         raise RuntimeError("no temporal best checkpoint was produced")
-    best = torch.load(best_path, map_location=device, weights_only=False)
+    best_binding, best_payload = shared._snapshot_training_file_payload(best_path)
+    best = torch.load(
+        io.BytesIO(best_payload), map_location=device, weights_only=True
+    )
     _validate_checkpoint(
         best,
         fold=fold,
@@ -1656,6 +2018,12 @@ def train_fold(
         source_binding_sha256=source_binding_sha256,
         normalizer=normalizer,
         action_calibration=action_calibration,
+    )
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
     )
     model.load_state_dict(best["model_state"])
 
@@ -1701,7 +2069,7 @@ def train_fold(
         "best_epoch": int(best["best_epoch"]),
         "best_validation_macro_mae": float(best["best_score"]),
         "run_signature": run_signature,
-        "checkpoint_sha256": shared.sha256_file(best_path),
+        "checkpoint_sha256": best_binding.sha256,
         "source_binding_sha256": source_binding_sha256,
         "signal_normalizer_signature": _normalizer_signature(normalizer),
         "action_calibration_signature": _action_signature(action_calibration),
@@ -1745,6 +2113,12 @@ def train_fold(
         amp=args.amp,
         max_batches=args.smoke_max_batches,
     )
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     shared.atomic_save_npz(
         fold_dir / "test_predictions.npz",
         **_prediction_arrays(test, promoted=promoted),
@@ -1759,10 +2133,12 @@ def train_fold(
     test_report.update(
         {
             "outer_fold": int(fold),
+            "run_signature": run_signature,
+            "source_binding_sha256": source_binding_sha256,
             "selection_lock_sha256": selection_lock_sha256,
             "selection": selection,
             "split": split_record,
-            "checkpoint_sha256": shared.sha256_file(best_path),
+            "checkpoint_sha256": best_binding.sha256,
             "candidate_saved_even_when_rejected": True,
             "test_evaluated_once_after_validation_lock": True,
         }
@@ -1773,6 +2149,13 @@ def train_fold(
         {
             "completed_utc": datetime.now(timezone.utc).isoformat(),
             "outer_fold": int(fold),
+            "run_signature": run_signature,
+            "source_binding_sha256": source_binding_sha256,
+            "split_sha256": _canonical_sha256(split_record),
+            "test_row_authority_sha256": _fold_row_authority_sha256(
+                experiment, split
+            ),
+            "checkpoint_sha256": best_binding.sha256,
             "test_fold_evaluation_invocations": 1,
             "test_rows_expected": int(len(split.test)),
             "test_rows_evaluated": int(len(test.position)),
@@ -1794,7 +2177,7 @@ def train_fold(
         "split": split_record,
         "selection": selection,
         "test": test_report,
-        "checkpoint_sha256": shared.sha256_file(best_path),
+        "checkpoint_sha256": best_binding.sha256,
         "test_reused_without_evaluation": False,
     }
 
@@ -1808,13 +2191,20 @@ def _build_run_config(
         if key not in {"resume", "resume_from"}
     }
     sources = (
-        Path(__file__),
-        PROJECT_ROOT / "scripts" / "train_svd_snn.py",
+        *shared._training_source_paths(),
+        Path(__file__).resolve(),
         SOURCE_ROOT / "snn_rr" / "svd_temporal_models.py",
     )
     config = {
         "schema_version": SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "claim_classification": (
+            "retrospective_scientific_noncommercial"
+            if experiment.training_authority_receipt is not None
+            and experiment.training_authority_receipt.acquisition_v2
+            else "historical_noncommercial_reproduction"
+        ),
+        "commercial_claim_allowed": False,
         "arguments": arguments,
         "source_sha256": {
             str(path.relative_to(PROJECT_ROOT)): shared.sha256_file(path)
@@ -1887,6 +2277,14 @@ def write_oof(
     ],
     run_signature: str,
 ) -> dict[str, Any]:
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
+    if not isinstance(run_signature, str) or not run_signature:
+        raise RuntimeError("temporal OOF publication requires a run signature")
     count = len(experiment.metadata)
     base = pd.to_numeric(
         experiment.metadata["prediction_bpm"], errors="raise"
@@ -1906,8 +2304,30 @@ def write_oof(
     posterior = np.full((count, 157), np.nan, dtype=np.float16)
     promoted = np.zeros(count, dtype=bool)
     evaluated = np.zeros(count, dtype=bool)
-    for _, (result, did_promote, _) in fold_results.items():
-        position = result.position
+    for fold, value in fold_results.items():
+        if (
+            type(fold) is not int
+            or not 0 <= fold < N_FOLDS
+            or not isinstance(value, tuple)
+            or len(value) != 3
+        ):
+            raise RuntimeError("temporal OOF fold result catalogue is invalid")
+        result, did_promote, report = value
+        if type(did_promote) is not bool or not isinstance(report, Mapping):
+            raise RuntimeError("temporal OOF fold decision/report is invalid")
+        split = shared.make_outer_split(experiment.metadata, fold)
+        _validate_temporal_prediction_binding(
+            result, experiment=experiment, fold=fold, split=split
+        )
+        test_report = report.get("test")
+        if (
+            not isinstance(test_report, Mapping)
+            or report.get("split") != _fold_split_record(experiment, fold, split)
+            or test_report.get("run_signature") != run_signature
+            or test_report.get("outer_fold") != fold
+        ):
+            raise RuntimeError("temporal OOF fold report context mismatch")
+        position = np.asarray(result.position, dtype=np.int64)
         if evaluated[position].any():
             raise RuntimeError("OOF row was predicted by more than one outer model")
         candidate[position] = result.candidate_prediction
@@ -1977,6 +2397,12 @@ def write_oof(
         "commercial_safety_policy": "validation-rejected folds are exact base fallback",
         "test_evaluation_policy": "exactly one inference pass per evaluated outer fold",
     }
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=bool(
+            getattr(args, "historical_legacy_reproduction", False)
+        ),
+    )
     output_dir = Path(args.output_dir)
     shared.atomic_save_npz(
         output_dir / "temporal_oof.npz",
@@ -2070,6 +2496,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "authority hashes are always mandatory"
         ),
     )
+    parser.add_argument(
+        "--historical-legacy-reproduction",
+        action="store_true",
+        help=(
+            "explicitly authorize noncommercial reproduction from a non-v2 "
+            "historical cache; never grants acquisition-v2 authority"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--preset", choices=("tiny", "compact", "full"), default="compact")
@@ -2138,6 +2572,51 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    experiment = load_temporal_aligned_experiment(
+        args.svd_cache,
+        args.base_oof_csv,
+        args.base_oof_npz,
+        base_oof_provenance=args.base_oof_provenance,
+        verify_file_hashes=args.verify_file_hashes,
+        historical_legacy_reproduction=args.historical_legacy_reproduction,
+    )
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=args.historical_legacy_reproduction,
+    )
+    if (
+        experiment.training_authority_receipt is not None
+        and not experiment.training_authority_receipt.acquisition_v2
+    ):
+        output_dir = Path(args.output_dir)
+        if output_dir.exists() and not args.resume:
+            raise RuntimeError(
+                "historical legacy reproduction requires a new, non-existing "
+                "versioned output directory"
+            )
+        if args.resume and not (output_dir / "run_config.json").is_file():
+            raise RuntimeError(
+                "historical legacy resume requires its existing run_config.json"
+            )
+    run_config = _build_run_config(args, experiment)
+    existing_run_config_path = Path(args.output_dir) / "run_config.json"
+    if args.resume and existing_run_config_path.is_file():
+        existing_run_config = shared._read_strict_json(
+            existing_run_config_path, label="temporal SVD resume run config"
+        )
+        if existing_run_config.get("run_signature") != run_config.get(
+            "run_signature"
+        ):
+            raise RuntimeError(
+                "temporal SVD resume run signature differs from output root"
+            )
+    _assert_temporal_training_authority(
+        experiment,
+        historical_legacy_reproduction=args.historical_legacy_reproduction,
+    )
+
+    # The complete shared/temporal authority replay precedes RNG, device
+    # discovery, output creation, normalization, and model construction.
     shared.seed_everything(args.seed, deterministic=args.deterministic)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2145,16 +2624,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    experiment = load_temporal_aligned_experiment(
-        args.svd_cache,
-        args.base_oof_csv,
-        args.base_oof_npz,
-        base_oof_provenance=args.base_oof_provenance,
-        verify_file_hashes=args.verify_file_hashes,
-    )
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    run_config = _build_run_config(args, experiment)
-    atomic_write_json(Path(args.output_dir) / "run_config.json", run_config)
+    if not existing_run_config_path.is_file():
+        atomic_write_json(existing_run_config_path, run_config)
     folds = shared.parse_fold_selection(args.fold)
     results: dict[
         int, tuple[TemporalPredictionResult, bool, dict[str, Any]]

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, Mapping
 
@@ -37,12 +38,67 @@ def test_active_test_runner_uses_lexical_virtualenv_entry() -> None:
     assert interpreter != interpreter.resolve()
 
 
+_ACTIVE_COLLECTION_CACHE: tuple[str, ...] | None = None
+
+
+def _exact_active_test_collection() -> tuple[str, ...]:
+    """Collect the covered suite exactly once for receipt-inventory fixtures."""
+
+    global _ACTIVE_COLLECTION_CACHE
+    if _ACTIVE_COLLECTION_CACHE is None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--collect-only",
+                "-q",
+                "-o",
+                "addopts=",
+                *authorization.ACTIVE_FIXED_TEST_PATHS,
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout
+        nodeids = sorted(
+            line
+            for line in completed.stdout.splitlines()
+            if any(
+                line == path or line.startswith(path + "::")
+                for path in authorization.ACTIVE_FIXED_TEST_PATHS
+            )
+        )
+        assert len(nodeids) == authorization._ACTIVE_FIXED_TEST_COLLECTION_COUNT
+        assert (
+            authorization._active_test_collection_sha256(nodeids)
+            == authorization._ACTIVE_FIXED_TEST_COLLECTION_SHA256
+        )
+        _ACTIVE_COLLECTION_CACHE = tuple(nodeids)
+    return _ACTIVE_COLLECTION_CACHE
+
+
 def _valid_active_test_evidence(
     root: Path, implementation: list[Mapping[str, Any]]
 ) -> dict[str, Any]:
+    collection = list(_exact_active_test_collection())
+    outcomes = [{"nodeid": nodeid, "outcome": "passed"} for nodeid in collection]
+    counts = {
+        "collected": len(collection),
+        "passed": len(collection),
+        "skipped": 0,
+        "failed": 0,
+        "errors": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "deselected": 0,
+    }
     stdout = (
         "................................................................ [100%]\n"
-        "514 passed, 3 skipped in 5.86s\n"
+        f"{len(collection)} passed in 5.86s\n"
     )
     encoded = stdout.encode("utf-8")
     runtime_state = {
@@ -56,6 +112,21 @@ def _valid_active_test_evidence(
         "stdout_bytes": len(encoded),
         "stdout_tail": stdout,
         "stdout_is_complete": True,
+        "collection_inventory": collection,
+        "outcome_inventory": outcomes,
+        "outcome_counts": counts,
+        "inventory_sha256": authorization._active_test_inventory_sha256(
+            collection, outcomes, counts
+        ),
+        "sandbox_enforcement_receipt": {
+            "path": authorization.ACTIVE_TEST_ENFORCEMENT_RECEIPT.as_posix(),
+            "sha256": "a" * 64,
+            "bytes": 8192,
+            "mode": "0444",
+            "nlink": 1,
+            "st_dev": 11,
+            "st_ino": 22,
+        },
         "implementation_files": list(implementation),
         "runtime_state_before": runtime_state,
         "runtime_state_after": json.loads(json.dumps(runtime_state)),
@@ -69,14 +140,33 @@ def _replace_test_stdout(document: dict[str, Any], stdout: str) -> None:
     document["stdout_sha256"] = hashlib.sha256(encoded).hexdigest()
 
 
-def test_active_test_receipt_exact_evidence_accepts_creator_shape() -> None:
+def _rehash_test_inventory(document: dict[str, Any]) -> None:
+    document["inventory_sha256"] = authorization._active_test_inventory_sha256(
+        document["collection_inventory"],
+        document["outcome_inventory"],
+        document["outcome_counts"],
+    )
+
+
+def test_active_test_result_payload_accepts_only_the_exact_pinned_collection() -> None:
     root = Path("/project")
     implementation = [{"path": "scripts/example.py"}]
     document = _valid_active_test_evidence(root, implementation)
 
-    authorization._active_validate_test_receipt_evidence(
-        root, document, implementation=implementation
-    )
+    authorization._active_validate_test_result_payload(document)
+
+
+def test_active_test_receipt_shape_cannot_bypass_missing_external_authority() -> None:
+    root = Path("/project")
+    implementation = [{"path": "scripts/example.py"}]
+    document = _valid_active_test_evidence(root, implementation)
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="no governed independently"
+    ):
+        authorization._active_validate_test_receipt_evidence(
+            root, document, implementation=implementation
+        )
 
 
 @pytest.mark.parametrize(
@@ -91,13 +181,22 @@ def test_active_test_receipt_exact_evidence_accepts_creator_shape() -> None:
         "stdout_sha256",
         "missing_progress_completion",
         "failure_summary",
+        "skipped_test",
+        "missing_bwrap_test",
+        "inventory_hash",
+        "enforcement_binding",
         "implementation_files",
         "runtime_state",
     ),
 )
 def test_active_test_receipt_exact_evidence_rejects_mutation(
-    mutation: str,
+    mutation: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Structural-only exercise: production calls never replace the authority
+    # check, and separate tests above prove the real entry point is blocked.
+    monkeypatch.setattr(
+        authorization, "_active_require_test_enforcement_authority", lambda: None
+    )
     root = Path("/project")
     implementation = [{"path": "scripts/example.py"}]
     document = _valid_active_test_evidence(root, implementation)
@@ -116,24 +215,393 @@ def test_active_test_receipt_exact_evidence_rejects_mutation(
     elif mutation == "stdout_sha256":
         document["stdout_sha256"] = "0" * 64
     elif mutation == "missing_progress_completion":
-        _replace_test_stdout(document, "514 passed, 3 skipped in 5.86s\n")
+        _replace_test_stdout(document, "17 passed in 5.86s\n")
     elif mutation == "failure_summary":
         _replace_test_stdout(
             document,
             "........................................................ [100%]\n"
-            "1 failed, 513 passed, 3 skipped in 5.86s\n",
+            "1 failed, 16 passed in 5.86s\n",
         )
+    elif mutation == "skipped_test":
+        document["outcome_inventory"][0]["outcome"] = "skipped"
+        document["outcome_counts"]["passed"] -= 1
+        document["outcome_counts"]["skipped"] = 1
+        _rehash_test_inventory(document)
+    elif mutation == "missing_bwrap_test":
+        missing = next(iter(authorization._ACTIVE_CRITICAL_BWRAP_TEST_NODEIDS))
+        index = document["collection_inventory"].index(missing)
+        document["collection_inventory"].pop(index)
+        document["outcome_inventory"].pop(index)
+        document["outcome_counts"]["collected"] -= 1
+        document["outcome_counts"]["passed"] -= 1
+        _rehash_test_inventory(document)
+    elif mutation == "inventory_hash":
+        document["inventory_sha256"] = "0" * 64
+    elif mutation == "enforcement_binding":
+        document["sandbox_enforcement_receipt"]["mode"] = "0644"
     elif mutation == "implementation_files":
         document["implementation_files"] = []
     else:
         document["runtime_state_after"]["usage_state"] = {"mutated": True}
 
-    with pytest.raises(
-        authorization.AuthorizationError, match="test receipt evidence"
-    ):
+    with pytest.raises(authorization.AuthorizationError, match="V8R4A"):
         authorization._active_validate_test_receipt_evidence(
             root, document, implementation=implementation
         )
+
+
+def _valid_test_enforcement_document(
+    root: Path, implementation: list[Mapping[str, Any]]
+) -> dict[str, Any]:
+    evidence = _valid_active_test_evidence(root, implementation)
+    evidence.pop("sandbox_enforcement_receipt")
+    document: dict[str, Any] = {
+        "schema_version": 1,
+        "classification": authorization.ACTIVE_TEST_ENFORCEMENT_CLASSIFICATION,
+        "campaign_id": (
+            "directed_harmonic_factor_expert_snn_v3r1_adaptive_retrospective"
+        ),
+        "scientific_campaign_revision": authorization.ACTIVE_SCIENTIFIC_REVISION,
+        "infrastructure_revision": authorization.ACTIVE_INFRASTRUCTURE_REVISION,
+        "authorization_generation": authorization.ACTIVE_AUTHORIZATION_GENERATION,
+        "created_utc": "2026-08-31T00:00:00+00:00",
+        **evidence,
+        "sandbox_capability": {
+            "enforcement_kind": "external_full_capability_sandbox_v1",
+            "separate_mount_namespace": True,
+            "separate_network_namespace": True,
+            "minimal_device_namespace": True,
+            "filesystem_allowlist_complete": True,
+            "gpu_device_nodes_available": False,
+            "raw_dataset_roots_available": False,
+            "outer_reference_roots_available": False,
+            "denied_canary_probes_passed": True,
+        },
+        "sandbox_completion": {
+            "sandbox_process_started": True,
+            "sandbox_process_exited": True,
+            "return_code": 0,
+            "stdout_sha256": evidence["stdout_sha256"],
+            "inventory_sha256": evidence["inventory_sha256"],
+            "gpu_accessed": False,
+            "target_or_outer_reference_accessed": False,
+        },
+    }
+    document["content_sha256"] = authorization.semantic_sha256(document)
+    return document
+
+
+def test_handmade_self_hashed_enforcement_receipt_is_non_authoritative(
+    tmp_path: Path,
+) -> None:
+    implementation = [{"path": "scripts/example.py"}]
+    document = _valid_test_enforcement_document(tmp_path, implementation)
+    receipt = _write_frozen_json(
+        tmp_path, authorization.ACTIVE_TEST_ENFORCEMENT_RECEIPT, document
+    )
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="handmade.*self-hashed"
+    ):
+        authorization._active_validate_test_enforcement_receipt(
+            tmp_path, implementation
+        )
+
+    assert receipt.stat().st_mode & 0o777 == 0o444
+
+
+def test_self_signed_enforcement_receipt_is_non_authoritative(
+    tmp_path: Path,
+) -> None:
+    implementation = [{"path": "scripts/example.py"}]
+    document = _valid_test_enforcement_document(tmp_path, implementation)
+    unsigned = authorization.semantic_sha256(document)
+    document["authority"] = {
+        "trust_root_id": "repository-local-key",
+        "issuer_id": "same-repository-writer",
+        "runner_id": "same-repository-writer",
+        "signature_scheme": "sha256-self-signature",
+        "signed_payload_sha256": unsigned,
+        "signature": unsigned,
+    }
+    document.pop("content_sha256")
+    document["content_sha256"] = authorization.semantic_sha256(document)
+    _write_frozen_json(
+        tmp_path, authorization.ACTIVE_TEST_ENFORCEMENT_RECEIPT, document
+    )
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="self-signed.*non-authoritative"
+    ):
+        authorization._active_validate_test_enforcement_receipt(
+            tmp_path, implementation
+        )
+
+
+def test_partial_rehashed_collection_cannot_satisfy_exact_inventory() -> None:
+    document = _valid_active_test_evidence(Path("/project"), [])
+    document["collection_inventory"].pop()
+    document["outcome_inventory"].pop()
+    document["outcome_counts"]["collected"] -= 1
+    document["outcome_counts"]["passed"] -= 1
+    _rehash_test_inventory(document)
+
+    with pytest.raises(authorization.AuthorizationError, match="exact pinned"):
+        authorization._active_validate_test_inventory(document)
+
+
+def test_invented_one_node_per_file_cannot_satisfy_exact_inventory() -> None:
+    document = _valid_active_test_evidence(Path("/project"), [])
+    collection = sorted(
+        {
+            *(
+                f"{path}::test_receipt_inventory_fixture"
+                for path in authorization.ACTIVE_FIXED_TEST_PATHS
+            ),
+            *authorization._ACTIVE_CRITICAL_BWRAP_TEST_NODEIDS,
+        }
+    )
+    document["collection_inventory"] = collection
+    document["outcome_inventory"] = [
+        {"nodeid": nodeid, "outcome": "passed"} for nodeid in collection
+    ]
+    document["outcome_counts"]["collected"] = len(collection)
+    document["outcome_counts"]["passed"] = len(collection)
+    _rehash_test_inventory(document)
+
+    with pytest.raises(authorization.AuthorizationError, match="exact pinned"):
+        authorization._active_validate_test_inventory(document)
+
+
+def test_context1_authority_blocker_requires_independent_signed_bindings() -> None:
+    assert authorization._ACTIVE_CONTEXT1_TEST_AUTHORITY_STATUS == (
+        "blocked_no_independent_trust_root"
+    )
+    assert authorization._ACTIVE_CONTEXT1_TEST_TRUST_ROOT is None
+    assert not authorization._ACTIVE_CONTEXT1_TRUSTED_ISSUER_IDS
+    assert not authorization._ACTIVE_CONTEXT1_TRUSTED_RUNNER_IDS
+    assert not authorization._ACTIVE_CONTEXT1_ACCEPTED_SIGNATURE_SCHEMES
+    assert {
+        "issuer_identity",
+        "runner_identity",
+        "exact_pytest_collection_inventory",
+        "exact_terminal_outcome_inventory",
+        "runner_environment_manifest",
+        "sandbox_policy_manifest",
+        "sandbox_observation_manifest",
+    } <= authorization._ACTIVE_CONTEXT1_REQUIRED_SIGNED_TEST_BINDINGS
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="no governed independently"
+    ):
+        authorization._active_require_test_enforcement_authority()
+
+
+def test_repository_constants_cannot_be_promoted_into_a_pseudo_trust_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        authorization, "_ACTIVE_CONTEXT1_TEST_AUTHORITY_STATUS", "trusted"
+    )
+    monkeypatch.setattr(
+        authorization, "_ACTIVE_CONTEXT1_TEST_TRUST_ROOT", {"key": "local"}
+    )
+    monkeypatch.setattr(
+        authorization,
+        "_ACTIVE_CONTEXT1_TRUSTED_ISSUER_IDS",
+        frozenset({"repository-writer"}),
+    )
+    monkeypatch.setattr(
+        authorization,
+        "_ACTIVE_CONTEXT1_TRUSTED_RUNNER_IDS",
+        frozenset({"repository-writer"}),
+    )
+    monkeypatch.setattr(
+        authorization,
+        "_ACTIVE_CONTEXT1_ACCEPTED_SIGNATURE_SCHEMES",
+        frozenset({"self-signature"}),
+    )
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="verifier is not implemented"
+    ):
+        authorization._active_require_test_enforcement_authority()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("replace_with_fake", "add_fake", "duplicate", "reorder"),
+)
+def test_rehashed_nonexact_nodeid_inventory_is_rejected(mutation: str) -> None:
+    document = _valid_active_test_evidence(Path("/project"), [])
+    collection = document["collection_inventory"]
+    outcomes = document["outcome_inventory"]
+    if mutation == "replace_with_fake":
+        real = collection[0]
+        path = next(
+            path
+            for path in authorization.ACTIVE_FIXED_TEST_PATHS
+            if real.startswith(path + "::")
+        )
+        collection[0] = f"{path}::test_repository_writer_invented_node"
+        outcomes[0]["nodeid"] = collection[0]
+        paired = sorted(zip(collection, outcomes, strict=True), key=lambda row: row[0])
+        document["collection_inventory"] = [row[0] for row in paired]
+        document["outcome_inventory"] = [row[1] for row in paired]
+    elif mutation == "add_fake":
+        path = authorization.ACTIVE_FIXED_TEST_PATHS[0]
+        nodeid = f"{path}::test_repository_writer_invented_node"
+        collection.append(nodeid)
+        outcomes.append({"nodeid": nodeid, "outcome": "passed"})
+        document["collection_inventory"].sort()
+        document["outcome_inventory"].sort(key=lambda row: row["nodeid"])
+        document["outcome_counts"]["collected"] += 1
+        document["outcome_counts"]["passed"] += 1
+    elif mutation == "duplicate":
+        collection.append(collection[-1])
+        outcomes.append(dict(outcomes[-1]))
+        document["outcome_counts"]["collected"] += 1
+        document["outcome_counts"]["passed"] += 1
+    else:
+        collection[0], collection[1] = collection[1], collection[0]
+        outcomes[0], outcomes[1] = outcomes[1], outcomes[0]
+    _rehash_test_inventory(document)
+
+    with pytest.raises(authorization.AuthorizationError):
+        authorization._active_validate_test_inventory(document)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "skip",
+        "missing_bwrap",
+        "gpu_available",
+        "raw_available",
+        "outer_available",
+        "completion_gpu_access",
+        "completion_target_access",
+        "inventory_hash",
+    ),
+)
+def test_external_test_enforcement_receipt_rejects_unsafe_or_inexact_evidence(
+    tmp_path: Path, mutation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Structural-only exercise behind the terminal production authority gate.
+    monkeypatch.setattr(
+        authorization, "_active_require_test_enforcement_authority", lambda: None
+    )
+    implementation = [{"path": "scripts/example.py"}]
+    document = _valid_test_enforcement_document(tmp_path, implementation)
+    if mutation == "skip":
+        document["outcome_inventory"][0]["outcome"] = "skipped"
+        document["outcome_counts"]["passed"] -= 1
+        document["outcome_counts"]["skipped"] = 1
+        _rehash_test_inventory(document)
+        document["sandbox_completion"]["inventory_sha256"] = document[
+            "inventory_sha256"
+        ]
+    elif mutation == "missing_bwrap":
+        missing = next(iter(authorization._ACTIVE_CRITICAL_BWRAP_TEST_NODEIDS))
+        index = document["collection_inventory"].index(missing)
+        document["collection_inventory"].pop(index)
+        document["outcome_inventory"].pop(index)
+        document["outcome_counts"]["collected"] -= 1
+        document["outcome_counts"]["passed"] -= 1
+        _rehash_test_inventory(document)
+        document["sandbox_completion"]["inventory_sha256"] = document[
+            "inventory_sha256"
+        ]
+    elif mutation == "gpu_available":
+        document["sandbox_capability"]["gpu_device_nodes_available"] = True
+    elif mutation == "raw_available":
+        document["sandbox_capability"]["raw_dataset_roots_available"] = True
+    elif mutation == "outer_available":
+        document["sandbox_capability"]["outer_reference_roots_available"] = True
+    elif mutation == "completion_gpu_access":
+        document["sandbox_completion"]["gpu_accessed"] = True
+    elif mutation == "completion_target_access":
+        document["sandbox_completion"][
+            "target_or_outer_reference_accessed"
+        ] = True
+    else:
+        document["inventory_sha256"] = "0" * 64
+    document.pop("content_sha256")
+    document["content_sha256"] = authorization.semantic_sha256(document)
+    _write_frozen_json(
+        tmp_path, authorization.ACTIVE_TEST_ENFORCEMENT_RECEIPT, document
+    )
+
+    with pytest.raises(authorization.AuthorizationError):
+        authorization._active_validate_test_enforcement_receipt(
+            tmp_path, implementation
+        )
+
+
+def test_create_test_receipt_fails_before_any_issuance_work_without_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        authorization,
+        "_active_validate_create_stage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("issuance work must never start without authority")
+        ),
+    )
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="no governed independently"
+    ):
+        authorization.create_test_receipt(tmp_path)
+    assert not os.path.lexists(tmp_path / authorization.ACTIVE_TEST_RECEIPT)
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "relative"),
+    (
+        (authorization.create_source_snapshot, authorization.ACTIVE_SOURCE_SNAPSHOT),
+        (
+            authorization.create_pretrain_authorization,
+            authorization.ACTIVE_PRETRAIN_AUTHORIZATION,
+        ),
+    ),
+)
+def test_downstream_create_once_stages_cannot_start_without_test_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: Any,
+    relative: Path,
+) -> None:
+    monkeypatch.setattr(
+        authorization,
+        "_active_validate_create_stage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("downstream issuance work must not start")
+        ),
+    )
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="no governed independently"
+    ):
+        entrypoint(tmp_path)
+    assert not os.path.lexists(tmp_path / relative)
+
+
+def test_target_document_chain_blocks_before_opening_repository_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        authorization,
+        "_active_validate_execution_closure_target_chain",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("target receipt loading must not start")
+        ),
+    )
+
+    with pytest.raises(
+        authorization.AuthorizationError, match="no governed independently"
+    ):
+        authorization._active_target_documents(tmp_path, {}, {})
 
 
 def _content_document(**extra: Any) -> dict[str, Any]:
@@ -1030,6 +1498,58 @@ def test_active_surface_registers_complete_v8r4a_dependency_closure() -> None:
     )
 
 
+def test_v8r4_scanner_excludes_only_the_validated_dependency_bound_v8r5_proposal() -> None:
+    relative = "src/snn_rr/axis_risk_router_snn_v8r5.py"
+    raw = (SOURCE_ROOT / relative).read_bytes()
+
+    authorization._active_validate_independent_successor_proposal(relative, raw)
+
+    assert relative in authorization._ACTIVE_INDEPENDENT_SUCCESSOR_PROPOSAL_PATHS
+    assert relative not in authorization.ACTIVE_IMPLEMENTATION_PATHS
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "claim_true",
+        "protected_import",
+        "extra_internal_dependency",
+        "missing_dependency_hash",
+        "missing_boundary",
+        "wrong_path",
+    ),
+)
+def test_dependency_bound_v8r5_scanner_exclusion_fails_closed(
+    mutation: str,
+) -> None:
+    relative = "src/snn_rr/axis_risk_router_snn_v8r5.py"
+    raw = (SOURCE_ROOT / relative).read_bytes()
+    if mutation == "claim_true":
+        raw = raw.replace(
+            b'"training_authorized": False',
+            b'"training_authorized": True',
+        )
+    elif mutation == "protected_import":
+        raw += b"\nfrom .harmonic_factor_router_v3 import HarmonicFactorSNN\n"
+    elif mutation == "extra_internal_dependency":
+        raw += b"\nfrom .models import StructuredTriRadarRRSNN\n"
+    elif mutation == "missing_dependency_hash":
+        raw = raw.replace(
+            b"_FEATURE_LAYOUT_SOURCE_SHA256",
+            b"_FEATURE_LAYOUT_SOURCE_DIGEST_MISSING",
+        )
+    elif mutation == "missing_boundary":
+        raw = raw.replace(
+            b"does not authorize protected training",
+            b"may authorize protected training",
+        )
+    else:
+        relative = "src/snn_rr/unregistered_v8r5.py"
+
+    with pytest.raises(authorization.AuthorizationError, match="successor"):
+        authorization._active_validate_independent_successor_proposal(relative, raw)
+
+
 def test_open_lifecycle_recovery_authority_has_exact_cross_bindings() -> None:
     authorities = authorization._active_authorized_modifications(SOURCE_ROOT)
     assert "V8R4A open-lifecycle recovery" in {label for _document, label in authorities}
@@ -1893,6 +2413,11 @@ def test_context1_host_and_target_reject_same_self_hashed_scope_tamper(
     monkeypatch: pytest.MonkeyPatch,
     projection: str,
 ) -> None:
+    # Exercise the schema validators behind the independently tested terminal
+    # authority gate; this fixture is intentionally non-authoritative.
+    monkeypatch.setattr(
+        authorization, "_active_require_test_enforcement_authority", lambda: None
+    )
     document = _content_document(
         authorization_generation=authorization.ACTIVE_AUTHORIZATION_GENERATION,
         **authorization._active_expected_pretrain_scopes()

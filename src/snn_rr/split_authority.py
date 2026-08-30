@@ -16,9 +16,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
+import stat
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
+import weakref
 
 import numpy as np
 import pandas as pd
@@ -98,7 +103,7 @@ def _resolve_reference(path_value: Any, manifest_path: Path, label: str) -> Path
     return resolved
 
 
-def _read_json(path: Path, label: str) -> Mapping[str, Any]:
+def _parse_json_bytes(payload: bytes, path: Path, label: str) -> Mapping[str, Any]:
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -112,13 +117,90 @@ def _read_json(path: Path, label: str) -> Mapping[str, Any]:
 
     try:
         value = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload.decode("utf-8"),
             object_pairs_hook=reject_duplicate_keys,
             parse_constant=reject_nonfinite,
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} is not valid JSON: {path} ({exc})") from exc
     return _require_mapping(value, label)
+
+
+def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _read_regular_file_snapshot(
+    path: Path, label: str
+) -> tuple[bytes, str, int]:
+    """Read one unaliased regular inode and bind the consumed bytes.
+
+    The path/open/fd/path signature checks reject symlinks, hard-link aliases,
+    replacement, and in-place mutation during capture.  Callers parse only the
+    returned private byte string, never the namespace path a second time.
+    """
+
+    source = path.expanduser().absolute()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        before_path = os.stat(source, follow_symlinks=False)
+        descriptor = os.open(source, flags)
+        before_fd = os.fstat(descriptor)
+        if not (
+            stat.S_ISREG(before_path.st_mode)
+            and stat.S_ISREG(before_fd.st_mode)
+            and before_path.st_nlink == before_fd.st_nlink == 1
+            and (before_path.st_dev, before_path.st_ino)
+            == (before_fd.st_dev, before_fd.st_ino)
+        ):
+            raise ValueError(f"{label} must be an unaliased regular file: {source}")
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+        payload = b"".join(chunks)
+        after_fd = os.fstat(descriptor)
+        after_path = os.stat(source, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be snapshotted: {source} ({exc})") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    signature = _stat_signature(before_fd)
+    if not (
+        signature == _stat_signature(after_fd) == _stat_signature(after_path)
+        and before_fd.st_size == len(payload)
+    ):
+        raise ValueError(f"{label} changed while being snapshotted: {source}")
+    return payload, digest.hexdigest(), len(payload)
+
+
+def _read_regular_json_snapshot(
+    path: Path, label: str
+) -> tuple[Mapping[str, Any], str]:
+    """Parse and hash the exact same regular-file bytes from one open inode."""
+
+    payload, digest, _ = _read_regular_file_snapshot(path, label)
+    return _parse_json_bytes(payload, path, label), digest
+
+
+def _read_json(path: Path, label: str) -> Mapping[str, Any]:
+    """Compatibility wrapper returning a one-inode JSON snapshot."""
+
+    return _read_regular_json_snapshot(path, label)[0]
 
 
 def _verify_reference(
@@ -126,12 +208,12 @@ def _verify_reference(
 ) -> tuple[Path, str, Mapping[str, Any]]:
     path = _resolve_reference(binding.get("path"), manifest_path, label)
     expected = _require_sha256(binding.get("sha256"), f"{label}.sha256")
-    actual = sha256_file(path)
+    document, actual = _read_regular_json_snapshot(path, label)
     if actual != expected:
         raise ValueError(
             f"{label} SHA-256 mismatch: expected {expected}, observed {actual}"
         )
-    return path, actual, _read_json(path, label)
+    return path, actual, document
 
 
 def _fold_identity_map(document: Mapping[str, Any]) -> dict[str, int]:
@@ -148,20 +230,70 @@ def _fold_identity_map(document: Mapping[str, Any]) -> dict[str, int]:
     return result
 
 
-def _session_identity_map(
-    metadata: pd.DataFrame, cache_manifest: Mapping[str, Any]
-) -> dict[str, str]:
+def _successful_session_ids(cache_manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_sessions = cache_manifest.get("sessions")
+    if not isinstance(raw_sessions, list):
+        raise ValueError("cache manifest sessions must be an array")
+    available: list[str] = []
+    for item in raw_sessions:
+        if not isinstance(item, Mapping):
+            raise ValueError("cache manifest session entries must be objects")
+        if item.get("status") == "ok":
+            session_id = item.get("session_id")
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or session_id != session_id.strip()
+                or len(Path(session_id).parts) != 1
+                or session_id in {".", ".."}
+            ):
+                raise ValueError("cache manifest has an invalid successful session_id")
+            available.append(session_id)
+    if not available:
+        raise ValueError("cache manifest has no successful sessions")
+    if len(set(available)) != len(available):
+        raise ValueError("cache manifest repeats a successful session_id")
+    return tuple(available)
+
+
+def _split_role_columns(
+    metadata: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if type(metadata) is not pd.DataFrame:
+        raise TypeError("cache metadata must be an exact pandas DataFrame")
     required = {"session_id", "identity", "reference_valid"}
     missing = sorted(required - set(metadata.columns))
     if missing:
         raise ValueError(f"cache metadata lacks split columns: {missing}")
     if metadata.empty:
         raise ValueError("cache metadata is empty")
-    if metadata[["session_id", "identity"]].isna().any().any():
-        raise ValueError("cache session_id/identity contains missing values")
+    session_values = metadata["session_id"].tolist()
+    identity_values = metadata["identity"].tolist()
+    reference_values = metadata["reference_valid"].tolist()
+    if any(
+        type(value) is not str or not value or value != value.strip()
+        for value in session_values
+    ):
+        raise ValueError("cache session_id must contain exact non-empty strings")
+    if any(
+        type(value) is not str or not value or value != value.strip()
+        for value in identity_values
+    ):
+        raise ValueError("cache identity must contain exact non-empty strings")
+    if any(type(value) not in {bool, np.bool_} for value in reference_values):
+        raise ValueError("cache reference_valid must contain exact booleans")
+    return (
+        np.asarray(session_values, dtype=object),
+        np.asarray(identity_values, dtype=object),
+        np.asarray(reference_values, dtype=np.bool_),
+    )
 
-    session_ids = metadata["session_id"].astype(str)
-    identities = metadata["identity"].astype(str)
+
+def _session_identity_map(
+    metadata: pd.DataFrame, cache_manifest: Mapping[str, Any]
+) -> dict[str, str]:
+    session_ids, identities, _ = _split_role_columns(metadata)
+
     result: dict[str, str] = {}
     for session_id, rows in metadata.assign(
         _session=session_ids, _identity=identities
@@ -173,20 +305,7 @@ def _session_identity_map(
             )
         result[str(session_id)] = str(unique[0])
 
-    raw_sessions = cache_manifest.get("sessions")
-    if not isinstance(raw_sessions, list):
-        raise ValueError("cache manifest sessions must be an array")
-    available: list[str] = []
-    for item in raw_sessions:
-        if not isinstance(item, Mapping):
-            raise ValueError("cache manifest session entries must be objects")
-        if item.get("status") == "ok":
-            session_id = item.get("session_id")
-            if not isinstance(session_id, str) or not session_id:
-                raise ValueError("cache manifest has an invalid successful session_id")
-            available.append(session_id)
-    if len(set(available)) != len(available):
-        raise ValueError("cache manifest repeats a successful session_id")
+    available = _successful_session_ids(cache_manifest)
     if set(available) != set(result):
         missing_metadata = sorted(set(available) - set(result))
         unknown_metadata = sorted(set(result) - set(available))
@@ -195,6 +314,189 @@ def _session_identity_map(
             f"(missing_metadata={missing_metadata}, unknown_metadata={unknown_metadata})"
         )
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class _MetadataFileBinding:
+    session_id: str
+    path: Path
+    sha256: str
+    bytes: int
+
+    def provenance(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "bytes": self.bytes,
+        }
+
+
+def _metadata_row_roles_sha256(metadata: pd.DataFrame) -> str:
+    session_ids, identities, reference_valid = _split_role_columns(metadata)
+    rows = [
+        [position, str(session_id), str(identity), bool(valid)]
+        for position, (session_id, identity, valid) in enumerate(
+            zip(session_ids, identities, reference_valid, strict=True)
+        )
+    ]
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "snn_rr.identity_split_metadata_row_roles.v1",
+                "columns": ["row_position", "session_id", "identity", "reference_valid"],
+                "rows": rows,
+            }
+        )
+    ).hexdigest()
+
+
+def _load_authoritative_metadata_snapshot(
+    cache_root: Path, cache_manifest: Mapping[str, Any]
+) -> tuple[pd.DataFrame, tuple[_MetadataFileBinding, ...], str]:
+    """Parse every metadata CSV from the exact bytes used for its digest."""
+
+    root = cache_root.expanduser().resolve()
+    frames: list[pd.DataFrame] = []
+    bindings: list[_MetadataFileBinding] = []
+    for session_id in _successful_session_ids(cache_manifest):
+        session_root = (root / session_id).resolve()
+        metadata_path = (session_root / "metadata.csv").resolve()
+        try:
+            session_root.relative_to(root)
+            metadata_path.relative_to(session_root)
+        except ValueError as error:
+            raise ValueError(
+                f"cache metadata path escapes its root for {session_id}"
+            ) from error
+        payload, digest, byte_count = _read_regular_file_snapshot(
+            metadata_path, f"cache metadata {session_id}"
+        )
+        try:
+            frame = pd.read_csv(io.BytesIO(payload))
+        except Exception as error:
+            raise ValueError(
+                f"cache metadata {session_id} cannot be parsed from its bound bytes"
+            ) from error
+        frame_sessions, _, _ = _split_role_columns(frame)
+        if set(frame_sessions.tolist()) != {session_id}:
+            raise ValueError(
+                f"cache metadata file/session mismatch for {session_id}"
+            )
+        frames.append(frame)
+        bindings.append(
+            _MetadataFileBinding(
+                session_id=session_id,
+                path=metadata_path,
+                sha256=digest,
+                bytes=byte_count,
+            )
+        )
+    authoritative = pd.concat(frames, ignore_index=True)
+    source_content_sha256 = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "schema": "snn_rr.identity_split_metadata_sources.v1",
+                "files": [binding.provenance() for binding in bindings],
+            }
+        )
+    ).hexdigest()
+    return authoritative, tuple(bindings), source_content_sha256
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorityRuntimeBinding:
+    authority_ref: weakref.ReferenceType[Any]
+    authority_claim_sha256: str
+    metadata_object: pd.DataFrame
+    metadata_snapshot: pd.DataFrame
+
+
+# A split authority is useful only when issued by the loader for the exact
+# metadata object that the trainer will consume.  Keeping the issuing object in
+# this process-local strong registry makes dataclass construction/copy and
+# receipt transplant fail before indices or scaler roles can be produced.
+_AUTHORITY_RUNTIME_REGISTRY: dict[int, _AuthorityRuntimeBinding] = {}
+
+
+def _authority_claim_sha256(authority: Any) -> str:
+    """Bind every authority field whose mutation could change split output."""
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "manifest_path": str(authority.manifest_path),
+                "manifest_file_sha256": authority.manifest_file_sha256,
+                "content_sha256": authority.content_sha256,
+                "fold_id": authority.fold_id,
+                "train_identities": list(authority.train_identities),
+                "validation_identities": list(authority.validation_identities),
+                "prediction_identities": list(authority.prediction_identities),
+                "excluded_identities": list(authority.excluded_identities),
+                "scaler_identities": list(authority.scaler_identities),
+                "fold_assignments_path": str(authority.fold_assignments_path),
+                "fold_assignments_sha256": authority.fold_assignments_sha256,
+                "cache_manifest_path": str(authority.cache_manifest_path),
+                "cache_manifest_sha256": authority.cache_manifest_sha256,
+                "identity_to_fold": dict(sorted(authority.identity_to_fold.items())),
+                "session_to_identity": dict(
+                    sorted(authority.session_to_identity.items())
+                ),
+                "metadata_source_content_sha256": (
+                    authority.metadata_source_content_sha256
+                ),
+                "metadata_row_roles_sha256": authority.metadata_row_roles_sha256,
+                "metadata_row_count": authority.metadata_row_count,
+                "metadata_file_bindings": [
+                    binding.provenance()
+                    for binding in authority.metadata_file_bindings
+                ],
+            }
+        )
+    ).hexdigest()
+
+
+def _register_authority(
+    authority: Any, metadata: pd.DataFrame, metadata_snapshot: pd.DataFrame
+) -> None:
+    key = id(authority)
+
+    def discard(reference: weakref.ReferenceType[Any]) -> None:
+        current = _AUTHORITY_RUNTIME_REGISTRY.get(key)
+        if current is not None and current.authority_ref is reference:
+            _AUTHORITY_RUNTIME_REGISTRY.pop(key, None)
+
+    authority_ref = weakref.ref(authority, discard)
+    _AUTHORITY_RUNTIME_REGISTRY[key] = _AuthorityRuntimeBinding(
+        authority_ref=authority_ref,
+        authority_claim_sha256=_authority_claim_sha256(authority),
+        metadata_object=metadata,
+        metadata_snapshot=metadata_snapshot.copy(deep=True),
+    )
+
+
+def _require_live_authority(authority: Any) -> _AuthorityRuntimeBinding:
+    if type(authority) is not IdentitySplitAuthority:
+        raise RuntimeError("identity split authority must have the exact issued type")
+    binding = _AUTHORITY_RUNTIME_REGISTRY.get(id(authority))
+    if binding is None or binding.authority_ref() is not authority:
+        raise RuntimeError("identity split authority was not issued by the loader")
+    if _authority_claim_sha256(authority) != binding.authority_claim_sha256:
+        raise RuntimeError("identity split authority changed after loader issuance")
+    return binding
+
+
+def _require_bound_metadata(authority: Any, metadata: pd.DataFrame) -> None:
+    binding = _require_live_authority(authority)
+    if type(metadata) is not pd.DataFrame or metadata is not binding.metadata_object:
+        raise RuntimeError(
+            "identity split authority requires the exact loader-bound metadata object"
+        )
+    if not metadata.equals(binding.metadata_snapshot):
+        raise RuntimeError("loader-bound cache metadata changed after authority issuance")
+    observed_roles = _metadata_row_roles_sha256(metadata)
+    if observed_roles != authority.metadata_row_roles_sha256:
+        raise RuntimeError("loader-bound metadata row roles changed after authority issuance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +509,7 @@ class ExplicitIdentitySplit:
     split: dict[str, list[str]]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class IdentitySplitAuthority:
     """An immutable manifest validated against the current feature cache."""
 
@@ -226,18 +528,28 @@ class IdentitySplitAuthority:
     cache_manifest_sha256: str
     identity_to_fold: Mapping[str, int]
     session_to_identity: Mapping[str, str]
+    metadata_source_content_sha256: str
+    metadata_row_roles_sha256: str
+    metadata_row_count: int
+    metadata_file_bindings: tuple[_MetadataFileBinding, ...]
 
     def checkpoint_provenance(self) -> dict[str, Any]:
         """Small, stable binding embedded in run and checkpoint artifacts."""
 
+        runtime = _require_live_authority(self)
+        _require_bound_metadata(self, runtime.metadata_object)
         return {
             "mode": "custom_identity_split",
             "schema_version": SCHEMA_VERSION,
+            "authority_receipt_version": 2,
             "fold_id": self.fold_id,
             "split_manifest_content_sha256": self.content_sha256,
             "split_manifest_file_sha256": self.manifest_file_sha256,
             "fold_assignments_sha256": self.fold_assignments_sha256,
             "cache_manifest_sha256": self.cache_manifest_sha256,
+            "metadata_source_content_sha256": self.metadata_source_content_sha256,
+            "metadata_row_roles_sha256": self.metadata_row_roles_sha256,
+            "metadata_row_count": self.metadata_row_count,
             "train_identities": list(self.train_identities),
             "validation_identities": list(self.validation_identities),
             "prediction_identities": list(self.prediction_identities),
@@ -252,6 +564,9 @@ class IdentitySplitAuthority:
             fold_assignments_path=str(self.fold_assignments_path),
             cache_manifest_path=str(self.cache_manifest_path),
             session_to_identity=dict(sorted(self.session_to_identity.items())),
+            metadata_files=[
+                binding.provenance() for binding in self.metadata_file_bindings
+            ],
         )
         return value
 
@@ -260,8 +575,8 @@ class IdentitySplitAuthority:
     ) -> ExplicitIdentitySplit:
         """Build indices without consulting rotating-fold helpers."""
 
-        identities = metadata["identity"].astype(str).to_numpy()
-        valid = metadata["reference_valid"].to_numpy(dtype=bool)
+        _require_bound_metadata(self, metadata)
+        _, identities, valid = _split_role_columns(metadata)
         train_mask = np.isin(identities, self.train_identities)
         if not include_invalid:
             train_mask &= valid
@@ -294,6 +609,8 @@ class IdentitySplitAuthority:
         if observed_prediction != set(self.prediction_identities):
             raise ValueError("not every custom prediction identity has a valid-reference row")
         self.validate_scaler_indices(metadata, train)
+        for positions in (train, validation, prediction):
+            positions.setflags(write=False)
         return ExplicitIdentitySplit(
             train_index=train,
             validation_index=validation,
@@ -310,6 +627,7 @@ class IdentitySplitAuthority:
     def validate_scaler_indices(
         self, metadata: pd.DataFrame, indices: Sequence[int] | np.ndarray
     ) -> None:
+        _require_bound_metadata(self, metadata)
         positions = np.asarray(indices, dtype=np.int64)
         if positions.ndim != 1 or len(positions) == 0:
             raise ValueError("scaler indices must be a non-empty vector")
@@ -337,7 +655,9 @@ def load_identity_split_authority(
     manifest_path = Path(path).expanduser().resolve()
     if not manifest_path.is_file():
         raise FileNotFoundError(f"identity split manifest is missing: {manifest_path}")
-    document = _read_json(manifest_path, "identity split manifest")
+    document, manifest_file_sha256 = _read_regular_json_snapshot(
+        manifest_path, "identity split manifest"
+    )
     if document.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
             f"identity split schema_version must equal {SCHEMA_VERSION}"
@@ -403,7 +723,26 @@ def load_identity_split_authority(
         )
 
     session_to_identity = _session_identity_map(metadata, cache_document)
-    metadata_identities = set(metadata["identity"].astype(str).tolist())
+    (
+        authoritative_metadata,
+        metadata_file_bindings,
+        metadata_source_content_sha256,
+    ) = _load_authoritative_metadata_snapshot(
+        Path(cache_dir).expanduser().resolve(), cache_document
+    )
+    metadata_snapshot = metadata.copy(deep=True)
+    if not metadata_snapshot.equals(authoritative_metadata):
+        raise ValueError(
+            "caller metadata differs from the exact cache metadata byte snapshot"
+        )
+    metadata_row_roles_sha256 = _metadata_row_roles_sha256(metadata_snapshot)
+    authoritative_row_roles_sha256 = _metadata_row_roles_sha256(
+        authoritative_metadata
+    )
+    if metadata_row_roles_sha256 != authoritative_row_roles_sha256:
+        raise RuntimeError("cache metadata row-role snapshot binding drifted")
+    _, metadata_identity_values, _ = _split_role_columns(metadata_snapshot)
+    metadata_identities = set(metadata_identity_values.tolist())
     canonical_identities = set(identity_to_fold)
     if metadata_identities != canonical_identities:
         raise ValueError(
@@ -419,9 +758,30 @@ def load_identity_split_authority(
             f"unknown={sorted(partition - canonical_identities)})"
         )
 
-    return IdentitySplitAuthority(
+    # Persistent replacement during parsing is rejected.  A swap-and-revert
+    # cannot make provenance lie about consumed bytes because every returned
+    # digest came from the same snapshot that was parsed.
+    for current_path, expected_sha256, label in (
+        (manifest_path, manifest_file_sha256, "identity split manifest"),
+        (fold_path, fold_sha, "fold assignments"),
+        (cache_path, cache_sha, "cache manifest"),
+    ):
+        if sha256_file(current_path) != expected_sha256:
+            raise ValueError(f"{label} changed while split authority was loaded")
+    for binding in metadata_file_bindings:
+        if (
+            binding.path.stat().st_size != binding.bytes
+            or sha256_file(binding.path) != binding.sha256
+        ):
+            raise ValueError(
+                f"cache metadata {binding.session_id} changed while split authority was loaded"
+            )
+    if not metadata.equals(metadata_snapshot):
+        raise RuntimeError("caller metadata changed while split authority was loaded")
+
+    authority = IdentitySplitAuthority(
         manifest_path=manifest_path,
-        manifest_file_sha256=sha256_file(manifest_path),
+        manifest_file_sha256=manifest_file_sha256,
         content_sha256=observed_content,
         fold_id=int(fold_id),
         train_identities=role_values["train"],
@@ -433,6 +793,12 @@ def load_identity_split_authority(
         fold_assignments_sha256=fold_sha,
         cache_manifest_path=cache_path,
         cache_manifest_sha256=cache_sha,
-        identity_to_fold=identity_to_fold,
-        session_to_identity=session_to_identity,
+        identity_to_fold=MappingProxyType(dict(identity_to_fold)),
+        session_to_identity=MappingProxyType(dict(session_to_identity)),
+        metadata_source_content_sha256=metadata_source_content_sha256,
+        metadata_row_roles_sha256=metadata_row_roles_sha256,
+        metadata_row_count=len(metadata_snapshot),
+        metadata_file_bindings=metadata_file_bindings,
     )
+    _register_authority(authority, metadata, metadata_snapshot)
+    return authority

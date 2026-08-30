@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -433,13 +434,28 @@ def test_temporal_dataset_uses_structural_mask_not_numeric_signal_values() -> No
 def test_valid_only_disk_alignment_loads_component_signal_binding(tmp_path: Path) -> None:
     cache, base_csv, base_npz = _write_disk_experiment(tmp_path)
     experiment = load_temporal_aligned_experiment(
-        cache, base_csv, base_npz, verify_file_hashes=False
+        cache,
+        base_csv,
+        base_npz,
+        verify_file_hashes=False,
+        historical_legacy_reproduction=True,
     )
     assert len(experiment.metadata) == 12
     assert experiment.sessions[0].component_signals.shape == (12, 3, 2, 2, 320)
     assert experiment.provenance["valid_only_alignment_enforced"] is True
     assert experiment.provenance["component_signals_status"].startswith(
         "window_end"
+    )
+    assert (
+        experiment.training_authority_receipt
+        is experiment._base_authority_experiment.training_authority_receipt
+    )
+    assert (
+        experiment.sessions[0].component_signals
+        is experiment._base_authority_experiment.sessions[0].component_signals
+    )
+    _TRAIN._assert_temporal_training_authority(
+        experiment, historical_legacy_reproduction=True
     )
     np.testing.assert_array_equal(
         experiment.metadata["cache_index"].to_numpy(), np.arange(100, 112)
@@ -459,7 +475,98 @@ def test_valid_only_disk_alignment_loads_component_signal_binding(tmp_path: Path
         raise AssertionError("non-valid-only cache was accepted")
 
 
-def test_cpu_tiny_cli_locks_validation_then_evaluates_test_once(tmp_path: Path) -> None:
+def test_temporal_train_fold_rejects_unissued_memory_view_before_output(
+    tmp_path: Path,
+) -> None:
+    experiment = _memory_experiment()
+    output_dir = tmp_path / "unissued_temporal_output_must_not_exist"
+    args = _TRAIN.parse_args(["--output-dir", str(output_dir)])
+
+    with pytest.raises(RuntimeError, match="loader-issued shared authority receipt"):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("mutation", ["metadata", "component_array"])
+def test_temporal_train_fold_rejects_mutated_loader_view_before_output(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    cache, base_csv, base_npz = _write_disk_experiment(tmp_path / "data")
+    experiment = load_temporal_aligned_experiment(
+        cache,
+        base_csv,
+        base_npz,
+        verify_file_hashes=False,
+        historical_legacy_reproduction=True,
+    )
+    if mutation == "metadata":
+        experiment.metadata["prediction_bpm"] = experiment.metadata[
+            "rr_bpm"
+        ].to_numpy()
+        message = "in-memory experiment"
+    else:
+        session = experiment.sessions[0]
+        forged = np.array(session.component_signals, copy=True, order="C")
+        forged[:, 0, 0, 0, 0] = experiment.metadata["rr_bpm"].to_numpy(
+            dtype=forged.dtype
+        )
+        forged.setflags(write=False)
+        assert forged.flags.owndata and not forged.flags.writeable
+        session.component_signals = forged
+        message = "not source-bound"
+    output_dir = tmp_path / f"{mutation}_temporal_output_must_not_exist"
+    args = _TRAIN.parse_args(
+        ["--output-dir", str(output_dir), "--historical-legacy-reproduction"]
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _TRAIN.train_fold(args, experiment, 0, torch.device("cpu"), "test")
+
+    assert not output_dir.exists()
+
+
+def test_temporal_authority_rejects_exact_clone_and_method_subclass(
+    tmp_path: Path,
+) -> None:
+    cache, base_csv, base_npz = _write_disk_experiment(tmp_path / "data")
+    experiment = load_temporal_aligned_experiment(
+        cache,
+        base_csv,
+        base_npz,
+        verify_file_hashes=False,
+        historical_legacy_reproduction=True,
+    )
+    fields = {
+        name: getattr(experiment, name)
+        for name in TemporalAlignedExperiment.__dataclass_fields__
+    }
+    clone = TemporalAlignedExperiment(**fields)
+
+    class TargetInjectingTemporalExperiment(TemporalAlignedExperiment):
+        def arrays_for_position(self, position: int) -> tuple[np.ndarray, np.ndarray]:
+            signals, attributes = super().arrays_for_position(position)
+            forged = np.array(signals, copy=True)
+            forged.flat[0] = float(self.metadata.iloc[position]["rr_bpm"])
+            return forged, attributes
+
+    subclass = TargetInjectingTemporalExperiment(**fields)
+    output = tmp_path / "clone_output_must_not_exist"
+    args = _TRAIN.parse_args(
+        ["--output-dir", str(output), "--historical-legacy-reproduction"]
+    )
+    for candidate in (clone, subclass):
+        with pytest.raises(RuntimeError, match="loader-issued shared authority"):
+            _TRAIN.train_fold(
+                args, candidate, 0, torch.device("cpu"), "test"
+            )
+    assert not output.exists()
+
+
+def test_cpu_tiny_cli_locks_validation_then_evaluates_test_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cache, base_csv, base_npz = _write_disk_experiment(tmp_path / "data")
     output = tmp_path / "run"
     arguments = [
@@ -491,6 +598,7 @@ def test_cpu_tiny_cli_locks_validation_then_evaluates_test_once(tmp_path: Path) 
         "cpu",
         "--no-amp",
         "--no-verify-file-hashes",
+        "--historical-legacy-reproduction",
         "--smoke-max-batches",
         "1",
         "--bootstrap-samples",
@@ -522,9 +630,96 @@ def test_cpu_tiny_cli_locks_validation_then_evaluates_test_once(tmp_path: Path) 
     assert metrics["complete_six_fold_oof"] is False
     assert "tail_25_35" in metrics["locked_final"]
 
+    with pytest.raises(RuntimeError, match="new, non-existing versioned output"):
+        main(arguments)
+
     first_manifest_sha = hashlib.sha256(completion_path.read_bytes()).hexdigest()
     assert main([*arguments, "--resume"]) == 0
     second_manifest_sha = hashlib.sha256(completion_path.read_bytes()).hexdigest()
     assert first_manifest_sha == second_manifest_sha
     completion_again = json.loads(completion_path.read_text(encoding="utf-8"))
     assert completion_again["test_fold_evaluation_invocations"] == 1
+
+    experiment = load_temporal_aligned_experiment(
+        cache,
+        base_csv,
+        base_npz,
+        verify_file_hashes=False,
+        historical_legacy_reproduction=True,
+    )
+    resume_args = _TRAIN.parse_args([*arguments, "--resume"])
+    run_signature = str(
+        json.loads((output / "run_config.json").read_text(encoding="utf-8"))[
+            "run_signature"
+        ]
+    )
+    with pytest.raises(RuntimeError, match="run_signature binding"):
+        _TRAIN.train_fold(
+            resume_args,
+            experiment,
+            0,
+            torch.device("cpu"),
+            "wrong-seed-or-run-signature",
+        )
+
+    original_completion = completion_path.read_text(encoding="utf-8")
+    transplanted = json.loads(original_completion)
+    transplanted["outer_fold"] = 1
+    completion_path.write_text(json.dumps(transplanted), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="outer_fold binding"):
+        _TRAIN.train_fold(
+            resume_args,
+            experiment,
+            0,
+            torch.device("cpu"),
+            run_signature,
+        )
+    completion_path.write_text(original_completion, encoding="utf-8")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(_TRAIN, "_source_binding", lambda _experiment: "0" * 64)
+        with pytest.raises(RuntimeError, match="source_binding_sha256 binding"):
+            _TRAIN.train_fold(
+                resume_args,
+                experiment,
+                0,
+                torch.device("cpu"),
+                run_signature,
+            )
+
+    completed_result = _TRAIN.train_fold(
+        resume_args,
+        experiment,
+        0,
+        torch.device("cpu"),
+        run_signature,
+    )
+    prediction, promoted, report = completed_result
+    tampered_cache_index = np.asarray(prediction.cache_index).copy()
+    tampered_cache_index[0] += 10_000
+    tampered = replace(prediction, cache_index=tampered_cache_index)
+    with pytest.raises(RuntimeError, match="cache_index binding mismatch"):
+        _TRAIN.write_oof(
+            resume_args,
+            experiment,
+            {0: (tampered, promoted, report)},
+            run_signature,
+        )
+
+
+def test_temporal_source_closure_includes_both_trainers_and_models() -> None:
+    digest = _TRAIN._current_temporal_training_source_sha256()
+    assert isinstance(digest, str) and len(digest) == 64
+    paths = {
+        *(_TRAIN.shared._training_source_paths()),
+        Path(_TRAIN.__file__).resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/svd_temporal_models.py").resolve(),
+    }
+    required = {
+        Path(_TRAIN.__file__).resolve(),
+        (_TRAIN.PROJECT_ROOT / "scripts/train_svd_snn.py").resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/svd_models.py").resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/svd_temporal_models.py").resolve(),
+        (_TRAIN.SOURCE_ROOT / "snn_rr/models.py").resolve(),
+    }
+    assert required <= {path.resolve() for path in paths}

@@ -20,6 +20,7 @@ import csv
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -495,7 +496,7 @@ def _validate_replaceable_destination(parent_fd: int, name: str) -> None:
 
 def _atomic_publish_immutable(
     path: Path, writer: Any
-) -> None:
+) -> dict[str, Any]:
     """Publish one create-or-replace artifact whose inode is born 0444."""
 
     if path.name not in _KILL_SAFE_OUTPUT_FILENAMES:
@@ -503,12 +504,12 @@ def _atomic_publish_immutable(
     parent_fd = _open_output_parent(path)
     temporary = f".{path.name}.v8r4a-tmp-{secrets.token_hex(16)}"
     descriptor = -1
-    created = False
     published = False
+    published_binding: dict[str, Any] | None = None
     try:
         _validate_replaceable_destination(parent_fd, path.name)
         flags = (
-            os.O_WRONLY
+            os.O_RDWR
             | os.O_CREAT
             | os.O_EXCL
             | getattr(os, "O_CLOEXEC", 0)
@@ -519,7 +520,6 @@ def _atomic_publish_immutable(
             descriptor = os.open(temporary, flags, 0o444, dir_fd=parent_fd)
         finally:
             os.umask(previous_umask)
-        created = True
         born = os.fstat(descriptor)
         if not (
             stat.S_ISREG(born.st_mode)
@@ -529,6 +529,13 @@ def _atomic_publish_immutable(
             raise RuntimeError("V8R4A temporary was not born immutable")
         writer(descriptor)
         os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
         committed = os.fstat(descriptor)
         if not (
             stat.S_ISREG(committed.st_mode)
@@ -555,30 +562,54 @@ def _atomic_publish_immutable(
             == (committed.st_dev, committed.st_ino)
         ):
             raise RuntimeError("published V8R4A output binding drifted")
+        published_binding = {
+            "path": str(path.expanduser().absolute()),
+            "sha256": digest.hexdigest(),
+            "bytes": int(committed.st_size),
+        }
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if created and not published:
-            try:
-                os.unlink(temporary, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
+        # A pathname is not an ownership capability.  On failure an attacker
+        # can rename the descriptor-owned inode and install an unrelated file
+        # at ``temporary``; unlinking by name would then delete caller data.
+        # Preserve every unpublished residue for explicit quarantine.
         os.close(parent_fd)
+    if published_binding is None:  # pragma: no cover - successful replace sets it.
+        raise RuntimeError("V8R4A publication did not return its committed binding")
+    return published_binding
 
 
-def cleanup_stale_atomic_temporaries(output_dir: Path) -> tuple[str, ...]:
-    """Remove only exact, immutable, single-link temporaries from a killed run."""
+def cleanup_stale_atomic_temporaries(
+    output_dir: Path,
+    *,
+    protected_paths: Iterable[Path] = (),
+) -> tuple[str, ...]:
+    """Detect orphan temporaries without claiming ownership of their bytes.
+
+    A filename-shaped 0444 file is not an ownership capability.  No
+    cross-invocation pathname can be deleted safely in a same-user mutable
+    directory, so every match is preserved for explicit quarantine.
+    """
 
     output_dir.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     directory_fd = os.open(output_dir, flags)
-    removed: list[str] = []
+    protected = {
+        path.expanduser().absolute() for path in protected_paths
+    }
+    orphans: list[str] = []
     try:
         for name in sorted(os.listdir(directory_fd)):
             match = _KILL_SAFE_TEMP_PATTERN.fullmatch(name)
             if match is None or match.group(1) not in _KILL_SAFE_OUTPUT_FILENAMES:
                 continue
+            candidate = (output_dir / name).expanduser().absolute()
+            if candidate in protected:
+                raise RuntimeError(
+                    f"stale temporary aliases a protected input; no files were deleted: {name}"
+                )
             status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if not (
                 stat.S_ISREG(status.st_mode)
@@ -588,13 +619,15 @@ def cleanup_stale_atomic_temporaries(output_dir: Path) -> tuple[str, ...]:
                 raise RuntimeError(
                     f"unsafe stale V8R4A temporary requires quarantine: {name}"
                 )
-            os.unlink(name, dir_fd=directory_fd)
-            removed.append(name)
-        if removed:
-            os.fsync(directory_fd)
+            orphans.append(name)
     finally:
         os.close(directory_fd)
-    return tuple(removed)
+    if orphans:
+        raise RuntimeError(
+            "orphan V8R4A temporaries require explicit quarantine; no files "
+            f"were deleted: {orphans}"
+        )
+    return ()
 
 
 def require_immutable_output_artifact(path: Path) -> None:
@@ -614,10 +647,10 @@ def _immutable_output_binding(path: Path) -> dict[str, Any]:
     """Return the exact completed-run binding for one immutable artifact."""
 
     require_immutable_output_artifact(path)
-    status = os.stat(path, follow_symlinks=False)
+    binding, _ = _verified_regular_file(path, required_mode=0o444)
     return {
-        "sha256": sha256_file(path),
-        "bytes": int(status.st_size),
+        "sha256": binding["sha256"],
+        "bytes": binding["bytes"],
         "mode": "0444",
         "nlink": 1,
     }
@@ -662,7 +695,9 @@ def _validate_completed_output_inventory(
     )
 
 
-def atomic_write_json(path: Path, value: Any, *, immutable: bool = True) -> None:
+def atomic_write_json(
+    path: Path, value: Any, *, immutable: bool = True
+) -> dict[str, Any]:
     del immutable  # V8R4A never publishes mutable artifacts.
     payload = (
         json.dumps(
@@ -674,17 +709,19 @@ def atomic_write_json(path: Path, value: Any, *, immutable: bool = True) -> None
         )
         + "\n"
     ).encode("utf-8")
-    _atomic_publish_immutable(path, lambda descriptor: _write_all(descriptor, payload))
+    return _atomic_publish_immutable(
+        path, lambda descriptor: _write_all(descriptor, payload)
+    )
 
 
-def atomic_torch_save(path: Path, value: Any) -> None:
+def atomic_torch_save(path: Path, value: Any) -> dict[str, Any]:
     def writer(descriptor: int) -> None:
         duplicate = os.dup(descriptor)
         with os.fdopen(duplicate, "wb", closefd=True) as stream:
             torch.save(value, stream)
             stream.flush()
 
-    _atomic_publish_immutable(path, writer)
+    return _atomic_publish_immutable(path, writer)
 
 
 def atomic_save_npz(
@@ -692,7 +729,7 @@ def atomic_save_npz(
     arrays: Mapping[str, np.ndarray],
     *,
     immutable: bool = True,
-) -> None:
+) -> dict[str, Any]:
     del immutable  # V8R4A never publishes mutable artifacts.
 
     def writer(descriptor: int) -> None:
@@ -701,7 +738,7 @@ def atomic_save_npz(
             np.savez_compressed(stream, **arrays)
             stream.flush()
 
-    _atomic_publish_immutable(path, writer)
+    return _atomic_publish_immutable(path, writer)
 
 
 def _positions_sha256(positions: np.ndarray) -> str:
@@ -874,6 +911,7 @@ class Experiment:
     anchor_available: AuditedRowArray
     proposer_stack: Path
     row_access_audit: RowAccessAudit
+    consumed_source_files: dict[str, dict[str, Any]]
 
 
 @dataclass(slots=True)
@@ -908,7 +946,8 @@ class PredictionBundle:
 
 
 def _load_contract() -> dict[str, Any]:
-    document = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    _, raw = _capture_verified_file(CONTRACT_PATH)
+    document = _strict_json_bytes(raw, CONTRACT_PATH)
     if document.get("campaign_id") != CAMPAIGN_ID:
         raise RuntimeError("adaptive v3r1 contract campaign binding drifted")
     if not document.get("implementation_authorization", {}).get("authorized_now"):
@@ -1034,6 +1073,117 @@ def _verified_regular_file(
         )
     finally:
         os.close(descriptor)
+
+
+def _capture_verified_file(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+    required_mode: int | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Return the one byte string that was hashed and will be consumed.
+
+    Validation followed by a second pathname open is an ABA boundary.  This
+    helper deliberately couples provenance and parsing: the parser/loaders
+    below receive only the captured bytes whose digest was checked through the
+    stable ``O_NOFOLLOW`` descriptor.
+    """
+
+    binding, raw = _verified_regular_file(
+        path,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
+        capture_bytes=True,
+        required_mode=required_mode,
+    )
+    if raw is None:  # pragma: no cover - capture_bytes is a local invariant.
+        raise RuntimeError(f"verified byte capture failed: {path}")
+    return binding, raw
+
+
+def _load_torch_bytes(
+    raw: bytes,
+    *,
+    source: Path,
+    map_location: Any,
+) -> Mapping[str, Any]:
+    """Deserialize a provenanced checkpoint without general pickle loading."""
+
+    try:
+        value = torch.load(
+            io.BytesIO(raw),
+            map_location=map_location,
+            weights_only=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"checkpoint is not a weights-only provenanced payload: {source}"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"checkpoint payload must be a mapping: {source}")
+    return value
+
+
+def _load_torch_snapshot(
+    path: Path,
+    *,
+    map_location: Any,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+    required_mode: int | None = None,
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    binding, raw = _capture_verified_file(
+        path,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
+        required_mode=required_mode,
+    )
+    return (
+        _load_torch_bytes(raw, source=path, map_location=map_location),
+        binding,
+    )
+
+
+def _assert_file_binding_current(binding: Mapping[str, Any]) -> None:
+    """Fail when a pathname no longer names the exact consumed source bytes."""
+
+    if set(binding) != {"path", "sha256", "bytes"}:
+        raise RuntimeError("consumed input binding schema drifted")
+    current, _ = _verified_regular_file(
+        Path(str(binding["path"])),
+        expected_sha256=str(binding["sha256"]),
+        expected_bytes=int(binding["bytes"]),
+    )
+    if current != dict(binding):
+        raise RuntimeError(f"consumed input path binding drifted: {binding['path']}")
+
+
+def _assert_file_bindings_current(bindings: Mapping[str, Mapping[str, Any]]) -> None:
+    for name in sorted(bindings):
+        try:
+            _assert_file_binding_current(bindings[name])
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"consumed source drifted before publication: {name}") from error
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            _json_ready(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("reuse context is not canonical JSON") from error
+
+
+def _exact_json_equal(left: Any, right: Any) -> bool:
+    """Strict JSON equality (in particular, never alias ``True`` with ``1``)."""
+
+    return _canonical_json_bytes(left) == _canonical_json_bytes(right)
 
 
 def verify_bound_regular_file(
@@ -1254,24 +1404,56 @@ def load_experiment(
         root, outer_fold=int(outer_fold)
     )
     proposer_record = manifest["inputs"]["proposer_stack"]
-    proposer_binding, _ = _verified_regular_file(
+    proposer_binding, proposer_raw = _capture_verified_file(
         stack_path,
         expected_sha256=str(proposer_record["sha256"]),
         expected_bytes=int(proposer_record["bytes"]),
     )
     cache_input_binding["proposer_stack"] = proposer_binding
-    feature_names = tuple(load_and_validate_feature_names(root / "feature_names.json"))
-    if len(feature_names) != 571:
-        raise RuntimeError("DHFER-SNN-v3r1 requires exactly 571 node features")
+
+    # Every payload is captured through the same descriptor that establishes
+    # its digest.  All parsers below consume these private byte strings only;
+    # no validated source pathname is reopened.
+    consumed_source_files: dict[str, dict[str, Any]] = {
+        "manifest": dict(cache_input_binding["manifest"]),
+        "proposer_stack": dict(proposer_binding),
+    }
+    payloads: dict[str, bytes] = {}
+    for logical_name, filename in REQUIRED_CACHE_OUTPUTS.items():
+        record = cache_input_binding["outputs"][logical_name]
+        binding, raw = _capture_verified_file(
+            root / filename,
+            expected_sha256=str(record["sha256"]),
+            expected_bytes=int(record["bytes"]),
+        )
+        payloads[logical_name] = raw
+        consumed_source_files[logical_name] = binding
+
+    feature_path = root / REQUIRED_CACHE_OUTPUTS["feature_names"]
+    feature_document = _strict_json_bytes(payloads["feature_names"], feature_path)
+    names = feature_document.get("node_feature_names")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise RuntimeError("feature_names.json node_feature_names schema drifted")
+    feature_names = tuple(names)
+    if (
+        len(feature_names) != 571
+        or len(set(feature_names)) != len(feature_names)
+        or semantic_sha256(list(feature_names))
+        != EXPECTED_FEATURE_NAMES_SEMANTIC_SHA256
+    ):
+        raise RuntimeError("DHFER-SNN-v3r1 feature-name contract drifted")
     metadata_path = root / "metadata.csv"
-    header = pd.read_csv(metadata_path, nrows=0)
+    metadata_raw = payloads["metadata"]
+    header = pd.read_csv(io.BytesIO(metadata_raw), nrows=0)
     if tuple(map(str, header.columns)) != NONOUTER_METADATA_COLUMNS:
         raise RuntimeError("V8R4 nonouter metadata has an unexpected column schema")
 
     # Establish the physical exclusion boundary before asking the CSV parser
     # for identity, classical context, or reference columns.  This is a real
     # reader boundary, not a post-read row filter.
-    topology = pd.read_csv(metadata_path, usecols=["cache_index", "fold"])
+    topology = pd.read_csv(
+        io.BytesIO(metadata_raw), usecols=["cache_index", "fold"]
+    )
     cache_index = topology["cache_index"].to_numpy(np.int64, copy=True)
     folds = topology["fold"].to_numpy(np.int16, copy=True)
     if (
@@ -1288,8 +1470,7 @@ def load_experiment(
     ):
         raise RuntimeError("V8R4 training pack is not the exact physical nonouter fold cover")
     local_to_global = np.load(
-        root / "local_to_global_cache_index.npy",
-        mmap_mode="r",
+        io.BytesIO(payloads["local_to_global_cache_index"]),
         allow_pickle=False,
     )
     if not (
@@ -1304,7 +1485,7 @@ def load_experiment(
         for name in NONOUTER_METADATA_COLUMNS
         if name not in {"rr_bpm", "reference_valid"}
     ]
-    metadata = pd.read_csv(metadata_path, usecols=context_columns)
+    metadata = pd.read_csv(io.BytesIO(metadata_raw), usecols=context_columns)
     if not (
         np.array_equal(metadata["cache_index"].to_numpy(np.int64), cache_index)
         and np.array_equal(metadata["fold"].to_numpy(np.int16), folds)
@@ -1320,7 +1501,7 @@ def load_experiment(
     excluded_reference_rows = np.flatnonzero(np.isin(folds, sorted(excluded_folds)))
     skipped_csv_lines = frozenset(map(int, excluded_reference_rows + 1))
     labels = pd.read_csv(
-        metadata_path,
+        io.BytesIO(metadata_raw),
         usecols=["cache_index", "rr_bpm", "reference_valid"],
         skiprows=lambda line: int(line) in skipped_csv_lines,
     )
@@ -1335,10 +1516,10 @@ def load_experiment(
     metadata.loc[expected_non_test, "reference_valid"] = labels[
         "reference_valid"
     ].astype(bool).to_numpy()
-    node = np.load(root / "node_features.npy", mmap_mode="r", allow_pickle=False)
-    candidate_rr = np.load(root / "candidate_bpm.npy", mmap_mode="r", allow_pickle=False)
-    candidate_mask = np.load(root / "candidate_mask.npy", mmap_mode="r", allow_pickle=False)
-    radar = np.load(root / "joint_radar_mask.npy", mmap_mode="r", allow_pickle=False)
+    node = np.load(io.BytesIO(payloads["node_features"]), allow_pickle=False)
+    candidate_rr = np.load(io.BytesIO(payloads["candidate_bpm"]), allow_pickle=False)
+    candidate_mask = np.load(io.BytesIO(payloads["candidate_mask"]), allow_pickle=False)
+    radar = np.load(io.BytesIO(payloads["joint_radar_mask"]), allow_pickle=False)
     if node.shape != (*candidate_rr.shape, 571):
         raise RuntimeError("cache node/candidate shape or feature width drifted")
     if candidate_mask.shape != candidate_rr.shape or radar.shape != (len(metadata), 3):
@@ -1346,7 +1527,7 @@ def load_experiment(
     if len(metadata) != candidate_rr.shape[0] or candidate_rr.shape[1] > 12:
         raise RuntimeError("cache row or maximum-candidate contract drifted")
 
-    with np.load(stack_path, allow_pickle=False) as stack:
+    with np.load(io.BytesIO(proposer_raw), allow_pickle=False) as stack:
         expected_stack_fields = {
             "classification",
             "campaign_revision",
@@ -1424,6 +1605,7 @@ def load_experiment(
         AuditedRowArray(anchor_available, audit, "proposer_available"),
         stack_path,
         audit,
+        consumed_source_files,
     )
 
 
@@ -2171,24 +2353,8 @@ def validate_pretrain_authorization(
 
 
 def _strict_json(path: Path) -> dict[str, Any]:
-    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise RuntimeError(f"duplicate JSON key in {path}: {key}")
-            result[key] = value
-        return result
-
-    value = json.loads(
-        path.read_text(encoding="utf-8"),
-        object_pairs_hook=unique,
-        parse_constant=lambda value: (_ for _ in ()).throw(
-            RuntimeError(f"non-finite JSON constant in {path}: {value}")
-        ),
-    )
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{path} must contain a JSON object")
-    return value
+    _, raw = _capture_verified_file(path)
+    return _strict_json_bytes(raw, path)
 
 
 def _selection_authority_module() -> Any:
@@ -2877,9 +3043,27 @@ def _save_scaler(path: Path, scaler: OuterTrainFeatureStandardizer) -> dict[str,
 
 
 def _load_scaler(path: Path) -> OuterTrainFeatureStandardizer:
-    if hasattr(OuterTrainFeatureStandardizer, "load_json"):
-        return OuterTrainFeatureStandardizer.load_json(path)
-    return OuterTrainFeatureStandardizer.from_state(_strict_json(path))
+    scaler, _ = _load_scaler_snapshot(path)
+    return scaler
+
+
+def _load_scaler_snapshot(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+    required_mode: int | None = None,
+) -> tuple[OuterTrainFeatureStandardizer, dict[str, Any]]:
+    binding, raw = _capture_verified_file(
+        path,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
+        required_mode=required_mode,
+    )
+    document = _strict_json_bytes(raw, path)
+    if "semantic_receipt" not in document:
+        raise RuntimeError("scaler JSON semantic_receipt is required")
+    return OuterTrainFeatureStandardizer.from_state(document), binding
 
 
 def _source_bindings() -> dict[str, Any]:
@@ -2891,27 +3075,36 @@ def _source_bindings() -> dict[str, Any]:
     )
     layout = PROJECT_ROOT / "src/snn_rr/harmonic_feature_layout_v3r1.py"
     validator = PROJECT_ROOT / "scripts/validate_hfr_v3r1_authorization.py"
-    return {
-        name: {
-            "path": str(path),
-            "sha256": sha256_file(path),
-            "bytes": path.stat().st_size,
-        }
-        for name, path in (
-            ("trainer", trainer),
-            ("model", model),
-            ("feature_layout", layout),
-            ("authorization_validator", validator),
-            ("contract", CONTRACT_PATH),
-            ("inherited_config", CONFIG_PATH),
-        )
-    }
+    bindings: dict[str, Any] = {}
+    for name, path in (
+        ("trainer", trainer),
+        ("model", model),
+        ("feature_layout", layout),
+        ("authorization_validator", validator),
+        ("contract", CONTRACT_PATH),
+        ("inherited_config", CONFIG_PATH),
+    ):
+        binding, _ = _verified_regular_file(path)
+        bindings[name] = binding
+    return bindings
 
 
 def _rng_checkpoint_state() -> dict[str, Any]:
+    numpy_state = np.random.get_state()
     return {
         "python_rng_state": random.getstate(),
-        "numpy_rng_state": np.random.get_state(),
+        # A raw NumPy ndarray requires a general-pickle global during
+        # ``torch.load``.  Store the state as tensors/primitives so every
+        # checkpoint remains compatible with ``weights_only=True``.
+        "numpy_rng_state": {
+            "bit_generator": str(numpy_state[0]),
+            "keys": torch.as_tensor(
+                np.asarray(numpy_state[1], dtype=np.uint32).astype(np.int64)
+            ),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
     }
@@ -2919,7 +3112,27 @@ def _rng_checkpoint_state() -> dict[str, Any]:
 
 def _restore_rng_checkpoint_state(checkpoint: Mapping[str, Any]) -> None:
     random.setstate(checkpoint["python_rng_state"])
-    np.random.set_state(checkpoint["numpy_rng_state"])
+    numpy_state = checkpoint["numpy_rng_state"]
+    if not isinstance(numpy_state, Mapping) or set(numpy_state) != {
+        "bit_generator",
+        "keys",
+        "position",
+        "has_gauss",
+        "cached_gaussian",
+    }:
+        raise RuntimeError("resume checkpoint NumPy RNG state is not weights-only safe")
+    keys = numpy_state["keys"]
+    if not isinstance(keys, Tensor):
+        raise RuntimeError("resume checkpoint NumPy RNG keys must be a tensor")
+    np.random.set_state(
+        (
+            str(numpy_state["bit_generator"]),
+            keys.detach().cpu().numpy().astype(np.uint32, copy=True),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
     torch.set_rng_state(checkpoint["torch_rng_state"])
     if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all"):
         torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
@@ -2994,10 +3207,15 @@ def _checkpoint_selection_metrics(
     )
 
 
-def _validate_completed_lock(output_dir: Path) -> dict[str, Any]:
+def _validate_completed_lock(
+    output_dir: Path,
+    *,
+    expected_reuse_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     path = output_dir / "checkpoint_selection_lock.json"
     require_immutable_output_artifact(path)
-    lock = _strict_json(path)
+    lock_binding, lock_raw = _capture_verified_file(path, required_mode=0o444)
+    lock = _strict_json_bytes(lock_raw, path)
     _validate_completed_output_inventory(output_dir, lock)
     if not (
         lock.get("campaign_revision") == CAMPAIGN_REVISION
@@ -3009,6 +3227,8 @@ def _validate_completed_lock(output_dir: Path) -> dict[str, Any]:
         and lock["row_access_audit"].get("implicit_whole_array_conversions") == 0
     ):
         raise RuntimeError("completed checkpoint lacks the V8R4 physical boundary attestation")
+    artifact_raw: dict[str, bytes] = {}
+    artifact_bindings: dict[str, dict[str, Any]] = {}
     for key, filename in (
         ("best_checkpoint_sha256", "best.pt"),
         ("last_checkpoint_sha256", "last.pt"),
@@ -3019,15 +3239,78 @@ def _validate_completed_lock(output_dir: Path) -> dict[str, Any]:
         ("validation_metrics_sha256", "validation_metrics.json"),
     ):
         require_immutable_output_artifact(output_dir / filename)
-        if lock.get(key) != sha256_file(output_dir / filename):
-            raise RuntimeError(f"completed checkpoint selection lock binding drifted: {filename}")
-    manifest = _strict_json(output_dir / "run_manifest.json")
-    last_checkpoint = output_dir / "last.pt"
-    require_immutable_output_artifact(last_checkpoint)
-    last = torch.load(last_checkpoint, map_location="cpu", weights_only=False)
+        binding, raw = _capture_verified_file(
+            output_dir / filename,
+            expected_sha256=str(lock.get(key)),
+            required_mode=0o444,
+        )
+        inventory = lock["completed_output_inventory"][filename]
+        if binding["bytes"] != inventory.get("bytes"):
+            raise RuntimeError(
+                f"completed checkpoint selection lock byte binding drifted: {filename}"
+            )
+        artifact_raw[filename] = raw
+        artifact_bindings[filename] = binding
+    manifest = _strict_json_bytes(
+        artifact_raw["run_manifest.json"], output_dir / "run_manifest.json"
+    )
+    last = _load_torch_bytes(
+        artifact_raw["last.pt"],
+        source=output_dir / "last.pt",
+        map_location="cpu",
+    )
+    best = _load_torch_bytes(
+        artifact_raw["best.pt"],
+        source=output_dir / "best.pt",
+        map_location="cpu",
+    )
     validate_v8r4_resume_checkpoint(last)
-    history_document = _strict_json(output_dir / "history.json")
+    history_document = _strict_json_bytes(
+        artifact_raw["history.json"], output_dir / "history.json"
+    )
+    scaler_document = _strict_json_bytes(
+        artifact_raw["scaler.json"], output_dir / "scaler.json"
+    )
+    validation_metrics_document = _strict_json_bytes(
+        artifact_raw["validation_metrics.json"],
+        output_dir / "validation_metrics.json",
+    )
+    if "semantic_receipt" not in scaler_document:
+        raise RuntimeError("completed scaler lacks its semantic receipt")
+    scaler = OuterTrainFeatureStandardizer.from_state(scaler_document)
     history_epochs = history_document.get("epochs")
+    recorded_reuse = lock.get("reuse_context")
+    manifest_reuse = manifest.get("reuse_context")
+    if not (
+        isinstance(recorded_reuse, Mapping)
+        and isinstance(manifest_reuse, Mapping)
+        and recorded_reuse.get("output_directory")
+        == str(output_dir.expanduser().resolve())
+        and _exact_json_equal(recorded_reuse, manifest_reuse)
+        and lock.get("reuse_context_sha256") == semantic_sha256(recorded_reuse)
+        and manifest.get("reuse_context_sha256")
+        == semantic_sha256(manifest_reuse)
+        and all(
+            lock.get(key) == recorded_reuse.get(key)
+            for key in (
+                "campaign_id",
+                "campaign_revision",
+                "campaign_phase",
+                "outer_fold",
+                "validation_fold",
+                "seed",
+                "variant",
+                "release_mode",
+                "run_signature_sha256",
+                "scientific_signature_sha256",
+            )
+        )
+    ):
+        raise RuntimeError("completed run reuse context binding drifted")
+    if expected_reuse_context is not None and not _exact_json_equal(
+        recorded_reuse, expected_reuse_context
+    ):
+        raise RuntimeError("completed run does not match the current exact reuse context")
     if not (
         last.get("run_signature_sha256") == lock.get("run_signature_sha256")
         and last.get("scientific_signature_sha256")
@@ -3040,8 +3323,32 @@ def _validate_completed_lock(output_dir: Path) -> dict[str, Any]:
         == semantic_sha256(history_epochs)
         and semantic_sha256(last.get("best_selection_key"))
         == semantic_sha256(lock.get("checkpoint_selection_key"))
+        and last.get("reuse_context_sha256")
+        == lock.get("reuse_context_sha256")
+        and best.get("campaign_id") == CAMPAIGN_ID
+        and best.get("campaign_revision") == CAMPAIGN_REVISION
+        and best.get("checkpoint_compatibility")
+        == "v8r4_nonouter_training_validation_pack_only"
+        and best.get("run_signature_sha256") == lock.get("run_signature_sha256")
+        and best.get("scientific_signature_sha256")
+        == lock.get("scientific_signature_sha256")
+        and best.get("scaler_sha256") == lock.get("scaler_sha256")
+        and best.get("reuse_context_sha256")
+        == lock.get("reuse_context_sha256")
+        and int(best.get("epoch", -1)) == int(lock.get("best_epoch", -2))
+        and semantic_sha256(best.get("validation_selection_key"))
+        == semantic_sha256(lock.get("checkpoint_selection_key"))
+        and scaler.state_receipt() == scaler_document.get("semantic_receipt")
+        and validation_metrics_document.get("validation_predictions_sha256")
+        == artifact_bindings["validation_predictions.npz"]["sha256"]
+        and validation_metrics_document.get("validation_predictions_bytes")
+        == artifact_bindings["validation_predictions.npz"]["bytes"]
+        and _exact_json_equal(
+            validation_metrics_document.get("consumed_best_checkpoint"),
+            artifact_bindings["best.pt"],
+        )
     ):
-        raise RuntimeError("completed last checkpoint provenance binding drifted")
+        raise RuntimeError("completed checkpoint/scaler provenance binding drifted")
     signature = manifest.get("scientific_signature")
     if not isinstance(signature, Mapping):
         raise RuntimeError("completed run manifest lacks its scientific signature")
@@ -3049,8 +3356,12 @@ def _validate_completed_lock(output_dir: Path) -> dict[str, Any]:
     if not (
         manifest.get("scientific_signature_sha256") == signature_sha
         and lock.get("scientific_signature_sha256") == signature_sha
+        and manifest.get("run_signature_sha256")
+        == lock.get("run_signature_sha256")
     ):
         raise RuntimeError("completed scientific signature binding drifted")
+    _assert_file_binding_current(lock_binding)
+    _assert_file_bindings_current(artifact_bindings)
     return lock
 
 
@@ -3066,6 +3377,7 @@ def validate_v8r4_resume_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     required = {
         "run_signature_sha256",
         "scientific_signature_sha256",
+        "reuse_context_sha256",
         "scaler_sha256",
         "epoch",
         "stale",
@@ -3083,6 +3395,104 @@ def validate_v8r4_resume_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     missing = sorted(required - set(checkpoint))
     if missing:
         raise RuntimeError(f"V8R4 resume checkpoint fields missing: {missing}")
+    numpy_state = checkpoint.get("numpy_rng_state")
+    if not (
+        isinstance(numpy_state, Mapping)
+        and set(numpy_state)
+        == {
+            "bit_generator",
+            "keys",
+            "position",
+            "has_gauss",
+            "cached_gaussian",
+        }
+        and isinstance(numpy_state.get("keys"), Tensor)
+    ):
+        raise RuntimeError("V8R4 resume checkpoint NumPy RNG state is unsafe")
+
+
+def _exact_authorization_mapping_equal(
+    supplied: Mapping[str, Any], fresh: Mapping[str, Any]
+) -> bool:
+    """Compare authorization results as strict canonical JSON values.
+
+    Python mapping equality aliases ``True`` with ``1``.  Authorization
+    evidence is JSON, so compare its canonical bytes instead and reject any
+    non-JSON caller value rather than normalizing it.
+    """
+
+    try:
+        supplied_bytes = json.dumps(
+            dict(supplied),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        fresh_bytes = json.dumps(
+            dict(fresh),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "caller pretrain authorization is not canonical JSON"
+        ) from error
+    return supplied_bytes == fresh_bytes
+
+
+def _fresh_entry_authorization(
+    args: argparse.Namespace,
+    *,
+    execution_phase: str,
+    supplied_pretrain: Mapping[str, Any] | None,
+    admitted_binding: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    """Revalidate the complete live authorization at an imported API entry.
+
+    ``main`` performs an early admission check, but training, prediction, and
+    the efficiency benchmark are also importable APIs.  They must not trust a
+    mapping validated by their caller.  The live admitted-child binding,
+    phase, context, target capability, and authorization files are replayed
+    here before any entry can inspect a cache or checkpoint, create an output
+    directory, initialize CUDA, or construct a model.
+    """
+
+    expected_context = args.expected_admitted_context_json
+    if not isinstance(expected_context, Mapping):
+        raise RuntimeError("entry authorization requires independent admitted context")
+    active_binding = (
+        _admitted_child_binding_for_cli(phase=execution_phase)
+        if admitted_binding is None
+        else admitted_binding
+    )
+    if not isinstance(active_binding, Mapping):
+        raise RuntimeError("entry authorization requires an admitted-child binding")
+    _validate_admitted_cli_scope(
+        args,
+        active_binding,
+        phase=execution_phase,
+        expected_context=expected_context,
+    )
+    fresh = validate_pretrain_authorization(
+        active_binding,
+        target_sealed_capability_receipt=(
+            args.target_sealed_capability_receipt.expanduser().resolve()
+        ),
+        expected_phase=execution_phase,
+        expected_context=expected_context,
+        expected_outer_fold=int(args.outer_fold),
+    )
+    if supplied_pretrain is not None:
+        if not isinstance(supplied_pretrain, Mapping):
+            raise RuntimeError("caller pretrain authorization must be a mapping")
+        if not _exact_authorization_mapping_equal(supplied_pretrain, fresh):
+            raise RuntimeError(
+                "caller pretrain authorization differs from fresh entry validation"
+            )
+    return fresh, active_binding
 
 
 def train(
@@ -3091,10 +3501,17 @@ def train(
     pretrain: Mapping[str, Any] | None = None,
     admitted_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # Governance validation must precede cache metadata, reference labels, and
-    # every training action.
-    pretrain = (
-        validate_pretrain_authorization() if pretrain is None else dict(pretrain)
+    # This imported entry owns a fresh governance replay.  A caller-provided
+    # result is comparison material only and can never authorize execution.
+    pretrain, admitted_binding = _fresh_entry_authorization(
+        args,
+        execution_phase=(
+            "discovery"
+            if args.campaign_phase == "discovery"
+            else "promotion_training"
+        ),
+        supplied_pretrain=pretrain,
+        admitted_binding=admitted_binding,
     )
     phase_binding = validate_phase_authorization(
         phase=args.campaign_phase,
@@ -3106,17 +3523,23 @@ def train(
         admitted_binding=admitted_binding,
     )
     output_dir = args.output_dir.expanduser().resolve()
+    cache_root = args.cache.expanduser().resolve()
+    proposer_path = args.proposer_stack.expanduser().resolve()
+    if (
+        output_dir == cache_root
+        or cache_root in output_dir.parents
+        or output_dir in cache_root.parents
+        or proposer_path == output_dir
+        or proposer_path.parent == output_dir
+    ):
+        raise RuntimeError("training output must be disjoint from cache/proposer inputs")
     output_dir.mkdir(parents=True, exist_ok=True)
-    cleanup_stale_atomic_temporaries(output_dir)
+    cleanup_stale_atomic_temporaries(
+        output_dir, protected_paths=(proposer_path,)
+    )
     lock_path = output_dir / "checkpoint_selection_lock.json"
-    if lock_path.exists():
-        if not args.resume:
-            raise RuntimeError("completed output already exists; pass --resume to verify")
-        return {
-            "status": "already_complete",
-            "output_dir": str(output_dir),
-            "checkpoint_selection_lock": _validate_completed_lock(output_dir),
-        }
+    if lock_path.exists() and not args.resume:
+        raise RuntimeError("completed output already exists; pass --resume to verify")
     contract = _load_contract()
     seed_everything(int(args.seed), bool(args.deterministic))
     device = torch.device(args.device)
@@ -3124,7 +3547,7 @@ def train(
         raise RuntimeError("CUDA was requested but is unavailable")
     amp_enabled = bool(args.amp) and device.type == "cuda"
     experiment = load_experiment(
-        args.cache, args.proposer_stack,
+        cache_root, proposer_path,
         outer_fold=int(args.outer_fold), seed=int(args.seed),
     )
     promotion_pack_binding = experiment.cache_input_binding.get(
@@ -3151,22 +3574,24 @@ def train(
         raise RuntimeError("outer-test rows crossed the training/validation boundary")
 
     source_bindings = _source_bindings()
-    cache_manifest_path = experiment.root / "manifest.json"
     input_bindings = {
-        "cache_manifest": {
-            "path": str(cache_manifest_path),
-            "sha256": sha256_file(cache_manifest_path),
-        },
+        "cache_manifest": copy.deepcopy(
+            experiment.cache_input_binding["manifest"]
+        ),
         "verified_cache_inputs": copy.deepcopy(experiment.cache_input_binding),
         "feature_names": {
             "path": str(experiment.root / "feature_names.json"),
-            "sha256": sha256_file(experiment.root / "feature_names.json"),
+            "sha256": experiment.cache_input_binding["outputs"]["feature_names"][
+                "sha256"
+            ],
+            "bytes": experiment.cache_input_binding["outputs"]["feature_names"][
+                "bytes"
+            ],
             "semantic_sha256": EXPECTED_FEATURE_NAMES_SEMANTIC_SHA256,
         },
-        "proposer_stack": {
-            "path": str(experiment.proposer_stack),
-            "sha256": sha256_file(experiment.proposer_stack),
-        },
+        "proposer_stack": copy.deepcopy(
+            experiment.cache_input_binding["proposer_stack"]
+        ),
     }
     effective = {
         "campaign_id": CAMPAIGN_ID,
@@ -3180,6 +3605,7 @@ def train(
         "validation_fold": validation_fold,
         "seed": int(args.seed),
         "variant": args.variant,
+        "release_mode": args.release_mode,
         "model": _model_configuration(args.variant),
         "optimization": {
             "epochs": int(args.epochs),
@@ -3238,7 +3664,7 @@ def train(
         "campaign_id": CAMPAIGN_ID,
         "campaign_revision": CAMPAIGN_REVISION,
         "classification": effective["classification"],
-        "contract_file_sha256": sha256_file(CONTRACT_PATH),
+        "contract_file_sha256": source_bindings["contract"]["sha256"],
         "outer_fold": int(args.outer_fold),
         "validation_fold": validation_fold,
         "seed": int(args.seed),
@@ -3277,16 +3703,92 @@ def train(
     scientific_signature_sha = scientific_signature_sha256(scientific_signature)
     run_signature = semantic_sha256(effective)
     manifest_path = output_dir / "run_manifest.json"
+    scaler_path = output_dir / "scaler.json"
+    if scaler_path.exists():
+        require_immutable_output_artifact(scaler_path)
+        scaler, scaler_binding = _load_scaler_snapshot(
+            scaler_path, required_mode=0o444
+        )
+    else:
+        scaler = fit_outer_train_standardizer(experiment, train_positions)
+        _save_scaler(scaler_path, scaler)
+        scaler, scaler_binding = _load_scaler_snapshot(
+            scaler_path, required_mode=0o444
+        )
+    scaler_sha = str(scaler_binding["sha256"])
+    reuse_context = _json_ready(
+        {
+            "schema_version": 1,
+            "campaign_id": CAMPAIGN_ID,
+            "campaign_revision": CAMPAIGN_REVISION,
+            "campaign_phase": args.campaign_phase,
+            "outer_fold": int(args.outer_fold),
+            "validation_fold": int(validation_fold),
+            "seed": int(args.seed),
+            "variant": str(args.variant),
+            "release_mode": str(args.release_mode),
+            "output_directory": str(output_dir),
+            "semantic_arguments": {
+                "mode": str(args.mode),
+                "cache": str(args.cache.expanduser().resolve()),
+                "proposer_stack": str(args.proposer_stack.expanduser().resolve()),
+                "promotion_authorization": (
+                    None
+                    if args.promotion_authorization is None
+                    else str(args.promotion_authorization.expanduser().resolve())
+                ),
+                "target_sealed_capability_receipt": str(
+                    args.target_sealed_capability_receipt.expanduser().resolve()
+                ),
+                "device": str(args.device),
+                "amp": bool(args.amp),
+                "deterministic": bool(args.deterministic),
+                "epochs": int(args.epochs),
+                "minimum_epochs": int(args.minimum_epochs),
+                "patience": int(args.patience),
+                "learning_rate": float(args.learning_rate),
+                "weight_decay": float(args.weight_decay),
+                "chunk_windows": int(args.chunk_windows),
+                "warmup_windows": int(args.warmup_windows),
+                "gradient_accumulation_sessions": int(
+                    args.gradient_accumulation_sessions
+                ),
+                "gradient_clip": float(args.gradient_clip),
+                "smoke_test": bool(args.smoke_test),
+            },
+            "authorization": {"pretrain": pretrain, "phase": phase_binding},
+            "source_bindings": source_bindings,
+            "input_bindings": input_bindings,
+            "population": population,
+            "effective_configuration": effective,
+            "run_signature_sha256": run_signature,
+            "scientific_signature_sha256": scientific_signature_sha,
+            "scaler": scaler_binding,
+            "scaler_semantic_receipt": scaler.state_receipt(),
+        }
+    )
+    reuse_context_sha = semantic_sha256(reuse_context)
     if manifest_path.exists():
         require_immutable_output_artifact(manifest_path)
         existing = _strict_json(manifest_path)
-        if existing.get("run_signature_sha256") != run_signature:
-            raise RuntimeError("--resume effective configuration differs from run manifest")
         if not (
-            existing.get("scientific_signature") == scientific_signature
-            and existing.get("scientific_signature_sha256") == scientific_signature_sha
+            existing.get("run_signature_sha256") == run_signature
+            and existing.get("scientific_signature_sha256")
+            == scientific_signature_sha
+            and _exact_json_equal(
+                existing.get("scientific_signature"), scientific_signature
+            )
+            and existing.get("reuse_context_sha256") == reuse_context_sha
+            and _exact_json_equal(existing.get("reuse_context"), reuse_context)
+            and _exact_json_equal(
+                existing.get("effective_configuration"), effective
+            )
+            and _exact_json_equal(existing.get("population"), population)
         ):
-            raise RuntimeError("--resume scientific signature differs from run manifest")
+            raise RuntimeError(
+                "--resume current authorization/configuration/input binding differs "
+                "from run manifest"
+            )
         if not args.resume:
             raise RuntimeError("output directory is non-empty; pass --resume")
     else:
@@ -3297,20 +3799,27 @@ def train(
             "run_signature_sha256": run_signature,
             "scientific_signature": scientific_signature,
             "scientific_signature_sha256": scientific_signature_sha,
+            "reuse_context": reuse_context,
+            "reuse_context_sha256": reuse_context_sha,
             "effective_configuration": effective,
             "population": population,
             "leakage_boundary": copy.deepcopy(DISCOVERY_LEAKAGE_BOUNDARY_DECLARATION),
         }
         atomic_write_json(manifest_path, manifest)
 
-    scaler_path = output_dir / "scaler.json"
-    if scaler_path.exists():
-        require_immutable_output_artifact(scaler_path)
-        scaler = _load_scaler(scaler_path)
-    else:
-        scaler = fit_outer_train_standardizer(experiment, train_positions)
-        _save_scaler(scaler_path, scaler)
-    scaler_sha = sha256_file(scaler_path)
+    if lock_path.exists():
+        _assert_file_bindings_current(experiment.consumed_source_files)
+        _assert_file_bindings_current(source_bindings)
+        validated_completed_lock = _validate_completed_lock(
+            output_dir, expected_reuse_context=reuse_context
+        )
+        _assert_file_bindings_current(experiment.consumed_source_files)
+        _assert_file_bindings_current(source_bindings)
+        return {
+            "status": "already_complete",
+            "output_dir": str(output_dir),
+            "checkpoint_selection_lock": validated_completed_lock,
+        }
 
     model = build_model(args.variant, device)
     optimizer = torch.optim.AdamW(
@@ -3336,12 +3845,18 @@ def train(
             require_immutable_output_artifact(best_path)
         if history_path.exists():
             require_immutable_output_artifact(history_path)
-        checkpoint = torch.load(last_path, map_location=device, weights_only=False)
+        checkpoint, _ = _load_torch_snapshot(
+            last_path,
+            map_location=device,
+            required_mode=0o444,
+        )
         validate_v8r4_resume_checkpoint(checkpoint)
         if checkpoint.get("run_signature_sha256") != run_signature:
             raise RuntimeError("resume checkpoint run signature drifted")
         if checkpoint.get("scaler_sha256") != scaler_sha:
             raise RuntimeError("resume checkpoint scaler binding drifted")
+        if checkpoint.get("reuse_context_sha256") != reuse_context_sha:
+            raise RuntimeError("resume checkpoint exact reuse context drifted")
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         gradient_scaler.load_state_dict(checkpoint["gradient_scaler_state"])
@@ -3407,6 +3922,7 @@ def train(
                     "classification": effective["classification"],
                     "run_signature_sha256": run_signature,
                     "scientific_signature_sha256": scientific_signature_sha,
+                    "reuse_context_sha256": reuse_context_sha,
                     "model_configuration": _model_configuration(args.variant),
                     "model_state": model.state_dict(),
                     "variant": args.variant,
@@ -3441,6 +3957,7 @@ def train(
                 ),
                 "run_signature_sha256": run_signature,
                 "scientific_signature_sha256": scientific_signature_sha,
+                "reuse_context_sha256": reuse_context_sha,
                 "scaler_sha256": scaler_sha,
                 "epoch": epoch + 1,
                 "stale": stale,
@@ -3468,7 +3985,19 @@ def train(
     if not best_path.exists():
         raise RuntimeError("training produced no validation-selected checkpoint")
     require_immutable_output_artifact(best_path)
-    checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+    checkpoint, best_checkpoint_binding = _load_torch_snapshot(
+        best_path,
+        map_location=device,
+        required_mode=0o444,
+    )
+    if not (
+        checkpoint.get("run_signature_sha256") == run_signature
+        and checkpoint.get("scientific_signature_sha256")
+        == scientific_signature_sha
+        and checkpoint.get("reuse_context_sha256") == reuse_context_sha
+        and checkpoint.get("scaler_sha256") == scaler_sha
+    ):
+        raise RuntimeError("best checkpoint exact run binding drifted")
     model.load_state_dict(checkpoint["model_state"])
     validation_bundle = predict_experiment_positions(
         model, experiment, validation_positions, scaler, device,
@@ -3477,15 +4006,24 @@ def train(
     validation_arrays, validation_metrics_document = _validation_artifacts(
         validation_bundle, experiment, validation_positions
     )
+    _assert_file_binding_current(best_checkpoint_binding)
+    _assert_file_bindings_current(experiment.consumed_source_files)
+    _assert_file_bindings_current(source_bindings)
     validation_npz = output_dir / "validation_predictions.npz"
     validation_metrics_path = output_dir / "validation_metrics.json"
-    atomic_save_npz(validation_npz, validation_arrays)
+    validation_prediction_binding = atomic_save_npz(
+        validation_npz, validation_arrays
+    )
     validation_metrics_document.update(
         {
             "schema_version": SCHEMA_VERSION,
             "best_epoch": int(checkpoint["epoch"]),
             "checkpoint_selection_key": checkpoint["validation_selection_key"],
-            "validation_predictions_sha256": sha256_file(validation_npz),
+            "validation_predictions_sha256": validation_prediction_binding[
+                "sha256"
+            ],
+            "validation_predictions_bytes": validation_prediction_binding["bytes"],
+            "consumed_best_checkpoint": best_checkpoint_binding,
             "commercial_claim_allowed": False,
         }
     )
@@ -3497,6 +4035,10 @@ def train(
         and access_audit["implicit_whole_array_conversions"] == 0
     ):
         raise RuntimeError("V8R4 row-access audit observed a boundary violation")
+    _assert_file_bindings_current(experiment.consumed_source_files)
+    _assert_file_bindings_current(source_bindings)
+    _assert_file_binding_current(best_checkpoint_binding)
+    _assert_file_binding_current(validation_prediction_binding)
     completed_output_inventory = {
         filename: _immutable_output_binding(output_dir / filename)
         for filename in sorted(
@@ -3504,6 +4046,17 @@ def train(
             - {"checkpoint_selection_lock.json"}
         )
     }
+    if not (
+        completed_output_inventory["best.pt"]["sha256"]
+        == best_checkpoint_binding["sha256"]
+        and completed_output_inventory["best.pt"]["bytes"]
+        == best_checkpoint_binding["bytes"]
+        and completed_output_inventory["validation_predictions.npz"]["sha256"]
+        == validation_prediction_binding["sha256"]
+        and completed_output_inventory["validation_predictions.npz"]["bytes"]
+        == validation_prediction_binding["bytes"]
+    ):
+        raise RuntimeError("consumed checkpoint/prediction changed before lock publication")
     lock = {
         "schema_version": SCHEMA_VERSION,
         "campaign_revision": CAMPAIGN_REVISION,
@@ -3515,24 +4068,35 @@ def train(
         "validation_fold": validation_fold,
         "seed": int(args.seed),
         "variant": args.variant,
+        "release_mode": args.release_mode,
         "best_epoch": int(checkpoint["epoch"]),
         "checkpoint_selection_key": checkpoint["validation_selection_key"],
         "run_signature_sha256": run_signature,
         "scientific_signature_sha256": scientific_signature_sha,
-        "best_checkpoint_sha256": sha256_file(best_path),
-        "last_checkpoint_sha256": sha256_file(last_path),
+        "reuse_context": reuse_context,
+        "reuse_context_sha256": reuse_context_sha,
+        "best_checkpoint_sha256": best_checkpoint_binding["sha256"],
+        "last_checkpoint_sha256": completed_output_inventory["last.pt"]["sha256"],
         "scaler_sha256": scaler_sha,
-        "history_sha256": sha256_file(history_path),
-        "run_manifest_sha256": sha256_file(manifest_path),
-        "validation_predictions_sha256": sha256_file(validation_npz),
-        "validation_metrics_sha256": sha256_file(validation_metrics_path),
+        "history_sha256": completed_output_inventory["history.json"]["sha256"],
+        "run_manifest_sha256": completed_output_inventory["run_manifest.json"][
+            "sha256"
+        ],
+        "validation_predictions_sha256": completed_output_inventory[
+            "validation_predictions.npz"
+        ]["sha256"],
+        "validation_metrics_sha256": completed_output_inventory[
+            "validation_metrics.json"
+        ]["sha256"],
         "completed_output_inventory": completed_output_inventory,
         "leakage_boundary": copy.deepcopy(DISCOVERY_LEAKAGE_BOUNDARY_DECLARATION),
         "row_access_audit": access_audit,
         "commercial_claim_allowed": False,
     }
     atomic_write_json(lock_path, lock, immutable=True)
-    validated_lock = _validate_completed_lock(output_dir)
+    validated_lock = _validate_completed_lock(
+        output_dir, expected_reuse_context=reuse_context
+    )
     return {
         "status": "checkpoint_locked",
         "output_dir": str(output_dir),
@@ -3673,10 +4237,14 @@ def run_efficiency_benchmark(
     may persist only the returned strict timing telemetry.
     """
 
-    pretrain = (
-        validate_pretrain_authorization(admitted_binding)
-        if pretrain is None
-        else dict(pretrain)
+    # The imported benchmark is a separately guarded entry.  A caller's
+    # prevalidated dictionary is comparison material only; it can never grant
+    # cache/CUDA/model access by itself.
+    pretrain, admitted_binding = _fresh_entry_authorization(
+        args,
+        execution_phase="efficiency_benchmark",
+        supplied_pretrain=pretrain,
+        admitted_binding=admitted_binding,
     )
     if not (
         pretrain.get("valid") is True
@@ -3823,9 +4391,232 @@ def run_efficiency_benchmark(
     return telemetry
 
 
-def load_sanitized_inference_input(path: Path) -> InferenceArrays:
+def _resolve_prediction_pack_artifact(
+    *,
+    index_path: Path,
+    unit_relative: str,
+    record: Any,
+    filename: str,
+) -> dict[str, Any]:
+    if not (
+        isinstance(record, Mapping)
+        and set(record) == {"path", "sha256", "bytes"}
+        and record.get("path") == f"{unit_relative}/{filename}"
+    ):
+        raise RuntimeError(f"prediction pack artifact binding drifted: {filename}")
+    source = (index_path.parent / str(record["path"])).resolve()
+    expected = (index_path.parent / unit_relative / filename).resolve()
+    if source != expected or index_path.parent.resolve() not in source.parents:
+        raise RuntimeError(f"prediction pack artifact escaped its unit: {filename}")
+    binding, _ = _verified_regular_file(
+        source,
+        expected_sha256=str(record["sha256"]),
+        expected_bytes=int(record["bytes"]),
+        required_mode=0o444,
+    )
+    return binding
+
+
+def _prediction_model_authority(
+    args: argparse.Namespace,
+    *,
+    pretrain: Mapping[str, Any],
+    phase_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve the exact model/input bytes authorized by the sealed pack.
+
+    Variant/fold/seed are not a checkpoint capability.  Promotion inference is
+    authorized only when the target-scoped receipt binds a model-bound shard
+    index whose unit binds the exact packed checkpoint, scaler and sanitized
+    input bytes.  Absence of that external pointer is a terminal boundary.
+    """
+
+    capability = pretrain.get("capability_document")
+    index_record = (
+        capability.get("sealed_pack_index")
+        if isinstance(capability, Mapping)
+        else None
+    )
+    if not (
+        args.campaign_phase == "promotion"
+        and phase_binding.get("phase") == "promotion"
+        and isinstance(capability, Mapping)
+        and capability.get("classification")
+        == "adaptive_v3r1_v8r4a_outer_target_sealed_runtime_capability_receipt"
+        and capability.get("campaign_id") == CAMPAIGN_ID
+        and capability.get("campaign_revision") == CAMPAIGN_REVISION
+        and capability.get("phase") == "promotion_prediction"
+        and capability.get("outer_fold") == int(args.outer_fold)
+        and isinstance(index_record, Mapping)
+        and {"path", "sha256", "bytes"} <= set(index_record)
+    ):
+        raise RuntimeError(
+            "promotion prediction lacks an exact target-sealed model authority"
+        )
+    index_path = Path(str(index_record["path"])).expanduser().resolve()
+    index_binding, index_raw = _capture_verified_file(
+        index_path,
+        expected_sha256=str(index_record["sha256"]),
+        expected_bytes=int(index_record["bytes"]),
+        required_mode=0o444,
+    )
+    index = _strict_json_bytes(index_raw, index_path)
+    units = index.get("units")
+    if not (
+        index.get("schema_version") == 1
+        and index.get("classification")
+        == "adaptive_v3r1_v8r4a_model_bound_target_free_prediction_shard_index"
+        and index.get("campaign_id") == CAMPAIGN_ID
+        and index.get("campaign_revision") == CAMPAIGN_REVISION
+        and index.get("outer_fold") == int(args.outer_fold)
+        and index.get("selected_variant") == args.variant
+        and index.get("status") == "complete"
+        and index.get("completed_units") == 3
+        and index.get("unit_count") == 3
+        and index.get("outer_test_opened") is False
+        and index.get("physical_target_free_input_and_model_packs") is True
+        and index.get("source_paths_or_peer_outputs_authorized_in_child") is False
+        and index.get("content_sha256")
+        == semantic_sha256(
+            {key: value for key, value in index.items() if key != "content_sha256"}
+        )
+        and isinstance(units, list)
+        and len(units) == 3
+    ):
+        raise RuntimeError("target-sealed prediction shard index drifted")
+    governance = phase_binding.get("governance")
+    promotion_binding = (
+        governance.get("promotion_authorization")
+        if isinstance(governance, Mapping)
+        else None
+    )
+    if not (
+        isinstance(promotion_binding, Mapping)
+        and isinstance(index.get("promotion_authorization"), Mapping)
+        and all(
+            index["promotion_authorization"].get(key)
+            == promotion_binding.get(key)
+            for key in ("sha256", "bytes")
+        )
+    ):
+        raise RuntimeError("prediction pack promotion authority drifted")
+    matching = [
+        row
+        for row in units
+        if isinstance(row, Mapping)
+        and row.get("outer_fold") == int(args.outer_fold)
+        and row.get("seed") == int(args.seed)
+    ]
+    if len(matching) != 1:
+        raise RuntimeError("prediction pack does not contain the exact requested unit")
+    unit = matching[0]
+    unit_relative = unit.get("relative_path")
+    artifacts = unit.get("artifacts")
+    expected_relative = f"units/outer_{int(args.outer_fold)}_seed_{int(args.seed)}"
+    if not (
+        unit_relative == expected_relative
+        and isinstance(artifacts, Mapping)
+        and set(artifacts)
+        == {
+            "prediction_pack_manifest",
+            "model_bound_prediction_pack_manifest",
+            "outer_predict_input",
+            "model_checkpoint",
+            "model_scaler",
+            "model_source_capability",
+        }
+        and isinstance(unit.get("scientific_signature_sha256"), str)
+        and len(str(unit["scientific_signature_sha256"])) == 64
+    ):
+        raise RuntimeError("prediction pack unit authority schema drifted")
+    checkpoint = _resolve_prediction_pack_artifact(
+        index_path=index_path,
+        unit_relative=expected_relative,
+        record=artifacts["model_checkpoint"],
+        filename="model_checkpoint.pt",
+    )
+    scaler = _resolve_prediction_pack_artifact(
+        index_path=index_path,
+        unit_relative=expected_relative,
+        record=artifacts["model_scaler"],
+        filename="model_scaler.json",
+    )
+    predict_input = _resolve_prediction_pack_artifact(
+        index_path=index_path,
+        unit_relative=expected_relative,
+        record=artifacts["outer_predict_input"],
+        filename="outer_predict_input.npz",
+    )
+    source_capability_binding, source_capability_raw = _capture_verified_file(
+        Path(
+            _resolve_prediction_pack_artifact(
+                index_path=index_path,
+                unit_relative=expected_relative,
+                record=artifacts["model_source_capability"],
+                filename="MODEL_SOURCE_CAPABILITY.json",
+            )["path"]
+        ),
+        expected_sha256=str(artifacts["model_source_capability"]["sha256"]),
+        expected_bytes=int(artifacts["model_source_capability"]["bytes"]),
+        required_mode=0o444,
+    )
+    source_capability = _strict_json_bytes(
+        source_capability_raw, Path(source_capability_binding["path"])
+    )
+    packed_checkpoint = source_capability.get("packed_checkpoint")
+    packed_scaler = source_capability.get("packed_scaler")
+    if not (
+        source_capability.get("schema_version") == 1
+        and source_capability.get("classification")
+        == "adaptive_v3r1_v8r4a_promotion_model_source_capability"
+        and source_capability.get("campaign_id") == CAMPAIGN_ID
+        and source_capability.get("campaign_revision") == CAMPAIGN_REVISION
+        and source_capability.get("outer_fold") == int(args.outer_fold)
+        and source_capability.get("seed") == int(args.seed)
+        and source_capability.get("selected_variant") == args.variant
+        and source_capability.get("scientific_signature_sha256")
+        == unit.get("scientific_signature_sha256")
+        and source_capability.get("source_deep_validated_before_copy") is True
+        and source_capability.get("source_paths_or_peer_outputs_authorized_in_child")
+        is False
+        and source_capability.get("model_bytes_changed") is False
+        and source_capability.get("commercial_or_confirmatory_claim_allowed") is False
+        and source_capability.get("content_sha256")
+        == semantic_sha256(
+            {
+                key: value
+                for key, value in source_capability.items()
+                if key != "content_sha256"
+            }
+        )
+        and isinstance(packed_checkpoint, Mapping)
+        and packed_checkpoint.get("sha256") == checkpoint["sha256"]
+        and packed_checkpoint.get("bytes") == checkpoint["bytes"]
+        and isinstance(packed_scaler, Mapping)
+        and packed_scaler.get("sha256") == scaler["sha256"]
+        and packed_scaler.get("bytes") == scaler["bytes"]
+    ):
+        raise RuntimeError("packed model-source capability drifted")
+    return {
+        "schema_version": 1,
+        "index": index_binding,
+        "model_source_capability": source_capability_binding,
+        "checkpoint": checkpoint,
+        "scaler": scaler,
+        "predict_input": predict_input,
+        "scientific_signature_sha256": unit["scientific_signature_sha256"],
+        "source_receipt": source_capability.get("source_receipt"),
+    }
+
+
+def load_sanitized_inference_input(
+    path: Path,
+    *,
+    return_binding: bool = False,
+) -> InferenceArrays | tuple[InferenceArrays, dict[str, Any]]:
     source = path.expanduser().resolve()
-    with np.load(source, allow_pickle=False) as archive:
+    binding, raw = _capture_verified_file(source)
+    with np.load(io.BytesIO(raw), allow_pickle=False) as archive:
         actual = frozenset(archive.files)
         if actual != PREDICT_INPUT_KEYS:
             missing = sorted(PREDICT_INPUT_KEYS - actual)
@@ -3884,10 +4675,11 @@ def load_sanitized_inference_input(path: Path) -> InferenceArrays:
     # This target-free call also validates every available candidate and all
     # structural shapes before the model sees the bytes.
     _build_availability(candidate, candidate_mask, radar)
-    return InferenceArrays(
+    arrays = InferenceArrays(
         cache_index, node, candidate, candidate_mask, radar,
         anchor_rr, anchor_std, anchor_available, classical, reset,
     )
+    return (arrays, binding) if return_binding else arrays
 
 
 def predict_target_free(
@@ -3896,8 +4688,13 @@ def predict_target_free(
     pretrain: Mapping[str, Any] | None = None,
     admitted_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    pretrain = (
-        validate_pretrain_authorization() if pretrain is None else dict(pretrain)
+    # Prediction is an independently guarded imported entry, not a trusted
+    # continuation of ``main`` or an orchestration caller.
+    pretrain, admitted_binding = _fresh_entry_authorization(
+        args,
+        execution_phase="promotion_prediction",
+        supplied_pretrain=pretrain,
+        admitted_binding=admitted_binding,
     )
     phase_binding = validate_phase_authorization(
         phase=args.campaign_phase,
@@ -3909,34 +4706,57 @@ def predict_target_free(
         admitted_binding=admitted_binding,
     )
     output_dir = args.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cleanup_stale_atomic_temporaries(output_dir)
     prediction_path = output_dir / "predictions.npz"
     manifest_path = output_dir / "prediction_manifest.json"
-    prediction_exists = prediction_path.exists()
-    manifest_exists = manifest_path.exists()
-    if prediction_exists:
-        require_immutable_output_artifact(prediction_path)
-    if manifest_exists:
-        require_immutable_output_artifact(manifest_path)
-    if prediction_exists and manifest_exists:
-        if not args.resume:
-            raise RuntimeError("target-free prediction output already exists")
-        manifest = _strict_json(manifest_path)
-        if manifest.get("predictions_sha256") != sha256_file(prediction_path):
-            raise RuntimeError("existing target-free prediction binding drifted")
-        return {"status": "already_predicted", "prediction_manifest": manifest}
-    if manifest_exists and not prediction_exists:
-        raise RuntimeError("prediction manifest exists without its bound predictions")
+    checkpoint_path = args.checkpoint.expanduser().resolve()
+    scaler_path = args.scaler.expanduser().resolve()
+    predict_input_path = args.predict_input.expanduser().resolve()
+    protected = {checkpoint_path, scaler_path, predict_input_path}
+    if (
+        prediction_path in protected
+        or manifest_path in protected
+        or any(path.parent == output_dir for path in protected)
+    ):
+        raise RuntimeError("prediction outputs must be disjoint from protected inputs")
+    model_authority = _prediction_model_authority(
+        args, pretrain=pretrain, phase_binding=phase_binding
+    )
+    if not (
+        model_authority.get("checkpoint", {}).get("path") == str(checkpoint_path)
+        and model_authority.get("scaler", {}).get("path") == str(scaler_path)
+        and model_authority.get("predict_input", {}).get("path")
+        == str(predict_input_path)
+    ):
+        raise RuntimeError(
+            "prediction checkpoint/scaler/input paths differ from sealed authority"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_atomic_temporaries(
+        output_dir, protected_paths=protected
+    )
     _load_contract()
     seed_everything(int(args.seed), bool(args.deterministic))
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    checkpoint_path = args.checkpoint.expanduser().resolve()
-    scaler_path = args.scaler.expanduser().resolve()
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if checkpoint.get("campaign_id") != CAMPAIGN_ID:
+    checkpoint, checkpoint_binding = _load_torch_snapshot(
+        checkpoint_path, map_location=device
+    )
+    scaler, scaler_binding = _load_scaler_snapshot(scaler_path)
+    if not (
+        _exact_json_equal(checkpoint_binding, model_authority["checkpoint"])
+        and _exact_json_equal(scaler_binding, model_authority["scaler"])
+        and checkpoint.get("campaign_id") == CAMPAIGN_ID
+        and checkpoint.get("campaign_revision") == CAMPAIGN_REVISION
+        and checkpoint.get("checkpoint_compatibility")
+        == "v8r4_nonouter_training_validation_pack_only"
+        and isinstance(checkpoint.get("model_state"), Mapping)
+        and isinstance(checkpoint.get("run_signature_sha256"), str)
+        and isinstance(checkpoint.get("scientific_signature_sha256"), str)
+        and isinstance(checkpoint.get("reuse_context_sha256"), str)
+        and checkpoint.get("scientific_signature_sha256")
+        == model_authority.get("scientific_signature_sha256")
+    ):
         raise RuntimeError("checkpoint campaign binding drifted")
     if checkpoint.get("variant") != args.variant:
         raise RuntimeError("checkpoint variant differs from --variant")
@@ -3944,7 +4764,7 @@ def predict_target_free(
         raise RuntimeError("checkpoint outer_fold differs from --outer-fold")
     if int(checkpoint.get("seed", -1)) != int(args.seed):
         raise RuntimeError("checkpoint seed differs from --seed")
-    if checkpoint.get("scaler_sha256") != sha256_file(scaler_path):
+    if checkpoint.get("scaler_sha256") != scaler_binding["sha256"]:
         raise RuntimeError("checkpoint scaler SHA-256 binding drifted")
     if args.campaign_phase == "promotion":
         authorization = _strict_json(args.promotion_authorization.expanduser().resolve())
@@ -3955,8 +4775,114 @@ def predict_target_free(
 
     # Only after governance and checkpoint validation do we open the sanitized
     # input.  Its loader has no code path for a reference-bearing archive.
-    arrays = load_sanitized_inference_input(args.predict_input)
-    scaler = _load_scaler(scaler_path)
+    loaded = load_sanitized_inference_input(
+        predict_input_path, return_binding=True
+    )
+    if not isinstance(loaded, tuple):  # pragma: no cover - local API invariant.
+        raise RuntimeError("sanitized inference snapshot binding was not returned")
+    arrays, predict_input_binding = loaded
+    if not _exact_json_equal(
+        predict_input_binding, model_authority["predict_input"]
+    ):
+        raise RuntimeError("sanitized input bytes differ from sealed model authority")
+    source_bindings = _source_bindings()
+    prediction_source_bindings = {
+        "checkpoint": checkpoint_binding,
+        "scaler": scaler_binding,
+        "predict_input": predict_input_binding,
+        "sealed_pack_index": model_authority["index"],
+        "model_source_capability": model_authority[
+            "model_source_capability"
+        ],
+    }
+    prediction_reuse_context = _json_ready(
+        {
+            "schema_version": 1,
+            "campaign_id": CAMPAIGN_ID,
+            "campaign_revision": CAMPAIGN_REVISION,
+            "campaign_phase": args.campaign_phase,
+            "outer_fold": int(args.outer_fold),
+            "seed": int(args.seed),
+            "variant": str(args.variant),
+            "release_mode": str(args.release_mode),
+            "output_directory": str(output_dir),
+            "arguments": {
+                "mode": str(args.mode),
+                "device": str(args.device),
+                "amp": bool(args.amp),
+                "deterministic": bool(args.deterministic),
+                "chunk_windows": int(args.chunk_windows),
+                "promotion_authorization": (
+                    None
+                    if args.promotion_authorization is None
+                    else str(args.promotion_authorization.expanduser().resolve())
+                ),
+                "target_sealed_capability_receipt": str(
+                    args.target_sealed_capability_receipt.expanduser().resolve()
+                ),
+            },
+            "authorization": {"pretrain": pretrain, "phase": phase_binding},
+            "source_bindings": source_bindings,
+            "checkpoint": checkpoint_binding,
+            "checkpoint_provenance": {
+                "run_signature_sha256": checkpoint["run_signature_sha256"],
+                "scientific_signature_sha256": checkpoint[
+                    "scientific_signature_sha256"
+                ],
+                "reuse_context_sha256": checkpoint["reuse_context_sha256"],
+                "scaler_sha256": checkpoint["scaler_sha256"],
+            },
+            "scaler": scaler_binding,
+            "scaler_semantic_receipt": scaler.state_receipt(),
+            "predict_input": predict_input_binding,
+            "predict_input_fields": sorted(PREDICT_INPUT_KEYS),
+            "sealed_model_authority": model_authority,
+        }
+    )
+    prediction_reuse_sha = semantic_sha256(prediction_reuse_context)
+    prediction_exists = prediction_path.exists()
+    manifest_exists = manifest_path.exists()
+    if prediction_exists:
+        require_immutable_output_artifact(prediction_path)
+    if manifest_exists:
+        require_immutable_output_artifact(manifest_path)
+    if prediction_exists and manifest_exists:
+        if not args.resume:
+            raise RuntimeError("target-free prediction output already exists")
+        manifest_binding, manifest_raw = _capture_verified_file(
+            manifest_path, required_mode=0o444
+        )
+        manifest = _strict_json_bytes(manifest_raw, manifest_path)
+        prediction_binding, _ = _verified_regular_file(
+            prediction_path,
+            expected_sha256=str(manifest.get("predictions_sha256")),
+            expected_bytes=manifest.get("predictions_bytes"),
+            required_mode=0o444,
+        )
+        if not (
+            manifest.get("prediction_reuse_context_sha256")
+            == prediction_reuse_sha
+            and _exact_json_equal(
+                manifest.get("prediction_reuse_context"),
+                prediction_reuse_context,
+            )
+            and manifest.get("predictions_sha256")
+            == prediction_binding["sha256"]
+        ):
+            raise RuntimeError(
+                "existing target-free prediction does not match current exact inputs"
+            )
+        _assert_file_bindings_current(source_bindings)
+        _assert_file_bindings_current(prediction_source_bindings)
+        _assert_file_bindings_current(
+            {
+                "prediction_manifest": manifest_binding,
+                "predictions": prediction_binding,
+            }
+        )
+        return {"status": "already_predicted", "prediction_manifest": manifest}
+    if manifest_exists and not prediction_exists:
+        raise RuntimeError("prediction manifest exists without its bound predictions")
     model = build_model(args.variant, device)
     model.load_state_dict(checkpoint["model_state"])
     bundle = predict_inference_arrays(
@@ -3991,7 +4917,10 @@ def predict_target_free(
     if prediction_exists:
         if not args.resume:
             raise RuntimeError("partial target-free prediction output already exists")
-        with np.load(prediction_path, allow_pickle=False) as existing:
+        prediction_binding, existing_raw = _capture_verified_file(
+            prediction_path, required_mode=0o444
+        )
+        with np.load(io.BytesIO(existing_raw), allow_pickle=False) as existing:
             if tuple(existing.files) != PREDICTION_KEYS:
                 raise RuntimeError("partial target-free prediction schema drifted")
             for name, expected in output_arrays.items():
@@ -4003,7 +4932,14 @@ def predict_target_free(
                         f"partial target-free prediction bytes disagree at {name}"
                     )
     else:
-        atomic_save_npz(prediction_path, output_arrays, immutable=True)
+        _assert_file_bindings_current(source_bindings)
+        _assert_file_bindings_current(prediction_source_bindings)
+        prediction_binding = atomic_save_npz(
+            prediction_path, output_arrays, immutable=True
+        )
+    _assert_file_binding_current(prediction_binding)
+    _assert_file_bindings_current(source_bindings)
+    _assert_file_bindings_current(prediction_source_bindings)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "created_utc": utc_now(),
@@ -4017,15 +4953,17 @@ def predict_target_free(
         "fixed_confidence_switch_probability_min": 0.80,
         "row_count": len(arrays.cache_index),
         "predict_input": {
-            "path": str(args.predict_input.expanduser().resolve()),
-            "sha256": sha256_file(args.predict_input.expanduser().resolve()),
+            **predict_input_binding,
             "fields": sorted(PREDICT_INPUT_KEYS),
         },
-        "checkpoint": {"path": str(checkpoint_path), "sha256": sha256_file(checkpoint_path)},
-        "scaler": {"path": str(scaler_path), "sha256": sha256_file(scaler_path)},
-        "source_bindings": _source_bindings(),
+        "checkpoint": checkpoint_binding,
+        "scaler": scaler_binding,
+        "source_bindings": source_bindings,
         "authorization": {"pretrain": pretrain, "phase": phase_binding},
-        "predictions_sha256": sha256_file(prediction_path),
+        "prediction_reuse_context": prediction_reuse_context,
+        "prediction_reuse_context_sha256": prediction_reuse_sha,
+        "predictions_sha256": prediction_binding["sha256"],
+        "predictions_bytes": prediction_binding["bytes"],
         "prediction_fields": list(output_arrays),
         "target_fields_accepted": False,
         "target_fields_emitted": False,
@@ -4034,6 +4972,7 @@ def predict_target_free(
         "commercial_claim_allowed": False,
     }
     atomic_write_json(manifest_path, manifest, immutable=True)
+    _assert_file_binding_current(prediction_binding)
     return {"status": "target_free_prediction_complete", "prediction_manifest": manifest}
 
 

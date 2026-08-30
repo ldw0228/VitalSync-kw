@@ -266,6 +266,112 @@ def test_missing_radar_uses_one_joint_fail_closed_mask() -> None:
     assert not np.any(svd.values[0, 0, 1:])
 
 
+def test_explicit_true_mask_preserves_finite_all_zero_measurements() -> None:
+    frequencies, maps, spectra, attributes = _synthetic_evidence()
+    maps.fill(0.0)
+    spectra.fill(0.0)
+    explicit = np.ones((1, 3), dtype=np.bool_)
+    joint = resolve_joint_radar_mask(
+        maps,
+        spectra,
+        svd_attributes=attributes,
+        explicit_mask=explicit,
+    )
+    np.testing.assert_array_equal(joint, explicit)
+
+    candidates = _one_candidate()
+    rf = sample_rf_harmonic_support(
+        maps, frequencies, candidates, radar_mask=joint, ratios=(1.0,)
+    )
+    svd = sample_svd_harmonic_support(
+        spectra,
+        attributes,
+        frequencies,
+        candidates,
+        radar_mask=joint,
+        ratios=(1.0,),
+    )
+    np.testing.assert_array_equal(rf.radar_mask, explicit)
+    np.testing.assert_array_equal(svd.radar_mask, explicit)
+    assert rf.mask[0, 0].all() and svd.mask[0, 0].all()
+    assert np.count_nonzero(rf.values) == 0
+    assert np.count_nonzero(svd.values) == 0
+
+    with pytest.raises(ValueError, match="boolean"):
+        resolve_joint_radar_mask(
+            maps,
+            spectra,
+            svd_attributes=attributes,
+            explicit_mask=explicit.astype(np.int8),
+        )
+
+
+def test_unavailable_radar_peak_never_enters_candidate_sources() -> None:
+    bank = build_candidate_bank(
+        proposal_bpm=np.asarray([[10.0]], dtype=np.float32),
+        proposal_confidence=np.asarray([[0.9]], dtype=np.float32),
+        classical_rr_bpm=np.asarray([np.nan]),
+        classical_confidence=np.asarray([0.0]),
+        radar_peaks_bpm=np.asarray([[10.0, 20.0, 30.0]], dtype=np.float32),
+        radar_peak_confidence=np.asarray([[0.8, 0.7, 0.6]], dtype=np.float32),
+        radar_mask=np.asarray([[False, True, True]], dtype=np.bool_),
+    )
+    radar1 = int(CandidateSource.RADAR_PEAK_1)
+    radar2 = int(CandidateSource.RADAR_PEAK_2)
+    radar3 = int(CandidateSource.RADAR_PEAK_3)
+    assert not bank.source_mask[..., radar1].any()
+    assert bank.source_mask[..., radar2].any()
+    assert bank.source_mask[..., radar3].any()
+    ten = int(np.flatnonzero(np.isclose(bank.bpm[0], 10.0) & bank.mask[0])[0])
+    assert bank.source_mask[0, ten, int(CandidateSource.BASE)]
+    assert not bank.source_mask[0, ten, radar1]
+    assert bank.source_confidence[0, ten, radar1] == 0.0
+
+
+def test_explicit_classical_availability_is_boolean_and_never_numeric_inferred() -> None:
+    bank = build_candidate_bank(
+        proposal_bpm=np.empty((2, 0), dtype=np.float32),
+        classical_rr_bpm=np.asarray([10.0, 10.0], dtype=np.float32),
+        classical_confidence=np.asarray([0.9, 0.9], dtype=np.float32),
+        classical_available=np.asarray([False, True], dtype=np.bool_),
+        radar_peaks_bpm=np.full((2, 3), np.nan, dtype=np.float32),
+    )
+    classical = np.asarray(
+        [int(CandidateSource.CLASSICAL_X1) + offset for offset in range(4)]
+    )
+    assert not bank.source_mask[0, :, classical].any()
+    assert not bank.mask[0].any()
+    assert bank.source_mask[1, :, classical].any()
+    np.testing.assert_array_equal(
+        bank.bpm[1, bank.mask[1]], np.asarray([10.0, 20.0, 30.0, 40.0])
+    )
+
+    radar_only = build_candidate_bank(
+        classical_rr_bpm=np.asarray([10.0], dtype=np.float32),
+        classical_confidence=np.asarray([0.9], dtype=np.float32),
+        classical_available=np.asarray([False], dtype=np.bool_),
+        radar_peaks_bpm=np.asarray([[11.0, np.nan, np.nan]], dtype=np.float32),
+        radar_mask=np.asarray([[True, False, False]], dtype=np.bool_),
+    )
+    radar_index = int(np.flatnonzero(radar_only.mask[0])[0])
+    assert radar_only.bpm[0, radar_index] == np.float32(11.0)
+    assert radar_only.confidence[0, radar_index] == np.float32(0.0)
+    assert (
+        radar_only.source_confidence[
+            0, radar_index, int(CandidateSource.RADAR_PEAK_1)
+        ]
+        == np.float32(0.0)
+    )
+
+    with pytest.raises(ValueError, match="classical_available must be boolean"):
+        build_candidate_bank(
+            classical_rr_bpm=np.asarray([10.0]),
+            classical_confidence=np.asarray([0.0]),
+            classical_available=np.asarray([0], dtype=np.int8),
+            radar_peaks_bpm=np.full((1, 3), np.nan),
+        )
+
+
 def test_compact_nodes_keep_top_range_location_and_are_fixed_width() -> None:
     frequencies, maps, spectra, attributes = _synthetic_evidence()
     candidates = _one_candidate()
@@ -318,6 +424,33 @@ def test_lazy_builder_slices_rows_and_keeps_feature_schema_constant() -> None:
     assert batches[0].nodes.feature_names == batches[1].nodes.feature_names
     assert batches[0].rf_support.values.shape[0] == 1
     assert batches[0].svd_support.values.shape[0] == 1
+
+
+@pytest.mark.parametrize(
+    "mask",
+    (
+        np.ones((2, 3), dtype=np.int8),
+        np.ones((2, 3), dtype=np.float32),
+        np.full((2, 3), np.nan, dtype=np.float32),
+    ),
+)
+def test_lazy_builder_rejects_nonboolean_explicit_radar_mask(
+    mask: np.ndarray,
+) -> None:
+    frequencies, maps, spectra, attributes = _synthetic_evidence(rows=2)
+    with pytest.raises(ValueError, match="boolean dtype"):
+        list(
+            iter_compact_node_feature_batches(
+                maps,
+                frequencies,
+                spectra,
+                attributes,
+                frequencies,
+                _one_candidate(rows=2),
+                explicit_radar_mask=mask,
+                batch_size=1,
+            )
+        )
 
 
 def _semantic_frame() -> pd.DataFrame:

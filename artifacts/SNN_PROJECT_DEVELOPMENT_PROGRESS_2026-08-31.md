@@ -1,9 +1,14 @@
-# SnnProject 개발 진행상황 — acquisition v2 causal-bound checkpoint
+# SnnProject 개발 진행상황 — acquisition v2 + Goal v3 hardening checkpoint
 
 - 기준 시각: 2026-08-31, Asia/Seoul
 - 대상: 3대 XeThru UWB radar 기반 호흡수 추정 hybrid/SNN 연구 시스템
 - 증거 수준: 18명 retrospective cohort
 - 제품 판정: 상용·의료 제품 아님, 내부 상용 정확도 gate `0/6`
+
+현재 실행 authority는 이 문서와
+`artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md`가 공동 최우선이다. Goal v2, 이전
+execution plan/progress, 보존 release manifest와 `commercial_goal_report.json`은 역사적
+증거이며 현재 training/evaluation/release authorization이 아니다.
 
 ## 1. 이번 실행의 목표
 
@@ -45,7 +50,8 @@ fault campaign, calibration, shadow/canary, rollback 검증 전에는 상용 성
 - BIOPAC 1개, radar metadata 3개, 선택된 모든 radar chunk의 완전한 입력 graph 검증
 - 경로·크기·SHA-256과 선택 session graph를 reconstruction consumer가 독립 재검증
 - config, protocol, spreadsheet, cohort, dataset, raw source의 parse 전후·publish 전후
-  재해시로 TOCTOU 차단
+  binding으로 persistent drift 차단. Active swap-and-revert까지 막으려면 sealed/read-only
+  runtime 또는 same-inode owned snapshot이 추가로 필요
 
 ### 2.3 Measured radar timing
 
@@ -65,7 +71,8 @@ fault campaign, calibration, shadow/canary, rollback 검증 전에는 상용 성
 - 모델: `t_rsp = offset + scale × t_radar`
 - radar motion marker와 RSP marker의 monotonic matching
 - residual, drift, confidence, ambiguity, marker span gate 적용
-- receipt의 marker index/time, residual, mapping, raw/config hash를 재계산
+- receipt 내부 marker index/time, residual, mapping, raw/config hash의 상호 일관성 검증
+- bound raw signal에서 marker/match/mapping을 독립 재계산하는 verifier는 미완료
 - 승인되지 않은 proposal은 diagnostic으로만 사용
 - outer-test target이나 `radar_observable`을 sync feature로 사용하지 않음
 - 수동 승인 receipt를 생성·수정·우회하지 않음
@@ -181,8 +188,20 @@ Root content SHA-256:
 - base CSV/NPZ hash·bytes, cache/reconstruction, six-fold identity ownership,
   checkpoint train/validation/test 분리, label-free forward를 재검증
 - target-equal CSV/NPZ 위조와 train/test identity 겹침을 adversarial test로 차단
-- scientific SVD array는 검증 후 mmap에서 독립된 read-only memory snapshot으로 복사,
-  복사 뒤 원본을 다시 해시해 학습 중 파일 변조 차단
+- scientific SVD와 명시적 historical-legacy 입력은 metadata, array, base OOF,
+  checkpoint, fold/frozen/completion artifact를 same-inode stable byte로 읽어 private
+  read-only snapshot에서만 소비. 복사 뒤 원본과 source/runtime binding을 다시 검사
+- acquisition-v2 scientific feature는 authority가 결합한 base NPZ의
+  `prediction_bpm`, `rr_std_bpm`만 허용. CSV의 임의 추가 column은 inference feature로
+  승격 불가
+- loader가 발급한 exact experiment/receipt object와 method identity만 training entry에서
+  재사용 가능. 복제 dataclass, subclass, temporal completed-fold transplant는 거부
+- identity split은 authoritative session metadata의 same-inode bytes, exact dtype/order,
+  `(row_position, session, physical_identity, reference_valid)` hash와 loader-issued exact
+  DataFrame/authority object를 결합. Clone, caller role swap, post-issuance mutation 거부
+- non-v2 SVD는 기본 training-authorized가 아니며, 명시적
+  `--historical-legacy-reproduction`과 최초 생성하는 고유 output root에서만
+  `historical_noncommercial` 재현 가능
 - `radar_observable`은 target-dependent이므로 추론 feature 금지
 - diagnostic cache를 scientific mode로 넘기면 학습 시작 전에 실패
 
@@ -191,14 +210,16 @@ authority failure다. 이를 우회한 학습 수치는 유효한 개선으로 �
 
 ## 6. 테스트와 재현성
 
-- focused acquisition/cache/train/SVD suites 통과
-- 현재 source에서 full suite 두 번 연속 통과
-- 각 실행: 1,441 collected, 1,437 passed, 4 skipped
-- managed namespace에서 skip된 실제 bubblewrap 4개를 권한 있는 host context에서
-  별도 실행: 4/4 passed
+- 최종 2026-08-31 generation: 1,766 collected
+- full suite 연속 2회: 각각 1,762 passed, 4 skipped
+- managed namespace에서 skip된 실제 bubblewrap 4개: capable host context에서 4/4 passed
+- active V8R4 fixed collection: 739 node IDs, semantic SHA-256
+  `b9b192c084d3f6d69094657bceb9047e368c12cac4e4420c2f75ef3c7fc39df4`
+- changed Python 전체 `py_compile`, config YAML parse, `git diff --check` 통과
 - import-time Torch thread mutation 제거
 - SVD 1×1 projection의 fixed-order accumulation으로 prefix/thread 수치 불안정 제거
-- `py_compile`과 `git diff --check` 통과
+- 이전 중간 generation의 1,545/1,541×2와 backup-time 688/4/2 기록은 역사
+  evidence로 보존하며 현재 최종 결과로 대체해 표현하지 않음
 
 남은 warning은 Python의 multi-threaded `fork()` deprecation warning이며 test failure가
 아니다.
@@ -218,6 +239,10 @@ authority failure다. 이를 우회한 학습 수치는 유효한 개선으로 �
 그 증거로 다시 만든 full scientific cache다. 그 전에는 모델 구조를 반복 학습해도
 정렬 오류를 성능으로 흡수할 가능성이 있어 목표 달성 증거가 되지 않는다. V8R4도
 별도의 CONTEXT1 receipt/source snapshot/pretrain authorization 없이는 시작하지 않는다.
+현 CONTEXT1 generation에는 독립적으로 관리되는 외부 issuer/runner trust root와
+signature verifier가 없어 trio를 발급할 수 없다. Real-bubblewrap 통과, local/self-hash,
+self-signature, constant monkeypatch만으로는 충분하지 않으며 새 governed source
+generation이 필요하다.
 
 실패한 partial cache와 이전 diagnostic artifact는 과학 기록으로 보존했다.
 
@@ -250,3 +275,145 @@ authority failure다. 이를 우회한 학습 수치는 유효한 개선으로 �
 이 명령은 diagnostic artifact를 재현한다. `--acquisition-mode strict`로 바꿔
 우회 학습하는 명령이 아니며, 현재 reconstruction에서는 strict mode가 의도대로
 실패한다.
+
+## 9. Goal v3 전면 hardening generation
+
+이번 generation은 새 OOF 수치를 만들지 않고, 잘못된 데이터나 권한으로 학습이
+시작되는 경로와 V8R5의 알려진 구조 결함을 먼저 폐쇄했다.
+
+### 9.1 학습·추론 entry 권한
+
+- `train.py`, `train_svd_snn.py`: acquisition diagnostic cache는 inspection-only.
+  seed, CUDA, scaler, model, output directory 생성 전에 실패한다.
+- V3R1 factor router의 import 가능한 `train()`과 `predict_target_free()`도 admitted
+  context, phase, capability, authorization, outer-fold binding을 각자 재검증한다.
+- 완료 run/prediction 재사용도 current fold/seed/variant/release/source/cache/args,
+  selected checkpoint/scaler/predict input과 exact 결합한다. Cache/proposer/checkpoint는
+  검증한 동일 private bytes에서만 소비하고 checkpoint load는
+  `BytesIO + weights_only=True`로 제한한다.
+- best/validation/prediction publication과 completed-return 직전에 input·artifact binding을
+  재검증한다. 실패 temp는 filename만으로 ownership을 가정해 삭제하지 않고 explicit
+  quarantine가 끝날 때까지 fail-closed한다.
+- CONTEXT1 validator는 정확한 test node inventory와
+  `0 skip/xfail/xpass/deselect`, real-bubblewrap 4개 PASS도 검사하지만, 현 generation에는
+  독립적으로 관리되는 외부 issuer/runner trust root와 signature verifier가 없다.
+- 따라서 validator는 terminal fail-closed다. Bubblewrap만 통과하거나 local/self-hashed
+  receipt를 만들어도 CONTEXT1 trio를 발급하지 않으며, 새 governed source generation과
+  독립 감사가 필요하다. V8R5 training authorization도 없다.
+
+### 9.2 Harmonic cache·scaler·proposer
+
+- RF/SVD timing-valid mask를 source hash, schema, shape와 함께 결합하고 두 view의
+  all-interval validity를 radar availability로 축약한다.
+- unavailable radar feature는 cache 생성과 scaling 뒤 모두 exact `+0.0`이다.
+- robust scaler는 structurally available cell만 feature별로 fit한다.
+- arbitrary proposer NPZ가 nested label-free ownership을 입증할 수 없으므로 현 builder
+  output은 모두 `trainable: false`다. acquisition cache는 `acquisition_diagnostic`,
+  legacy source는 `retrospective_legacy_unverified_proposer`로 분류한다.
+- harmonic trainer는 manifest content hash, classification, `trainable`을 RNG/output
+  생성 전에 검증한다.
+- harmonic cache는 format v2와 schema ID로 승격하고 exact per-feature availability,
+  571-layout digest, layout source hash, forward output inventory를 결합한다.
+- proposer/RF/SVD input은 load 전 binding과 publication 직전 재해시로 persistent
+  drift를 차단하고, 실제 소비 bytes를 private snapshot으로 복사한 뒤 원본 namespace를
+  재검증한다. Input mmap의 active swap-and-revert가 학습 payload를 바꾸는 경로는
+  폐쇄했지만 Python import 이전에 실행 code를 바꿨다가 복원하는 공격은 별도 sealed
+  launcher/runtime 없이는 폐쇄됐다고 주장하지 않는다.
+
+### 9.3 Custom prediction·동기화·protocol
+
+- custom all-window prediction은 timing mask를 history에 전달하고 unavailable 값을
+  exact zero로 유지한다. Cache는 exact private snapshot에서 소비하고 checkpoint, run
+  config, split, reconstruction, dataset, external authority, source tree와 output 경로는
+  alias/disjoint를 검사한다. Private stable directory와 `O_TMPFILE`/fd publication,
+  no-clobber atomic link 또는 controlled exchange, directory `fsync`, rollback, symlink와
+  output-parent rename/rebind 방어를 적용한다.
+- 실행 초기화 시 disk source binding과 publish 전 drift는 검사하지만 이미 import되어
+  실제로 compile된 loader byte 전체를 증명하지는 못한다. Manifest도
+  `binds_actual_loader_compiled_bytes: false`로 명시하며, externally owned read-only
+  source snapshot을 fresh isolated child에서 import하는 launcher 전에는 production
+  execution authority가 아니다.
+- marker detector는 invalid resampling 구간과 smoothing support 경계를 marker로 쓰지
+  못한다.
+- sync ambiguity는 첫 후보가 아니라 모든 동등 품질 alternative를 검사한다.
+- bool/NaN/Inf/complex/fractional counter 같은 축약 입력을 gate 값으로 받지 않는다.
+- sync/protocol/cohort/workbook config는 hash와 parse를 분리하지 않고 same-inode snapshot
+  bytes를 직접 파싱한다. Workbook session 번호는 exact positive Python `int`만 허용한다.
+- protocol은 config와 동일한 7개 phase의 order/name, 유효한 timing, worst stage status,
+  mean stage confidence를 강제한다. Stage-metric eligibility는 protocol auto와 alignment
+  authority가 모두 있어야 한다.
+- legacy manual approval 문자열은 새 과학 권한을 만들지 못한다.
+
+### 9.4 AxisRiskRouterSNN V8R5
+
+새 구조는 frozen 571-wide layout을 유지한 228,838-parameter 미측정 제안이다.
+
+- evidence 값과 per-feature availability를 radar/ratio/branch/candidate 좌표와
+  pooling 전에 joint encoding
+- ratio→radar와 radar→ratio bidirectional axial attention
+- 7-relation directed harmonic graph, 2 PLIF blocks, 8 simulation steps
+- causal PLIF→ALIF temporal state와 session-boundary reset contract
+- 분리된 anchor/candidate value·route-preference·risk heads의 RR, scale,
+  expected-error, `P(error>2)`, `P(error>5)`
+- soft-routing gradient path와 differentiable expected deployment cost 구현, inference만
+  hard selection; gradient correctness는 synthetic 증거이며 실데이터 routing 개선 미측정
+- tail probability 단조성, quality supervision, route-temperature checkpoint binding
+- float32 masked normalization으로 FP16 autocast all-missing NaN 차단
+- explicit classical-RR availability, no-source quality exact zero, classical-only
+  fallback quality supervision
+- canonical structural mask parity, padded exact-zero, finite/range/state validation
+- invalid target를 float32 변환·산술 전에 안전 치환, valid target 6–45 bpm 강제
+- format-v2 cache schema/content/6개 forward payload same-inode 검증
+- checkpoint에 source/config/layout/spiking dependency와 runtime-structure canonical uint8
+  receipt 저장. Fresh runtime attributes, live buffer, checkpoint receipt를 삼자 비교
+- strict load 전 exact key/shape/dtype/layout/finite private preflight, `assign=False`, 실패 시
+  live model 무변이·transactional rollback
+- parameter/buffer/raw-head/graph/PLIF/ALIF/route/streaming state nonfinite를 source별 차단.
+  learned source가 오염되면 finite classical fallback, 없으면 unavailable exact-zero와
+  quality untrusted/exact-zero
+
+74개 전용 CPU synthetic test는 shape, gradient, mask parity, permutation, streaming,
+autocast, transactional checkpoint/cache round-trip과 NaN/Inf fail-closed를 검증한다.
+417개 named parameter/buffer NaN/±Inf 주입에서 trusted deploy output·streaming state
+nonfinite 위반은 0이었다. 실제 data authority와 CUDA가 없으므로
+학습·성능 측정은 하지 않았고 정확도 leader와 상용 gate `0/6`은 그대로다.
+
+### 9.5 평가·prospective 계약 hardening
+
+- 여섯 accuracy threshold와 inclusive operator, 세 fixed seed, full denominator,
+  fallback 포함, no-estimate fail-closed를 YAML에 기계 판독 가능하게 고정
+- G1–G4 authority 재구축 뒤 authoritative row count/hash를 prediction 전에 동결.
+  기존 2,327 row는 exact bijective crosswalk일 때만 legacy co-primary이며, 다르면
+  historical comparator로만 유지
+- Greedy non-overlap과 8 stride phase를 physical source session별로 선택하고,
+  authoritative session-local `window_number`, selector source/config/selected-key hash를
+  prediction 전에 동결
+- 최소 identity/25–35 support와 별도 35–45 bpm safety gate를 정의. 지원량 미달은
+  통과가 아니라 `insufficient_support`
+- 사전 잠금 campaign당 outer target 공개 1회. 각 hypothesis iteration은
+  inner/discovery validation만 사용하며 공개 후 같은 campaign에서 선택·재교정 금지
+- Final model refit→weight seal→untouched prospective calibration→calibrator seal→untouched
+  confirmation 순서 고정
+- R1/R2/R3에 cohort floor, collection 전 identity-cluster power, one-sided bootstrap 95%
+  accuracy bound, 6–45 support, exclusion/coverage/calibration, seven masks, fault,
+  latency/memory, shadow/canary/rollback 수치를 사전 선언
+
+이 기준은 아직 측정·통과하지 않은 내부 engineering release criteria다. 의료·임상·규제
+보장이 아니다.
+
+### 9.6 남은 실행 경계
+
+1. bound raw signal에서 sync receipt를 독립 재계산하는 verifier
+2. spreadsheet/RSP/config에서 seven-stage decoder를 재실행하는 authority
+3. 새 governed CONTEXT source generation, 외부 issuer/runner trust root와 signature verifier
+4. externally owned source snapshot을 fresh isolated child에서만 import하는 production
+   launcher와 actual compiled-loader provenance
+5. raw XeThru/BIOPAC manifest hash와 실제 장시간 memmap/load bytes를 동일 stable
+   descriptor에 종단 결합하는 source-consumption runtime
+6. measured timing 부적격 10 sessions의 독립 해결
+7. 29-session strict RF/SVD cache와 versioned nested proposer/scaler authority
+8. V8R5 전용 immutable authorization, GPU fixed-update discovery, 3 seeds × 6 folds OOF
+9. 독립 prospective calibration/confirmation과 target-device fault/shadow 검증
+
+현재 상태는 `R0_RESEARCH_ACTIVE`다. Source hardening과 resume-ready 설계는 완료했지만,
+권한 부재를 우회해서 만든 성능 수치는 목표 진척으로 인정하지 않는다.

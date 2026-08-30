@@ -4,7 +4,13 @@
 
 현재 정확도 선두는 주파수 구조를 보존하는 두 12-step SNN의 **validation-locked ensemble**이다. BIOPAC RSP reference QC를 통과한 2,327개 window에서 MAE 1.291 bpm, identity-macro MAE 1.220 bpm을 기록했다. 그러나 사전에 선언한 상용 목표 6개를 모두 통과하지 못했다. 특히 25–35 bpm MAE가 4.216 bpm이다. 따라서 이 저장소는 상용·의료 성능을 입증한 제품이 아니라, 외부 prospective 검증 전 단계의 retrospective 연구 후보이다.
 
-상세 근거는 [REPORT.md](REPORT.md), 2026-08-31 causal acquisition 재구축·실측 상태는 [개발 진행상황](artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md), 상용 목표는 [artifacts/COMMERCIAL_SNN_GOAL_V2.md](artifacts/COMMERCIAL_SNN_GOAL_V2.md), 데이터부터 prospective confirmation·shadow/canary까지 한 번에 잠근 실행 계약은 [artifacts/COMMERCIAL_SNN_MASTER_EXECUTION_PLAN_V3.md](artifacts/COMMERCIAL_SNN_MASTER_EXECUTION_PLAN_V3.md), 최신 반복 감사와 차단 조건은 [artifacts/COMMERCIAL_SNN_PROGRESS_V2.md](artifacts/COMMERCIAL_SNN_PROGRESS_V2.md)에 있다. 최종 release authority는 [artifacts/COMMERCIAL_SNN_RELEASE_MANIFEST_V3.json](artifacts/COMMERCIAL_SNN_RELEASE_MANIFEST_V3.json), 기계 판독 accuracy gate는 [artifacts/commercial_goal_report.json](artifacts/commercial_goal_report.json)이다.
+현재 문서 authority는 [Goal v3](artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md)와
+[2026-08-31 개발 진행상황](artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md)이
+최우선이다. [기술 상태 보고서](artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md)와
+[REPORT.md](REPORT.md)는 동결 결과의 근거다. Goal v2, 이전 master/progress 문서,
+기존 release manifest와 `commercial_goal_report.json`은 역사적 세대의 증거이며 현재
+학습·평가·release authority가 아니다. 서로 충돌하면 Goal v3와 2026-08-31 진행상황을
+따른다.
 
 SNN 학습 방식(STDP, ANN→SNN, surrogate-gradient, PLIF/ALIF, TET, distillation, self-supervised pretraining)의 비교와 이 데이터에 맞춘 최종 권고 구조·loss·평가 계약은 [SNN 학습 방법론과 최종 권고안](artifacts/SNN_TRAINING_METHODOLOGY_RECOMMENDATION_2026-08-30.md)에 정리했다.
 
@@ -38,6 +44,17 @@ SNN 학습 방식(STDP, ANN→SNN, surrogate-gradient, PLIF/ALIF, TET, distillat
 - 정확도 선두 ensemble은 legacy-grid structured SNN과 exact auxiliary-alignment structured SNN을 fold별 validation identity에서만 선택한 convex weight로 조합한다. Outer-test target으로 weight를 고르지 않는다.
 
 두 component는 각각 1,298,548 trainable parameters다. Exact-alignment run의 `--deterministic`은 재현성 설정을 요청하지만, CUDA adaptive-average-pool backward가 deterministic implementation을 제공하지 않는다는 warn-only 경고가 발생하므로 bitwise deterministic 결과를 보장하지 않는다.
+
+차기 `AxisRiskRouterSNNV8R5`는 frozen 571-wide harmonic candidate layout을 쓰는
+228,838-parameter 미측정 제안이다. Governed feature layout과 spiking cell을 source
+hash로 명시적으로 재사용한다. Evidence 값과 per-feature availability를
+radar/ratio/branch/candidate 좌표와 pooling 전에 결합하고, directed harmonic PLIF
+graph, causal PLIF→ALIF state, 분리된 value/route/risk head, explicit classical-RR
+availability, differentiable expected-risk training 및 inference-only hard routing을
+사용한다. Format-v2 cache contract validator와 synthetic correctness test까지
+구현됐고 soft-routing gradient path도 synthetic test로 확인했지만, routing과 정확도
+개선은 실데이터에서 미측정이다. Sync/stage/nested-training authority가 없어 상용
+개선으로 해석하면 안 된다.
 
 ## 핵심 결과
 
@@ -80,76 +97,107 @@ Ensemble uncertainty는 오차 순위를 매기는 score이며 calibrated RR 표
 
 ## 설치와 재현
 
-Python 3.12 환경을 전제로 한다.
+Python 3.12 환경을 전제로 한다. 환경은 직접 설치 명령을 조합하기보다 복구 계약에
+포함된 bootstrap을 우선 사용한다.
 
 ```bash
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+bash restore/bootstrap_env.sh
+bash restore/verify_restore.sh
 ```
 
-원본 zip이 풀려 `HAI_EXPERIMENT/`가 존재한다는 전제에서 다음 순서로 실행한다.
+아래 명령은 보존 leader를 새로 증명하는 현재 과학 campaign이 아니라 **역사적 legacy
+reproduction**이다. 현재 acquisition-v2 synchronization authority는 `0/29`이므로 이
+실행에서 같은 수치가 나와도 새 과학 증거나 상용 성능이 아니다. 보존 경로를 절대
+덮어쓰지 않도록 매 시도마다 고유한 새 versioned root를 지정한다.
+
+원본 zip이 풀려 `HAI_EXPERIMENT/`가 존재한다는 전제에서 다음처럼 실행한다.
 
 ```bash
-# 1. 읽기 전용 원본 감사와 feature cache
+# 실행마다 이름을 바꾼 새 root. 기존 artifacts/runs/final_* 경로 사용 금지.
+REPRO_ROOT=artifacts/reproductions/legacy_leader_20260831_attempt_001
+mkdir -p artifacts/reproductions
+mkdir "$REPRO_ROOT"  # 이미 있으면 중단; 기존 attempt 재사용 금지
+
+# 1. 읽기 전용 원본 감사와 별도 legacy feature cache
 .venv/bin/python scripts/audit_dataset.py HAI_EXPERIMENT \
-  --format json --output artifacts/dataset_audit.json
+  --format json --output "$REPRO_ROOT/dataset_audit.json"
 .venv/bin/python scripts/build_features.py \
-  --config configs/default.yaml --force
+  --config configs/default.yaml --cache-dir "$REPRO_ROOT/cache/rf32s" --force
 
 # 2. Structured auxiliary teacher + 12-step SNN, six folds
 .venv/bin/python scripts/train.py \
   --config configs/default.yaml --model both --fold all \
   --preset default --simulation-steps 12 --device cuda --amp \
-  --aux-fusion structured \
-  --output-dir artifacts/runs/final_structured_aux_s12
+  --aux-fusion structured --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/structured_aux"
 
 # 3. 같은 teacher를 사용한 exact-alignment SNN
 .venv/bin/python scripts/train.py \
   --config configs/default.yaml --model snn --fold all \
   --preset default --simulation-steps 12 --device cuda --amp \
   --deterministic --aux-fusion structured --exact-aux-alignment \
-  --teacher-checkpoint \
-    'artifacts/runs/final_structured_aux_s12/fold_{fold}/teacher_best.pt' \
-  --output-dir artifacts/runs/final_structured_exact_s12_deterministic
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --teacher-checkpoint "$REPRO_ROOT/structured_aux/fold_{fold}/teacher_best.pt" \
+  --output-dir "$REPRO_ROOT/structured_exact"
 
 # 4. Validation-only fold lock을 사용하는 ensemble
 .venv/bin/python scripts/ensemble.py \
-  --run-a artifacts/runs/final_structured_aux_s12 \
-  --run-b artifacts/runs/final_structured_exact_s12_deterministic \
-  --output-dir artifacts/runs/ensemble_structured_exact \
+  --run-a "$REPRO_ROOT/structured_aux" \
+  --run-b "$REPRO_ROOT/structured_exact" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/ensemble" \
   --device cuda --workers 4
 
 # 5. 각 component의 radar-mask 평가 후 locked rule을 그대로 결합
 .venv/bin/python scripts/benchmark_robustness.py \
-  --run-dir artifacts/runs/final_structured_aux_s12 \
-  --output-dir artifacts/robustness/final_structured_aux_s12 \
+  --run-dir "$REPRO_ROOT/structured_aux" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/robustness_aux" \
   --device cuda
 .venv/bin/python scripts/benchmark_robustness.py \
-  --run-dir artifacts/runs/final_structured_exact_s12_deterministic \
-  --output-dir artifacts/robustness/final_structured_exact_s12_deterministic \
+  --run-dir "$REPRO_ROOT/structured_exact" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/robustness_exact" \
   --device cuda
-.venv/bin/python scripts/evaluate_ensemble_robustness.py
+.venv/bin/python scripts/evaluate_ensemble_robustness.py \
+  --ensemble-dir "$REPRO_ROOT/ensemble" \
+  --source-a-robustness "$REPRO_ROOT/robustness_aux" \
+  --source-b-robustness "$REPRO_ROOT/robustness_exact" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --output-dir "$REPRO_ROOT/robustness_ensemble"
 
 # 6. Raw 32 s radar window부터 batch-one end-to-end benchmark
 .venv/bin/python scripts/benchmark_e2e.py \
-  --checkpoint artifacts/runs/final_structured_aux_s12/fold_0/snn_best.pt \
+  --checkpoint "$REPRO_ROOT/structured_aux/fold_0/snn_best.pt" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
   --input-source raw-file --devices all --warmup 10 --repeats 200 \
   --file-repeats 100 \
-  --output artifacts/benchmarks/commercial/structured_aux_fold0_e2e.json
+  --output "$REPRO_ROOT/benchmarks/structured_aux_fold0_e2e.json"
 .venv/bin/python scripts/benchmark_e2e.py \
-  --checkpoint artifacts/runs/final_structured_exact_s12_deterministic/fold_0/snn_best.pt \
+  --checkpoint "$REPRO_ROOT/structured_exact/fold_0/snn_best.pt" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
   --input-source raw-file --devices all --warmup 10 --repeats 200 \
   --file-repeats 100 \
-  --output artifacts/benchmarks/commercial/structured_exact_fold0_e2e.json
+  --output "$REPRO_ROOT/benchmarks/structured_exact_fold0_e2e.json"
 
-# 7. 사전 선언 gate 감사, 보고서 재생성, 테스트
-.venv/bin/python scripts/audit_harmonic_candidate_gate.py
-.venv/bin/python scripts/evaluate_commercial_goal.py
-.venv/bin/python scripts/make_report.py
-.venv/bin/pytest
+# 7. 역사적 gate 형식 감사와 별도 보고서, 테스트
+.venv/bin/python scripts/evaluate_commercial_goal.py \
+  --candidate-csv "$REPRO_ROOT/ensemble/ensemble_oof.csv" \
+  --cache-dir "$REPRO_ROOT/cache/rf32s" \
+  --fold-assignments "$REPRO_ROOT/structured_aux/fold_assignments.json" \
+  --robustness-report "$REPRO_ROOT/robustness_ensemble/report.json" \
+  --e2e-reports "$REPRO_ROOT/benchmarks/structured_aux_fold0_e2e.json" \
+    "$REPRO_ROOT/benchmarks/structured_exact_fold0_e2e.json" \
+  --output-json "$REPRO_ROOT/commercial_goal_report_historical.json" \
+  --output-markdown "$REPRO_ROOT/COMMERCIAL_GOAL_AUDIT_HISTORICAL.md"
+.venv/bin/python -m pytest -q
 ```
 
-학습은 fold별 best/last checkpoint와 validation/test prediction을 저장하며 `--resume`을 지원한다. GPU가 없으면 `--device cpu --no-amp`를 쓸 수 있지만 시간이 오래 걸린다.
+학습은 fold별 best/last checkpoint와 validation/test prediction을 저장한다. `--resume`은
+동일 시도의 `$REPRO_ROOT/structured_aux` 또는 `$REPRO_ROOT/structured_exact`에만 사용한다.
+보존 leader 경로, 다른 시도의 root, hash가 다른 cache/checkpoint를 resume 대상으로
+사용하지 않는다. GPU가 없으면 `--device cpu --no-amp`를 쓸 수 있지만 시간이 오래
+걸리고 CUDA 재현 증거를 대체하지 않는다.
 
 ## End-to-end 지연시간
 
@@ -178,7 +226,7 @@ python3.12 -m venv .venv
 
 ## Alias-head 최종 판정
 
-Full 6-fold alias-gated harmonic SNN은 MAE 1.351, macro MAE 1.294, RMSE 2.536이었다. Alias classifier는 ROC-AUC 0.973/AP 0.930이었지만 25–35 bpm MAE는 4.049 bpm으로 남았다. Validation-locked 3-way blend는 outer macro MAE를 1.2209→1.2345로 악화시켰고, causal decoder는 high-RR macro를 3.7512→3.4047로 낮촄지만 full macro, non-overlap, >5 bpm 오류율을 악화시켰다. 두 후보 모두 retrospective acceptance guard에서 **REJECT**되었으며 test 수치로 사후 재튜닝하지 않았다. 이 outer OOF reject 판정 자체도 반복된 cohort 선택 증거이므로 prospective confirmatory test는 아니다.
+Full 6-fold alias-gated harmonic SNN은 MAE 1.351, macro MAE 1.294, RMSE 2.536이었다. Alias classifier는 ROC-AUC 0.973/AP 0.930이었지만 25–35 bpm MAE는 4.049 bpm으로 남았다. Validation-locked 3-way blend는 outer macro MAE를 1.2209→1.2345로 악화시켰고, causal decoder는 high-RR macro를 3.7512→3.4047로 낮췄지만 full macro, non-overlap, >5 bpm 오류율을 악화시켰다. 두 후보 모두 retrospective acceptance guard에서 **REJECT**되었으며 test 수치로 사후 재튜닝하지 않았다. 이 outer OOF reject 판정 자체도 반복된 cohort 선택 증거이므로 prospective confirmatory test는 아니다.
 
 ## 해석상의 필수 제한
 
