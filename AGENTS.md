@@ -3,7 +3,7 @@
 This file is the first instruction source for any AI or human agent working in
 this repository. It describes the scientific claim boundary, restoration
 procedure, data-safety rules, and the current execution boundary as of
-2026-08-30. Read `RESTORE_GUIDE.md` next.
+2026-08-31. Read `RESTORE_GUIDE.md` next.
 
 ## 1. Project status: do not overclaim
 
@@ -32,6 +32,7 @@ also pass.
 
 Authoritative summaries:
 
+- `artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md`
 - `artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md`
 - `README.md`
 - `REPORT.md`
@@ -88,6 +89,21 @@ Known data facts that affect code:
 - no common radar/BIOPAC hardware trigger; retain this limitation in reports
 
 Do not rename or rewrite raw files. Parsers must treat raw input as read-only.
+
+Current acquisition-v2 evidence:
+
+- frozen authority: 30 sessions, 29 usable, 18 usable physical identities
+- full causal-bound reconstruction: complete but diagnostic
+- synchronization authorized: 0/29
+- measured-timing eligible: 19/29
+- stage-metric eligible: 0/29
+- strict-cache/scientific eligible: 0/29
+- diagnostic RF cache: 5,826 windows from 18 mapping-bearing sessions,
+  `reference_valid=0` for every row
+
+The authoritative paths and content hashes are recorded in
+`artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md`. Do not train from
+that diagnostic cache or convert its proposed mappings into approvals.
 
 ## 4. First actions after restoration
 
@@ -202,17 +218,16 @@ Minimum checks after source changes:
 .venv/bin/python -m pytest -q
 ```
 
-Historical fixed evidence was 694 collected, 690 passed, 4 skipped. At backup
-time, however, two consecutive full-suite runs produced 688 passed, 4 skipped,
-and 2 failed. The failures were exact/tight floating-point equivalence checks
-in `test_causal_prefix_is_invariant_to_future_samples` and
-`test_chunk_round_padding_forward_loss_state_and_gradient_equivalence`; both
-passed when rerun together in isolation. This unresolved order-, thread-, or
-floating-point-state sensitivity is recorded in
-`restore/backup_validation_2026-08-30.json`. Do not report the snapshot as a
-clean test pass, weaken the tolerances, or authorize a new scientific run until
-the cause is understood. The four skips were real-bubblewrap tests blocked by
-the originating sandbox namespace policy; run them on a capable host.
+The backup-time snapshot remains recorded in
+`restore/backup_validation_2026-08-30.json`: 688 passed, 4 skipped, and 2
+order/precision-sensitive failures. The current source removes import-time
+Torch thread mutations and uses fixed-order accumulation for the affected SVD
+projection. On 2026-08-31 the current 1,441-test suite passed twice
+consecutively: 1,437 passed and 4 real-bubblewrap tests skipped in the managed
+namespace. The same four bubblewrap tests then passed 4/4 in a capable host
+context. Do not rewrite the historical snapshot; use the 2026-08-31 progress
+report as the evidence for the current source generation. A passing unit suite
+still does not authorize a new scientific run.
 
 For changes touching split, target firewall, sealed packs, authorization,
 ledger, or sandbox code, run the corresponding focused tests first and then

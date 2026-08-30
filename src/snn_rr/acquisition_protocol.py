@@ -1278,14 +1278,25 @@ def assign_window_to_stage(
             None,
         )
     phase7_assignment = protocol.phase7_assignment if winner.stage_id == "phase7" else None
+    metric_eligible = winner.status == "auto"
+    if metric_eligible:
+        reason = "assigned"
+    elif winner.status == "uncertain":
+        reason = "stage_uncertain"
+    elif winner.status == "review":
+        reason = "stage_requires_review"
+    else:
+        # Serialized or externally constructed protocol objects must not make
+        # an unknown status eligible by virtue of merely being non-"review".
+        reason = "stage_status_invalid"
     return WindowStageAssignment(
         window_start_s,
         window_end_s,
         winner.stage_id,
         overlap_fraction,
         False,
-        winner.status != "review",
-        "assigned" if winner.status != "review" else "stage_requires_review",
+        metric_eligible,
+        reason,
         winner.confidence,
         phase7_assignment,
     )

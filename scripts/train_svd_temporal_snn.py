@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Train the chronological SVD temporal SNN with a locked grouped protocol.
+"""Train the window-end SVD temporal SNN with a locked grouped protocol.
+
+The cached component sequence is ordered within a 32-second window, but its
+global detrending, normalization, and SVD basis use that complete window.
+Consequently the model consumes only the past 32 seconds at prediction time,
+while neither the representation nor a sliced component prefix is an
+end-to-end raw-stream prefix-causal feature.
 
 For outer fold ``f``, fold ``(f + 1) % 6`` is the validation identity fold and
 the remaining four folds are the only weight-fitting identities.  Signal
@@ -65,6 +71,7 @@ class TemporalSessionArrays:
     metadata: pd.DataFrame
     manifest: dict[str, Any]
     component_signals_sha256: str
+    radar_timing_valid_mask: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -82,6 +89,23 @@ class TemporalAlignedExperiment:
         session = self.sessions[int(row["_session_slot"])]
         local_row = int(row["_local_row"])
         return session.component_signals[local_row], session.attributes[local_row]
+
+    def structural_radar_mask_for_position(
+        self, position: int
+    ) -> np.ndarray | None:
+        row = self.metadata.iloc[int(position)]
+        session = self.sessions[int(row["_session_slot"])]
+        if session.radar_timing_valid_mask is None:
+            return None
+        local_row = int(row["_local_row"])
+        timing = np.asarray(
+            session.radar_timing_valid_mask[local_row], dtype=np.bool_
+        )
+        if timing.ndim != 2 or timing.shape[0] != 3:
+            raise RuntimeError(
+                f"invalid structural radar timing mask for {session.session_id}"
+            )
+        return np.all(timing, axis=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,11 +205,221 @@ def atomic_write_json(path: Path, value: Any) -> None:
     shared.atomic_write_json(path, _json_ready(value))
 
 
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_content_sha256(document: Mapping[str, Any]) -> str:
+    payload = dict(document)
+    payload.pop("content_sha256", None)
+    return _canonical_sha256(payload)
+
+
+def _manifest_session_ids(value: Any, *, location: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"{location} must be a non-empty session-ID list")
+    session_ids: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            raise RuntimeError(f"{location} contains an invalid session ID")
+        session_ids.append(item)
+    if len(set(session_ids)) != len(session_ids):
+        raise RuntimeError(f"{location} contains duplicate session IDs")
+    return session_ids
+
+
+def _validate_acquisition_v2_training_scope(
+    root_manifest: Mapping[str, Any],
+    session_manifests: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Require exact full-cohort provenance for acquisition-v2 training.
+
+    Historical SVD caches without a version-2 acquisition indicator retain
+    their existing loader behavior.  Once any root or child manifest carries a
+    v2 binding, however, stripping or contradicting the root scope contract is
+    a hard failure rather than a downgrade to legacy behavior.
+    """
+
+    root_contract = root_manifest.get("canonical_acquisition_contract")
+    root_sessions_value = root_manifest.get("sessions")
+    root_sessions = (
+        root_sessions_value if isinstance(root_sessions_value, list) else []
+    )
+    indicated_v2 = bool(
+        isinstance(root_contract, dict)
+        and root_contract.get("schema_version")
+        == "snn_rr.feature_cache_acquisition.v2"
+        or root_manifest.get(
+            "canonical_acquisition_reconstruction_content_sha256"
+        )
+        is not None
+    )
+    for item in root_sessions:
+        indicated_v2 = bool(
+            indicated_v2
+            or (
+                isinstance(item, Mapping)
+                and shared._session_has_acquisition_v2_indicator(item)
+            )
+        )
+    for manifest in session_manifests.values():
+        indicated_v2 = bool(
+            indicated_v2
+            or shared._session_has_acquisition_v2_indicator(manifest)
+        )
+    if not indicated_v2:
+        return
+
+    if not isinstance(root_contract, dict) or root_contract.get(
+        "schema_version"
+    ) != "snn_rr.feature_cache_acquisition.v2":
+        raise RuntimeError(
+            "acquisition-v2 SVD input lacks its canonical root acquisition contract"
+        )
+    declared_root_content = root_manifest.get("content_sha256")
+    if (
+        not isinstance(declared_root_content, str)
+        or declared_root_content != _canonical_content_sha256(root_manifest)
+    ):
+        raise RuntimeError("acquisition-v2 SVD root content hash mismatch")
+
+    expected = _manifest_session_ids(
+        root_manifest.get("expected_session_ids"),
+        location="SVD expected_session_ids",
+    )
+    selected = _manifest_session_ids(
+        root_manifest.get("selected_session_ids"),
+        location="SVD selected_session_ids",
+    )
+    if root_manifest.get("expected_session_ids_sha256") != _canonical_sha256(
+        expected
+    ):
+        raise RuntimeError("SVD expected-session ID hash mismatch")
+    if root_manifest.get("selected_session_ids_sha256") != _canonical_sha256(
+        selected
+    ):
+        raise RuntimeError("SVD selected-session ID hash mismatch")
+    subjects_filter_applied = root_manifest.get("subjects_filter_applied")
+    if type(subjects_filter_applied) is not bool:
+        raise RuntimeError("SVD subjects_filter_applied must be an explicit boolean")
+
+    if not isinstance(root_sessions_value, list) or any(
+        not isinstance(item, dict) for item in root_sessions_value
+    ):
+        raise RuntimeError("acquisition-v2 SVD root session catalogue is malformed")
+    catalogue_ids = _manifest_session_ids(
+        [item.get("session_id") for item in root_sessions_value],
+        location="SVD root catalogue session IDs",
+    )
+    if catalogue_ids != selected:
+        raise RuntimeError("SVD selected-session IDs differ from its root catalogue")
+
+    selection_is_full = bool(
+        not subjects_filter_applied and selected == expected
+    )
+    derived_scope = "full_cohort" if selection_is_full else "diagnostic_subset"
+    if root_manifest.get("selection_scope") != derived_scope:
+        raise RuntimeError("SVD selection_scope does not match its selection evidence")
+
+    canonical_expected = _manifest_session_ids(
+        root_contract.get("expected_usable_session_ids"),
+        location="canonical acquisition expected usable-session IDs",
+    )
+    canonical_cache = _manifest_session_ids(
+        root_contract.get("cache_usable_session_ids"),
+        location="canonical acquisition cache usable-session IDs",
+    )
+    if root_contract.get(
+        "expected_usable_session_ids_sha256"
+    ) != _canonical_sha256(canonical_expected):
+        raise RuntimeError("canonical acquisition expected-session hash mismatch")
+    if root_contract.get("cache_usable_session_ids_sha256") != _canonical_sha256(
+        canonical_cache
+    ):
+        raise RuntimeError("canonical acquisition cache-session hash mismatch")
+    if canonical_expected != expected or canonical_cache != expected:
+        raise RuntimeError(
+            "scientific SVD training requires exact canonical expected-session coverage"
+        )
+
+    canonical_full = bool(
+        root_contract.get("selection_scope") == "full_cohort"
+        and root_contract.get("full_cohort_complete") is True
+        and root_contract.get("reconstruction_full_cohort_complete") is True
+    )
+    all_results_ok = bool(root_sessions_value) and all(
+        item.get("status") == "ok" for item in root_sessions_value
+    )
+    derived_complete = bool(
+        selection_is_full and all_results_ok and canonical_full
+    )
+    if type(root_manifest.get("full_cohort_complete")) is not bool or (
+        root_manifest.get("full_cohort_complete") != derived_complete
+    ):
+        raise RuntimeError(
+            "SVD full_cohort_complete does not match its bound cohort evidence"
+        )
+
+    if set(session_manifests) != set(selected):
+        raise RuntimeError("SVD child manifest set differs from selected sessions")
+    bindings_scientific = True
+    for item in root_sessions_value:
+        session_id = str(item["session_id"])
+        child = session_manifests[session_id]
+        declared_child_content = child.get("content_sha256")
+        if (
+            not isinstance(declared_child_content, str)
+            or declared_child_content != _canonical_content_sha256(child)
+            or item.get("content_sha256") != declared_child_content
+        ):
+            raise RuntimeError(f"SVD child manifest content mismatch: {session_id}")
+        root_binding = item.get("canonical_acquisition_binding")
+        child_binding = child.get("canonical_acquisition_binding")
+        if root_binding != child_binding:
+            raise RuntimeError(
+                f"SVD root/child acquisition binding mismatch: {session_id}"
+            )
+        bindings_scientific = bool(
+            bindings_scientific
+            and isinstance(child_binding, dict)
+            and child_binding.get("schema_version")
+            == "snn_rr.feature_cache_acquisition.v2"
+            and child_binding.get("scientific_eligible") is True
+        )
+
+    derived_scientific = bool(
+        derived_complete
+        and root_contract.get("mode") == "strict"
+        and root_contract.get("scientific_eligible") is True
+        and bindings_scientific
+    )
+    if type(root_manifest.get("scientific_eligible")) is not bool or (
+        root_manifest.get("scientific_eligible") != derived_scientific
+    ):
+        raise RuntimeError(
+            "SVD scientific_eligible does not match its acquisition evidence"
+        )
+    if not derived_scientific:
+        raise RuntimeError(
+            "acquisition-v2 temporal training requires a strict, scientifically "
+            "eligible, untargeted full-cohort SVD cache"
+        )
+
+
 def load_temporal_aligned_experiment(
     cache_root: Path,
     oof_csv: Path,
     oof_npz: Path | None = None,
     *,
+    base_oof_provenance: Path | None = None,
     verify_file_hashes: bool = True,
 ) -> TemporalAlignedExperiment:
     """Bind valid-only component signals to the already frozen base OOF."""
@@ -194,7 +428,12 @@ def load_temporal_aligned_experiment(
         cache_root,
         oof_csv,
         oof_npz,
+        base_oof_provenance=base_oof_provenance,
         verify_file_hashes=verify_file_hashes,
+    )
+    _validate_acquisition_v2_training_scope(
+        base.root_manifest,
+        {session.session_id: session.manifest for session in base.sessions},
     )
     if not bool(base.root_manifest.get("valid_only", False)):
         raise RuntimeError("temporal training requires a valid-reference-only cache")
@@ -206,7 +445,11 @@ def load_temporal_aligned_experiment(
             raise FileNotFoundError(
                 f"component_signals.npy is missing for {source_session.session_id}"
             )
-        component_signals = np.load(signal_path, mmap_mode="r", allow_pickle=False)
+        component_signals = source_session.component_signals
+        if component_signals is None:
+            component_signals = np.load(
+                signal_path, mmap_mode="r", allow_pickle=False
+            )
         expected_shape = (
             len(source_session.metadata),
             *source_session.attributes.shape[1:4],
@@ -226,14 +469,41 @@ def load_temporal_aligned_experiment(
             raise RuntimeError(
                 f"session {source_session.session_id} is not declared valid-only"
             )
-        if source_session.manifest.get("label_inputs", []):
+        if source_session.manifest.get("feature_value_label_inputs", []) != []:
             raise RuntimeError(
-                f"session {source_session.session_id} declares label-derived SVD inputs"
+                f"session {source_session.session_id} declares label-derived SVD values"
             )
+        expected_row_labels = [
+            "canonical_metadata.reference_valid (row_selection_only)"
+        ]
+        if (
+            source_session.manifest.get("target_dependent_row_selection") is not True
+            or source_session.manifest.get("label_inputs") != expected_row_labels
+        ):
+            raise RuntimeError(
+                f"session {source_session.session_id} does not disclose its "
+                "valid-only target-derived row filter"
+            )
+        causality_scope = source_session.manifest.get("causality_scope")
+        if not isinstance(causality_scope, dict) or (
+            causality_scope.get("within_window_prefix_causal_representation")
+            is not False
+            or causality_scope.get("streaming_prefix_causality_claim_allowed")
+            is not False
+        ):
+            raise RuntimeError(
+                f"session {source_session.session_id} lacks the bounded SVD "
+                "causality disclosure"
+            )
+        bound_signal_sha = source_session.files_sha256.get("component_signals")
         signal_sha = (
-            shared.sha256_file(signal_path)
-            if verify_file_hashes
-            else "not_computed_verify_file_hashes_false"
+            bound_signal_sha
+            if bound_signal_sha is not None
+            else (
+                shared.sha256_file(signal_path)
+                if verify_file_hashes
+                else "not_computed_verify_file_hashes_false"
+            )
         )
         component_hashes[source_session.session_id] = signal_sha
         sessions.append(
@@ -244,15 +514,21 @@ def load_temporal_aligned_experiment(
                 metadata=source_session.metadata,
                 manifest=source_session.manifest,
                 component_signals_sha256=signal_sha,
+                radar_timing_valid_mask=source_session.radar_timing_valid_mask,
             )
         )
     provenance = dict(base.provenance)
     provenance.update(
         {
-            "component_signals_status": "loaded_as_chronological_label_free_input",
+            "component_signals_status": (
+                "window_end_label_free_values_with_target_derived_row_selection"
+            ),
             "component_signals_sha256": component_hashes,
             "valid_only_alignment_enforced": True,
             "nominal_time_samples": 320,
+            "causality_scope": (
+                "past_32s_window_end_only_not_raw_stream_prefix_causal"
+            ),
         }
     )
     return TemporalAlignedExperiment(
@@ -416,11 +692,26 @@ class TemporalSVDDataset(Dataset[dict[str, Tensor]]):
         row = self.experiment.metadata.iloc[position]
         raw_signals, raw_attributes = self.experiment.arrays_for_position(position)
         raw_signals = np.asarray(raw_signals)
-        radar_mask = np.any(np.abs(raw_signals) > 1.0e-8, axis=(1, 2, 3))
+        structural_mask = self.experiment.structural_radar_mask_for_position(position)
+        if structural_mask is None:
+            # Legacy caches have no timing authority and retain their original
+            # numeric-availability fallback.
+            radar_mask = np.any(np.abs(raw_signals) > 1.0e-8, axis=(1, 2, 3))
+        else:
+            radar_mask = np.asarray(structural_mask, dtype=np.bool_)
+            if radar_mask.shape != (raw_signals.shape[0],):
+                raise RuntimeError("structural radar mask has an invalid shape")
         signals = self.normalizer.transform(raw_signals)
-        signals *= radar_mask[:, None, None, None]
+        signals[~radar_mask] = 0
         attributes = np.asarray(raw_attributes, dtype=np.float32).copy()
-        attributes *= radar_mask[:, None, None, None]
+        attributes[~radar_mask] = 0
+        classical = _classical_values(row)
+        if structural_mask is not None:
+            classical[1:][~radar_mask] = 0
+            if not bool(radar_mask.all()):
+                # The leading candidate is the cached three-view fusion and
+                # cannot survive a missing contributing radar.
+                classical[0] = 0
         reference_sigma = float(row.get("reference_sigma_bpm", 1.0))
         reference_quality = float(row.get("reference_quality", 1.0))
         return {
@@ -432,7 +723,7 @@ class TemporalSVDDataset(Dataset[dict[str, Tensor]]):
             "base_std": torch.tensor(
                 max(0.25, float(row.get("rr_std_bpm", 1.5))), dtype=torch.float32
             ),
-            "classical_rr": torch.from_numpy(_classical_values(row)),
+            "classical_rr": torch.from_numpy(classical),
             "radar_mask": torch.from_numpy(radar_mask),
             # Loss/evaluation only: forward_temporal_model cannot access these.
             "rr": torch.tensor(float(row["rr_bpm"]), dtype=torch.float32),
@@ -1545,6 +1836,8 @@ def _build_run_config(
         },
         "component_signals_input": True,
         "chronological_spike_time": True,
+        "raw_to_component_prefix_causal": False,
+        "prediction_time_context": "past_complete_32s_window",
     }
     signature_payload = {
         "arguments": arguments,
@@ -1751,6 +2044,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         / "artifacts/runs/ensemble_structured_exact/ensemble_oof.npz",
     )
     parser.add_argument(
+        "--base-oof-provenance",
+        type=Path,
+        help=(
+            "authority JSON for scientific acquisition-v2 base predictions; "
+            "defaults only to provenance.json beside --base-oof-csv"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=PROJECT_ROOT / "artifacts/runs/svd_temporal_snn",
@@ -1761,7 +2062,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument(
-        "--verify-file-hashes", action=argparse.BooleanOptionalAction, default=True
+        "--verify-file-hashes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "verify legacy-cache payload hashes when available; acquisition-v2 "
+            "authority hashes are always mandatory"
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-from", type=Path)
@@ -1842,6 +2149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.svd_cache,
         args.base_oof_csv,
         args.base_oof_npz,
+        base_oof_provenance=args.base_oof_provenance,
         verify_file_hashes=args.verify_file_hashes,
     )
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

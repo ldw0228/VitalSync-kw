@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from snn_rr.cache import FeatureCache
+from snn_rr.cache import CacheProvenance, FeatureCache
 from snn_rr.split_authority import (
     canonical_content_sha256,
     load_identity_split_authority,
@@ -43,6 +43,24 @@ capture_rng_state = _TRAIN.capture_rng_state
 restore_rng_state = _TRAIN.restore_rng_state
 validate_external_teacher_checkpoint = _TRAIN.validate_external_teacher_checkpoint
 teacher_checkpoint_provenance = _TRAIN.teacher_checkpoint_provenance
+
+
+def _legacy_cache_provenance(tmp_path: Path) -> CacheProvenance:
+    return CacheProvenance(
+        classification="legacy",
+        root_manifest_path=str(tmp_path / "cache/manifest.json"),
+        root_manifest_sha256="1" * 64,
+        root_manifest_content_sha256="2" * 64,
+        acquisition_schema_version=None,
+        acquisition_mode=None,
+        scientific_eligible=False,
+        config_sha256="3" * 64,
+        pipeline_sha256="4" * 64,
+        reconstruction_content_sha256=None,
+        inventory_sha256="5" * 64,
+        inventory_file_count=4,
+        selected_sessions=("SA", "SB", "SC", "SD"),
+    )
 
 
 def _write_custom_split_fixture(
@@ -364,6 +382,86 @@ def test_coupled_radar_dropout_neutralizes_auxiliary_bypass() -> None:
     assert torch.all(dropped_aux[:, 37:] == 1)
 
 
+def _timing_mask_metadata(rows: int) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "session_id": ["S01_A"] * rows,
+            "identity": ["A"] * rows,
+            "window_number": np.arange(rows),
+            "rr_bpm": np.linspace(12.0, 14.0, rows),
+            "reference_valid": np.ones(rows, dtype=bool),
+            "reference_quality": np.ones(rows),
+            "reference_sigma_bpm": np.ones(rows),
+            "radar_observable": np.ones(rows, dtype=bool),
+            "classical_rr_bpm": np.linspace(11.0, 13.0, rows),
+            "classical_confidence": np.full(rows, 0.8),
+            "radar_peak_spread_bpm": np.full(rows, 0.4),
+        }
+    )
+
+
+def test_cached_dataset_uses_structural_timing_mask_not_numeric_zero() -> None:
+    layout = infer_auxiliary_layout(61)  # F=4.
+    maps = np.full((2, 3, 2, 4), 7.0, dtype=np.float16)
+    maps[0, 0] = 0.0  # A legitimate numeric-zero view remains available.
+    aux = np.ones((2, layout.base_dim), dtype=np.float32)
+    timing = np.ones((2, 3, 5), dtype=np.bool_)
+    timing[1, 1, 2] = False  # Nonzero payload, structurally unavailable view.
+    cache = FeatureCache(
+        maps=maps,
+        aux=aux,
+        metadata=_timing_mask_metadata(2),
+        frequencies_hz=np.asarray([0.1, 0.2], dtype=np.float32),
+        radar_timing_valid_mask=timing,
+    )
+    dataset = _TRAIN.CachedRadarDataset(
+        cache,
+        aux,
+        np.arange(2),
+        auxiliary_layout=layout,
+    )
+
+    numeric_zero = dataset[0]
+    assert numeric_zero["radar_mask"].tolist() == [True, True, True]
+    assert torch.count_nonzero(numeric_zero["map"][0]) == 0
+    assert torch.all(numeric_zero["aux"] == 1)
+
+    structurally_invalid = dataset[1]
+    assert structurally_invalid["radar_mask"].tolist() == [True, False, True]
+    assert torch.count_nonzero(structurally_invalid["map"][1]) == 0
+    assert torch.all(structurally_invalid["map"][[0, 2]] == 7)
+    # Per-view spectra and scalars plus all fused current-window cells are
+    # neutralized after scaling.  Valid per-view cells remain untouched.
+    assert torch.all(structurally_invalid["aux"][8:16] == 0)
+    assert torch.all(structurally_invalid["aux"][32:40] == 0)
+    assert torch.all(structurally_invalid["aux"][48:61] == 0)
+    assert torch.all(structurally_invalid["aux"][0:8] == 1)
+    assert torch.all(structurally_invalid["aux"][16:32] == 1)
+    assert torch.all(structurally_invalid["aux"][40:48] == 1)
+
+
+def test_causal_history_excludes_structurally_invalid_prior_window() -> None:
+    metadata = _timing_mask_metadata(3)
+    timing = np.ones((3, 3, 5), dtype=np.bool_)
+    timing[0, 2, 4] = False
+    cache = FeatureCache(
+        maps=np.ones((3, 3, 2, 4), dtype=np.float16),
+        aux=np.ones((3, 1), dtype=np.float32),
+        metadata=metadata,
+        frequencies_hz=np.asarray([0.1, 0.2], dtype=np.float32),
+        radar_timing_valid_mask=timing,
+    )
+    augmented, names = _TRAIN.append_mask_aware_causal_history_features(cache)
+    history = augmented[:, 1:]
+    lag_rr = names.index("history_lag_1_classical_rr_bpm")
+    lag_available = names.index("history_lag_1_available")
+
+    assert history[1, lag_rr] == 0.0
+    assert history[1, lag_available] == 0.0
+    assert history[2, lag_rr] == pytest.approx(metadata.loc[1, "classical_rr_bpm"])
+    assert history[2, lag_available] == 1.0
+
+
 def _teacher_checkpoint_fixture(tmp_path: Path) -> tuple[
     Path,
     dict[str, object],
@@ -622,6 +720,7 @@ def test_run_signature_binds_resume_sensitive_parameters() -> None:
         "min_delta": args.min_delta + 0.01,
         "teacher_checkpoint": "/tmp/different_teacher/fold_{fold}.pt",
         "identity_split_manifest_sha256": "a" * 64,
+        "cache_provenance_sha256": "b" * 64,
     }
     for key, value in changes.items():
         changed = copy.deepcopy(args)
@@ -683,6 +782,7 @@ def test_rng_capture_restore_includes_process_and_sampler_generators() -> None:
         aux_scale=np.empty(0, dtype=np.float32),
         run_signature="signature",
         rng_state=state,
+        cache_provenance={"content_sha256": "1" * 64},
         distillation_teacher_provenance=None,
     )
     assert checkpoint["format_version"] == 2
@@ -693,6 +793,45 @@ def test_rng_capture_restore_includes_process_and_sampler_generators() -> None:
         "torch_cuda",
         "sampler_generator",
     }
+
+
+def test_resume_rejects_changed_cache_provenance(tmp_path: Path) -> None:
+    fold_dir = tmp_path / "fold_0"
+    fold_dir.mkdir()
+    torch.save(
+        {
+            "run_signature": "same-signature",
+            "cache_provenance": {"content_sha256": "1" * 64},
+        },
+        fold_dir / "teacher_last.pt",
+    )
+    args = _TRAIN.parse_args(["--resume", "--device", "cpu"])
+    loader = DataLoader(TensorDataset(torch.zeros((1, 1))))
+
+    with pytest.raises(RuntimeError, match="resume cache provenance mismatch"):
+        _TRAIN.train_stage(
+            model=nn.Linear(1, 1),
+            model_type="teacher",
+            model_kwargs={},
+            train_loader=loader,
+            validation_loader=loader,
+            metadata=pd.DataFrame(),
+            device=torch.device("cpu"),
+            fold_dir=fold_dir,
+            fold=0,
+            split={
+                "train_identities": ["A"],
+                "validation_identities": ["B"],
+                "test_identities": ["C"],
+            },
+            aux_center=np.empty(0, dtype=np.float32),
+            aux_scale=np.empty(0, dtype=np.float32),
+            run_signature="same-signature",
+            args=args,
+            quality_positive_weight=1.0,
+            auxiliary_layout=None,
+            cache_provenance={"content_sha256": "2" * 64},
+        )
 
 
 def test_alias_detailed_report_uses_requested_range_and_tolerance() -> None:
@@ -882,8 +1021,17 @@ def test_custom_run_bypasses_rotating_split_and_oof_and_never_loads_excluded(
         aux=auxiliary,
         metadata=metadata,
         frequencies_hz=np.asarray([0.1, 0.2], dtype=np.float32),
+        provenance=_legacy_cache_provenance(tmp_path),
     )
-    monkeypatch.setattr(_TRAIN, "load_feature_cache", lambda path: cache)
+    def fake_cache_loader(path: Path, **kwargs: object) -> FeatureCache:
+        assert Path(path) == cache_dir
+        assert kwargs == {
+            "require_acquisition_contract": False,
+            "require_scientific_eligible": False,
+        }
+        return cache
+
+    monkeypatch.setattr(_TRAIN, "load_feature_cache", fake_cache_loader)
 
     def forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("legacy split/OOF helper must not run in custom mode")
@@ -932,6 +1080,9 @@ def test_custom_run_bypasses_rotating_split_and_oof_and_never_loads_excluded(
         assert isinstance(provenance, dict)
         assert provenance["excluded_identities"] == ["D"]
         assert provenance["scaler_identities"] == ["A"]
+        cache_binding = kwargs["cache_provenance"]
+        assert isinstance(cache_binding, dict)
+        assert cache_binding["classification"] == "legacy"
         return kwargs["model"], {"best_validation_macro_mae": 1.0}  # type: ignore[return-value]
 
     monkeypatch.setattr(_TRAIN, "train_stage", fake_train_stage)
@@ -977,6 +1128,8 @@ def test_custom_run_bypasses_rotating_split_and_oof_and_never_loads_excluded(
             str(split_path),
             "--cache-dir",
             str(cache_dir),
+            "--cache-trust-mode",
+            "legacy",
             "--output-dir",
             str(tmp_path / "run"),
             "--model",
@@ -999,12 +1152,26 @@ def test_custom_run_bypasses_rotating_split_and_oof_and_never_loads_excluded(
     assert transformed_rows[0].tolist() == [0, 2, 3, 4, 5]
     assert saved == [tmp_path / "run" / "fold_7" / "teacher_prediction_predictions.npz"]
     assert report["oof"] == {}
+    assert report["claim_classification"] == "retrospective_legacy_noncommercial"
+    assert report["commercial_claim_allowed"] is False
     assert report["prediction"]["teacher"]["overall"]["mae"] == 0.0
+    run_config = json.loads(
+        (tmp_path / "run" / "run_config.json").read_text(encoding="utf-8")
+    )
+    assert run_config["arguments"]["cache_trust_mode"] == "legacy"
+    assert run_config["cache_provenance"]["content_sha256"] == (
+        cache.provenance.content_sha256
+    )
+    assert run_config["claim_classification"] == "retrospective_legacy_noncommercial"
+    assert run_config["commercial_claim_allowed"] is False
 
 
 def test_legacy_split_and_parser_behavior_remain_available() -> None:
     args = _TRAIN.parse_args([])
     assert args.identity_split_manifest is None
+    assert args.cache_trust_mode == "scientific"
+    legacy_args = _TRAIN.parse_args(["--cache-trust-mode", "legacy"])
+    assert legacy_args.cache_trust_mode == "legacy"
     metadata = pd.DataFrame(
         {
             "identity": ["A", "A", "B", "B", "C", "C"],
@@ -1023,3 +1190,114 @@ def test_legacy_split_and_parser_behavior_remain_available() -> None:
         "validation_identities",
         "test_identities",
     }
+
+
+@pytest.mark.parametrize(
+    ("trust_mode", "expected"),
+    [
+        (
+            "scientific",
+            {
+                "require_acquisition_contract": True,
+                "require_scientific_eligible": True,
+            },
+        ),
+        (
+            "acquisition-diagnostic",
+            {
+                "require_acquisition_contract": True,
+                "require_scientific_eligible": False,
+            },
+        ),
+        (
+            "legacy",
+            {
+                "require_acquisition_contract": False,
+                "require_scientific_eligible": False,
+            },
+        ),
+    ],
+)
+def test_run_passes_explicit_cache_trust_policy_to_loader(
+    trust_mode: str,
+    expected: dict[str, bool],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LoaderReached(RuntimeError):
+        pass
+
+    observed: dict[str, object] = {}
+
+    def stop_at_loader(path: Path, **kwargs: object) -> FeatureCache:
+        observed["path"] = path
+        observed.update(kwargs)
+        raise LoaderReached
+
+    monkeypatch.setattr(_TRAIN, "load_feature_cache", stop_at_loader)
+    args = _TRAIN.parse_args(
+        ["--cache-trust-mode", trust_mode, "--device", "cpu"]
+    )
+    with pytest.raises(LoaderReached):
+        _TRAIN.run(args)
+    assert observed["path"] == args.cache_dir
+    assert {key: observed[key] for key in expected} == expected
+
+
+@pytest.mark.parametrize(
+    ("trust_mode", "schema_version", "classification", "scientific", "mask"),
+    [
+        (
+            "acquisition-diagnostic",
+            "snn_rr.feature_cache_acquisition.v1",
+            "acquisition_diagnostic",
+            False,
+            None,
+        ),
+        (
+            "scientific",
+            "snn_rr.feature_cache_acquisition.v2",
+            "acquisition_scientific",
+            True,
+            np.asarray([[[True], [False], [True]]], dtype=np.bool_),
+        ),
+    ],
+)
+def test_acquisition_training_fails_closed_without_complete_structural_timing(
+    trust_mode: str,
+    schema_version: str,
+    classification: str,
+    scientific: bool,
+    mask: np.ndarray | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provenance = CacheProvenance(
+        classification=classification,
+        root_manifest_path=str(tmp_path / "manifest.json"),
+        root_manifest_sha256="1" * 64,
+        root_manifest_content_sha256="2" * 64,
+        acquisition_schema_version=schema_version,
+        acquisition_mode="strict",
+        scientific_eligible=scientific,
+        config_sha256="3" * 64,
+        pipeline_sha256="4" * 64,
+        reconstruction_content_sha256="5" * 64,
+        inventory_sha256="6" * 64,
+        inventory_file_count=5,
+        selected_sessions=("S01_A",),
+    )
+    cache = FeatureCache(
+        maps=np.ones((1, 3, 2, 4), dtype=np.float16),
+        aux=np.ones((1, 37), dtype=np.float32),
+        metadata=_timing_mask_metadata(1),
+        frequencies_hz=np.asarray([0.1, 0.2], dtype=np.float32),
+        provenance=provenance,
+        radar_timing_valid_mask=mask,
+    )
+    monkeypatch.setattr(_TRAIN, "load_feature_cache", lambda *args, **kwargs: cache)
+    args = _TRAIN.parse_args(
+        ["--cache-trust-mode", trust_mode, "--device", "cpu"]
+    )
+
+    with pytest.raises((ValueError, RuntimeError), match="timing mask|interval"):
+        _TRAIN.run(args)

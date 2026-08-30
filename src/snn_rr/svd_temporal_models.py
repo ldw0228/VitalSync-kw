@@ -1,11 +1,16 @@
-"""Chronological spiking model for source-separated slow-time signals.
+"""Spiking model over ordered, full-window source-separated signals.
 
 Unlike :mod:`snn_rr.svd_models`, which treats frequency bins as repeated SNN
 simulation steps, this module advances its neuron state in the physical order
 of the 32-second slow-time window.  The nominal cache input has shape
 ``[B, 3, V, C, 320]``.  A causal anti-alias filter reduces it to 80 steps, and
 every LIF/PLIF/ALIF state update then corresponds to one successive 0.4-second
-interval.
+component coordinate.  The cached component signals themselves are computed
+with full-window detrending, standardization, and SVD.  Model-level prefix
+invariance therefore applies only after feature extraction; it is not a claim
+that raw-to-component preprocessing is streaming-prefix causal.  The complete
+predictor is causal at the 32-second window end because no sample after that
+endpoint is used.
 
 The network is deliberately a safe residual estimator.  It predicts a
 posterior over the classical-rate hypotheses x1, x2, x3 and x4, a bounded
@@ -220,7 +225,28 @@ class _CausalAntiAliasDownsample(nn.Module):
             stride=self.stride,
             groups=self.channels,
         )
-        projected = self.pointwise(filtered).transpose(1, 2)
+        # A single 1x1 Conv1d may select a different GEMM reduction kernel when
+        # the physical-time length changes (for example 80 steps versus a
+        # sealed 40-step prefix).  The resulting few-ULP difference is not a
+        # future-data leak, but it breaks the bitwise prefix contract and makes
+        # CPU results depend on the process thread state.  Accumulating the
+        # fixed channel axis explicitly keeps the arithmetic order identical
+        # for every shared time step while retaining the checkpoint-compatible
+        # Conv1d parameter layout.
+        pointwise_weight = self.pointwise.weight[:, :, 0].to(
+            device=filtered.device,
+            dtype=filtered.dtype,
+        )
+        projected_channels = (
+            filtered[:, 0:1]
+            * pointwise_weight[:, 0].reshape(1, -1, 1)
+        )
+        for channel_index in range(1, self.channels):
+            projected_channels = projected_channels + (
+                filtered[:, channel_index : channel_index + 1]
+                * pointwise_weight[:, channel_index].reshape(1, -1, 1)
+            )
+        projected = projected_channels.transpose(1, 2)
         return self.norm(projected).transpose(1, 2)
 
 

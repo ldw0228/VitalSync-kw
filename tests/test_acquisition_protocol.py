@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -205,17 +206,42 @@ def test_ordered_dynamic_programming_and_window_transition_guard():
 
     stable = assign_window_to_stage(100.0, 132.0, decoded)
     assert stable.stage_id == "phase1"
-    assert stable.eligible_for_stage_metrics
+    assert not stable.eligible_for_stage_metrics
     assert not stable.transition_guard_triggered
+    assert stable.reason == "stage_uncertain"
+
+    auto_protocol = replace(
+        decoded,
+        stages=(replace(decoded.stages[0], status="auto"), *decoded.stages[1:]),
+    )
+    auto = assign_window_to_stage(100.0, 132.0, auto_protocol)
+    assert auto.stage_id == "phase1"
+    assert auto.eligible_for_stage_metrics
+    assert auto.reason == "assigned"
+
+    for status, reason in (
+        ("review", "stage_requires_review"),
+        ("unexpected", "stage_status_invalid"),
+    ):
+        changed = replace(
+            decoded,
+            stages=(replace(decoded.stages[0], status=status), *decoded.stages[1:]),
+        )
+        ineligible = assign_window_to_stage(100.0, 132.0, changed)
+        assert ineligible.stage_id == "phase1"
+        assert not ineligible.eligible_for_stage_metrics
+        assert ineligible.reason == reason
 
     transition = assign_window_to_stage(190.0, 222.0, decoded)
     assert transition.stage_id is None
     assert transition.transition_guard_triggered
     assert not transition.eligible_for_stage_metrics
+    assert transition.reason == "transition_guard"
 
     gap = assign_window_to_stage(212.0, 244.0, decoded)
     assert gap.stage_id is None
     assert not gap.eligible_for_stage_metrics
+    assert gap.reason == "insufficient_stage_overlap"
 
     phase7 = assign_window_to_stage(1301.0, 1314.0, decoded)
     assert phase7.stage_id is None  # within the 2 s transition guards

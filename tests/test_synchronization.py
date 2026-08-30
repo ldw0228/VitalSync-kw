@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from snn_rr.synchronization import (
+    MANUAL_APPROVAL_SCHEMA,
     MarkerCandidate,
     SynchronizationConfig,
     SynchronizationError,
@@ -15,6 +16,7 @@ from snn_rr.synchronization import (
     build_affine_sample_index,
     build_manual_approval,
     build_sync_receipt,
+    canonical_content_sha256,
     canonical_json_bytes,
     detect_radar_marker_candidates,
     detect_rsp_marker_candidates,
@@ -58,6 +60,56 @@ def _accepted_result():
     return estimate_marker_time_mapping(
         radar, rsp, epoch_prior_offset_s=5.0, config=_decision_config()
     )
+
+
+def _content_bound_manual_decision(receipt, *, decision="approve"):
+    """Model a pre-existing v1 artifact without using the guarded builder."""
+
+    mapping = receipt["result"]["mapping"]
+    assert mapping is not None
+    approval = {
+        "schema": MANUAL_APPROVAL_SCHEMA,
+        "session_id": receipt["session_id"],
+        "reviewed_at_utc": "2026-08-30T00:01:00Z",
+        "reviewer_id": "historical-reviewer",
+        "decision": decision,
+        "rationale": "Content-bound historical review artifact.",
+        "sync_receipt_content_sha256": receipt["content_sha256"],
+        "mapping_sha256": hashlib.sha256(canonical_json_bytes(mapping)).hexdigest(),
+    }
+    approval["content_sha256"] = canonical_content_sha256(approval)
+    return approval
+
+
+def _accepted_receipt():
+    config = _decision_config()
+    return build_sync_receipt(
+        _accepted_result(),
+        session_id="SYNTHETIC_ACCEPTED",
+        config=config,
+        input_bindings={"signals": {"sha256": "9" * 64}},
+        created_at_utc="2026-08-30T00:00:00Z",
+    )
+
+
+def _rehash(document):
+    document["content_sha256"] = canonical_content_sha256(document)
+    return document
+
+
+def _refresh_match_residual_summaries(receipt):
+    mapping = receipt["result"]["mapping"]
+    residuals = []
+    for match in receipt["result"]["matches"]:
+        residual = match["rsp_time_s"] - (
+            mapping["offset_s"] + mapping["scale"] * match["radar_time_s"]
+        )
+        match["residual_s"] = residual
+        residuals.append(residual)
+    receipt["result"]["residual_rmse_s"] = float(
+        np.sqrt(np.mean(np.square(residuals)))
+    )
+    receipt["result"]["residual_max_abs_s"] = float(np.max(np.abs(residuals)))
 
 
 def test_exact_182_payload_and_target_free_motion_marker_detection():
@@ -215,8 +267,15 @@ def test_affine_mapping_index_and_resampling():
 
 
 def test_receipt_is_canonical_tamper_evident_and_manual_approval_is_bound():
-    result = _accepted_result()
-    config = _decision_config()
+    config = _decision_config(min_marker_span_s=1_000.0)
+    result = estimate_marker_time_mapping(
+        _markers([0.0, 100.0, 200.0]),
+        _markers([2.0, 102.0, 202.0], source="fixed_high"),
+        epoch_prior_offset_s=2.0,
+        config=config,
+    )
+    assert result.decision == "manual_review_required"
+    assert not result.ambiguous
     receipt = build_sync_receipt(
         result,
         session_id="SYNTHETIC_01",
@@ -261,6 +320,78 @@ def test_receipt_is_canonical_tamper_evident_and_manual_approval_is_bound():
         validate_manual_approval(approval_tampered, receipt)
 
 
+def test_accepted_receipt_recomputes_epoch_prior_and_drift_gates():
+    prior_tampered = copy.deepcopy(_accepted_receipt())
+    prior_tampered["result"]["prior_offset_s"] += 100.0
+    _rehash(prior_tampered)
+    with pytest.raises(SynchronizationError, match="epoch prior gate"):
+        validate_sync_receipt(prior_tampered)
+
+    drift_tampered = copy.deepcopy(_accepted_receipt())
+    mapping = drift_tampered["result"]["mapping"]
+    mapping["mode"] = "affine"
+    mapping["scale"] = 1.0 + 5_000e-6
+    mapping["drift_ppm"] = (mapping["scale"] - 1.0) * 1_000_000.0
+    for match in drift_tampered["result"]["matches"]:
+        rsp_time = mapping["offset_s"] + mapping["scale"] * match["radar_time_s"]
+        match["rsp_time_s"] = rsp_time
+        drift_tampered["result"]["rsp_markers"][match["rsp_index"]][
+            "time_s"
+        ] = rsp_time
+    _refresh_match_residual_summaries(drift_tampered)
+    _rehash(drift_tampered)
+    with pytest.raises(SynchronizationError, match="drift gate"):
+        validate_sync_receipt(drift_tampered)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("automatically_authorized", "true"), ("ambiguous", "false")],
+)
+def test_receipt_authority_flags_reject_truthy_strings(field, value):
+    tampered = copy.deepcopy(_accepted_receipt())
+    tampered["result"][field] = value
+    _rehash(tampered)
+
+    with pytest.raises(SynchronizationError, match="must be boolean"):
+        validate_sync_receipt(tampered)
+
+
+def test_match_indices_times_and_residuals_bind_exactly_to_markers_and_mapping():
+    swapped_indices = copy.deepcopy(_accepted_receipt())
+    swapped_indices["result"]["matches"][1]["radar_index"], swapped_indices[
+        "result"
+    ]["matches"][2]["radar_index"] = (
+        swapped_indices["result"]["matches"][2]["radar_index"],
+        swapped_indices["result"]["matches"][1]["radar_index"],
+    )
+    _rehash(swapped_indices)
+    with pytest.raises(SynchronizationError, match="does not bind"):
+        validate_sync_receipt(swapped_indices)
+
+    time_tampered = copy.deepcopy(_accepted_receipt())
+    time_tampered["result"]["matches"][0]["radar_time_s"] += 5e-10
+    _rehash(time_tampered)
+    with pytest.raises(SynchronizationError, match="does not bind"):
+        validate_sync_receipt(time_tampered)
+
+    residual_tampered = copy.deepcopy(_accepted_receipt())
+    residual_tampered["result"]["matches"][0]["residual_s"] += 5e-10
+    _rehash(residual_tampered)
+    with pytest.raises(SynchronizationError, match="residual is inconsistent"):
+        validate_sync_receipt(residual_tampered)
+
+
+def test_mapping_must_equal_deterministic_proposal_even_if_residuals_are_rehashed():
+    tampered = copy.deepcopy(_accepted_receipt())
+    tampered["result"]["mapping"]["offset_s"] += 0.1
+    _refresh_match_residual_summaries(tampered)
+    _rehash(tampered)
+
+    with pytest.raises(SynchronizationError, match="marker proposal"):
+        validate_sync_receipt(tampered)
+
+
 def test_manual_approval_is_required_for_review_only_mapping():
     config = _decision_config(min_marker_span_s=1_000.0)
     radar = _markers([0.0, 100.0, 200.0])
@@ -285,6 +416,114 @@ def test_manual_approval_is_required_for_review_only_mapping():
         rationale="The complete plots and acquisition notes were reviewed.",
     )
     assert synchronization_is_authorized(receipt, manual_approval=approval)
+
+
+def test_rejected_mapping_cannot_be_manually_approved():
+    config = _decision_config()
+    result = estimate_marker_time_mapping(
+        _markers([100.0]),
+        _markers([102.0], source="fixed_high"),
+        epoch_prior_offset_s=2.0,
+        config=config,
+    )
+    assert result.decision == "rejected"
+    assert result.mapping is not None
+    receipt = build_sync_receipt(
+        result,
+        session_id="SYNTHETIC_REJECTED",
+        config=config,
+        input_bindings={"signals": {"sha256": "d" * 64}},
+        created_at_utc="2026-08-30T00:00:00Z",
+    )
+
+    with pytest.raises(SynchronizationError, match="review-required"):
+        build_manual_approval(
+            receipt,
+            reviewer_id="reviewer-03",
+            decision="approve",
+            reviewed_at_utc="2026-08-30T00:01:00Z",
+            rationale="Audit-only attempted override.",
+        )
+    historical_approval = _content_bound_manual_decision(receipt)
+    with pytest.raises(SynchronizationError, match="review-required"):
+        validate_manual_approval(historical_approval, receipt)
+    with pytest.raises(SynchronizationError, match="review-required"):
+        synchronization_is_authorized(
+            receipt, manual_approval=historical_approval
+        )
+    assert not synchronization_is_authorized(receipt)
+
+
+def test_ambiguous_mapping_cannot_be_manually_approved():
+    config = _decision_config(
+        prior_tolerance_s=20.0,
+        match_residual_gate_s=0.3,
+        ambiguity_score_margin=1.0,
+    )
+    result = estimate_marker_time_mapping(
+        _markers([100.0, 300.0, 500.0, 700.0]),
+        _markers(
+            [95.0, 105.0, 295.0, 305.0, 495.0, 505.0, 695.0, 705.0],
+            source="adaptive_high+fixed_high",
+        ),
+        epoch_prior_offset_s=0.0,
+        config=config,
+    )
+    assert result.decision == "manual_review_required"
+    assert result.ambiguous
+    receipt = build_sync_receipt(
+        result,
+        session_id="SYNTHETIC_AMBIGUOUS",
+        config=config,
+        input_bindings={"signals": {"sha256": "e" * 64}},
+        created_at_utc="2026-08-30T00:00:00Z",
+    )
+
+    with pytest.raises(SynchronizationError, match="ambiguous"):
+        build_manual_approval(
+            receipt,
+            reviewer_id="reviewer-04",
+            decision="approve",
+            reviewed_at_utc="2026-08-30T00:01:00Z",
+            rationale="Audit-only attempted override.",
+        )
+    historical_approval = _content_bound_manual_decision(receipt)
+    with pytest.raises(SynchronizationError, match="ambiguous"):
+        validate_manual_approval(historical_approval, receipt)
+    with pytest.raises(SynchronizationError, match="ambiguous"):
+        synchronization_is_authorized(
+            receipt, manual_approval=historical_approval
+        )
+    assert not synchronization_is_authorized(receipt)
+
+
+def test_manual_rejection_revokes_automatically_accepted_mapping():
+    config = _decision_config()
+    receipt = build_sync_receipt(
+        _accepted_result(),
+        session_id="SYNTHETIC_REVOKED",
+        config=config,
+        input_bindings={"signals": {"sha256": "f" * 64}},
+        created_at_utc="2026-08-30T00:00:00Z",
+    )
+    rejection = build_manual_approval(
+        receipt,
+        reviewer_id="reviewer-05",
+        decision="reject",
+        reviewed_at_utc="2026-08-30T00:01:00Z",
+        rationale="Visual review identified an acquisition mismatch.",
+    )
+
+    assert synchronization_is_authorized(receipt)
+    assert not synchronization_is_authorized(receipt, manual_approval=rejection)
+    with pytest.raises(SynchronizationError, match="review-required"):
+        build_manual_approval(
+            receipt,
+            reviewer_id="reviewer-05",
+            decision="approve",
+            reviewed_at_utc="2026-08-30T00:02:00Z",
+            rationale="Automatic acceptance does not require a manual approval.",
+        )
 
 
 def test_config_contract_loads_and_end_to_end_signal_path():
@@ -326,3 +565,27 @@ def test_config_contract_loads_and_end_to_end_signal_path():
     assert result.diagnostics["radar_payload_interpretation"] == (
         "182_real_float_payload_values"
     )
+
+
+def test_measured_timing_config_binds_exact_radar_metadata_warning_allowlist():
+    loaded = load_synchronization_config(
+        "configs/sync_marker_affine_measured10_v2.yaml"
+    )
+
+    assert loaded.radar_metadata_warning_allowlist == {
+        "S07_KDM": ["unwrapped 1 relative-timestamp counter reset(s)"]
+    }
+    assert loaded.to_dict()["radar_metadata_warning_allowlist"] == {
+        "S07_KDM": ["unwrapped 1 relative-timestamp counter reset(s)"]
+    }
+
+
+def test_radar_metadata_warning_allowlist_rejects_duplicate_or_empty_content():
+    with pytest.raises(SynchronizationError, match="repeats"):
+        SynchronizationConfig(
+            radar_metadata_warning_allowlist={"S07_KDM": ["warning", "warning"]}
+        ).validate()
+    with pytest.raises(SynchronizationError, match="invalid"):
+        SynchronizationConfig(
+            radar_metadata_warning_allowlist={"S07_KDM": [""]}
+        ).validate()

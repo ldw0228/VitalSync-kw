@@ -158,6 +158,8 @@ class SVDSessionArrays:
     metadata: pd.DataFrame
     manifest: dict[str, Any]
     files_sha256: dict[str, str]
+    radar_timing_valid_mask: np.ndarray | None = None
+    component_signals: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -176,6 +178,21 @@ class AlignedSVDExperiment:
         session = self.sessions[int(row["_session_slot"])]
         local = int(row["_local_row"])
         return session.spectra[local], session.attributes[local]
+
+    def structural_radar_mask_for_position(
+        self, position: int
+    ) -> np.ndarray | None:
+        row = self.metadata.iloc[int(position)]
+        session = self.sessions[int(row["_session_slot"])]
+        if session.radar_timing_valid_mask is None:
+            return None
+        local = int(row["_local_row"])
+        timing = np.asarray(session.radar_timing_valid_mask[local], dtype=np.bool_)
+        if timing.ndim != 2 or timing.shape[0] != 3:
+            raise RuntimeError(
+                f"invalid structural radar timing mask for {session.session_id}"
+            )
+        return np.all(timing, axis=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +216,1110 @@ def sha256_file(path: Path, *, block_size: int = 4 * 1024 * 1024) -> str:
         for block in iter(lambda: handle.read(block_size), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _current_svd_pipeline_sha256() -> str:
+    paths = (
+        PROJECT_ROOT / "scripts/build_svd_features.py",
+        SOURCE_ROOT / "snn_rr/svd_features.py",
+        PROJECT_ROOT / "scripts/build_features.py",
+        SOURCE_ROOT / "snn_rr/acquisition_contract.py",
+        SOURCE_ROOT / "snn_rr/cache.py",
+        SOURCE_ROOT / "snn_rr/data.py",
+        SOURCE_ROOT / "snn_rr/preprocess.py",
+        SOURCE_ROOT / "snn_rr/synchronization.py",
+        SOURCE_ROOT / "snn_rr/radar_timing.py",
+    )
+    return hashlib.sha256(
+        "".join(sha256_file(path) for path in paths).encode("utf-8")
+    ).hexdigest()
+
+
+def _feature_cache_inventory_sha256(
+    cache_root: Path, root_manifest: Mapping[str, Any]
+) -> tuple[str, int]:
+    sessions = root_manifest.get("sessions")
+    if not isinstance(sessions, list):
+        raise RuntimeError("canonical feature-cache session catalogue is missing")
+    paths = [cache_root / "manifest.json"]
+    for item in sessions:
+        if not isinstance(item, Mapping) or item.get("status") != "ok":
+            continue
+        session_id = item.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise RuntimeError("canonical feature-cache session ID is invalid")
+        session_dir = cache_root / session_id
+        paths.extend(
+            session_dir / name
+            for name in (
+                "manifest.json",
+                "maps.npy",
+                "aux.npy",
+                "metadata.csv",
+                "frequencies_hz.npy",
+            )
+        )
+        for optional_name in ("radar_timing_valid_mask.npy", "range_aux.npy"):
+            optional_path = session_dir / optional_name
+            if optional_path.is_file():
+                paths.append(optional_path)
+    inventory: list[dict[str, Any]] = []
+    for path in sorted(set(paths), key=lambda item: str(item.relative_to(cache_root))):
+        if not path.is_file():
+            raise RuntimeError(f"canonical feature-cache inventory is missing: {path}")
+        inventory.append(
+            {
+                "path": str(path.relative_to(cache_root)),
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return _canonical_sha256(inventory), len(inventory)
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _canonical_content_sha256(document: Mapping[str, Any]) -> str:
+    payload = dict(document)
+    payload.pop("content_sha256", None)
+    return _canonical_sha256(payload)
+
+
+_ACQUISITION_V2_SCHEMA = "snn_rr.feature_cache_acquisition.v2"
+BASE_OOF_AUTHORITY_SCHEMA = "snn_rr.base_oof_authority.v1"
+_V2_SVD_INVENTORY_NAMES: dict[str, str] = {
+    "spectra": "spectra.npy",
+    "component_signals": "component_signals.npy",
+    "attributes": "attributes.npy",
+    "frequencies_hz": "frequencies_hz.npy",
+    "metadata": "metadata.csv",
+    "radar_timing_valid_mask": "radar_timing_valid_mask.npy",
+}
+
+
+def _read_strict_json(path: Path, *, label: str) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} repeats JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"{label} contains non-finite JSON number {value}")
+
+    try:
+        document = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_nonfinite,
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read {label} {path}: {error}") from error
+    if not isinstance(document, dict):
+        raise RuntimeError(f"{label} must be a JSON object")
+    return document
+
+
+def _require_sha256(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _resolve_bound_path(base: Path, value: Any, *, label: str) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{label} path is missing")
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    path = path.resolve()
+    if not path.is_file():
+        raise RuntimeError(f"{label} is missing: {path}")
+    return path
+
+
+def _row_fold_binding_sha256(
+    cache_index: Sequence[Any], identity: Sequence[Any], fold: Sequence[Any]
+) -> str:
+    indices = np.asarray(cache_index)
+    identities = np.asarray(identity).astype(str)
+    folds = np.asarray(fold)
+    if not (indices.ndim == identities.ndim == folds.ndim == 1) or not (
+        len(indices) == len(identities) == len(folds)
+    ):
+        raise RuntimeError("base OOF row/fold binding arrays are inconsistent")
+    try:
+        integer_indices = indices.astype(np.int64)
+        integer_folds = folds.astype(np.int64)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("base OOF row/fold binding is not integral") from error
+    if not (
+        np.array_equal(indices, integer_indices)
+        and np.array_equal(folds, integer_folds)
+    ):
+        raise RuntimeError("base OOF row/fold binding is not integral")
+    return _canonical_sha256(
+        [
+            {
+                "cache_index": int(index),
+                "identity": str(person),
+                "fold": int(fold_id),
+            }
+            for index, person, fold_id in zip(
+                integer_indices, identities, integer_folds, strict=True
+            )
+        ]
+    )
+
+
+def _exact_int_vector(value: Any, *, label: str) -> np.ndarray:
+    raw = np.asarray(value)
+    if raw.ndim != 1:
+        raise RuntimeError(f"{label} must be a one-dimensional integer vector")
+    try:
+        numeric = raw.astype(np.float64)
+        integer = raw.astype(np.int64)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError(f"{label} is not integral") from error
+    if not np.isfinite(numeric).all() or not np.array_equal(
+        numeric, integer.astype(np.float64)
+    ):
+        raise RuntimeError(f"{label} is not integral")
+    return integer
+
+
+def _base_oof_payloads(
+    csv_path: Path,
+    npz_path: Path,
+) -> tuple[pd.DataFrame, dict[str, np.ndarray], str]:
+    """Read either the historical valid OOF or authority-v1 all-window form."""
+
+    frame = pd.read_csv(csv_path).sort_values("cache_index", kind="stable").reset_index(
+        drop=True
+    )
+    with np.load(npz_path, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]) for name in archive.files}
+    if {"index", "target", "prediction", "rr_std", "fold"} <= set(arrays):
+        normalized = arrays
+        layout = "legacy_valid_oof"
+    elif {
+        "cache_index",
+        "identity",
+        "fold",
+        "reference_rr_bpm",
+        "prediction_bpm",
+        "rr_std_bpm",
+    } <= set(arrays):
+        normalized = {
+            **arrays,
+            "index": np.asarray(arrays["cache_index"]),
+            "target": np.asarray(arrays["reference_rr_bpm"]),
+            "prediction": np.asarray(arrays["prediction_bpm"]),
+            "rr_std": np.asarray(arrays["rr_std_bpm"]),
+        }
+        layout = "identity_disjoint_all_windows_v2"
+        if "rr_bpm" not in frame and "reference_rr_bpm" in frame:
+            frame = frame.rename(columns={"reference_rr_bpm": "rr_bpm"})
+    else:
+        raise RuntimeError("base OOF NPZ does not match a supported bound layout")
+    return frame, normalized, layout
+
+
+def _validate_base_oof_authority(
+    *,
+    csv_path: Path,
+    npz_path: Path,
+    provenance_path: Path,
+    svd_root_manifest: Mapping[str, Any],
+) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict[str, Any]]:
+    """Validate a label-free, identity-owned base OOF publication graph."""
+
+    provenance_path = provenance_path.resolve()
+    document = _read_strict_json(
+        provenance_path, label="base OOF provenance"
+    )
+    if document.get("schema_version") != BASE_OOF_AUTHORITY_SCHEMA:
+        raise RuntimeError("base OOF provenance schema is unsupported")
+    declared_content = _require_sha256(
+        document.get("content_sha256"), label="base OOF provenance content_sha256"
+    )
+    if declared_content != _canonical_content_sha256(document):
+        raise RuntimeError("base OOF provenance canonical content hash mismatch")
+
+    outputs = document.get("outputs")
+    if not isinstance(outputs, Mapping):
+        raise RuntimeError("base OOF provenance outputs binding is missing")
+    bound_csv = _resolve_bound_path(
+        provenance_path.parent, outputs.get("csv"), label="base OOF CSV"
+    )
+    bound_npz = _resolve_bound_path(
+        provenance_path.parent, outputs.get("npz"), label="base OOF NPZ"
+    )
+    if bound_csv != csv_path.resolve() or bound_npz != npz_path.resolve():
+        raise RuntimeError("base OOF provenance points to different CSV/NPZ files")
+    first_hashes: dict[str, str] = {}
+    for name, path in (("csv", bound_csv), ("npz", bound_npz)):
+        declared_bytes = outputs.get(f"{name}_bytes")
+        if type(declared_bytes) is not int or declared_bytes != path.stat().st_size:
+            raise RuntimeError(f"base OOF {name.upper()} byte-count mismatch")
+        declared_hash = _require_sha256(
+            outputs.get(f"{name}_sha256"),
+            label=f"base OOF {name.upper()} SHA-256",
+        )
+        observed_hash = sha256_file(path)
+        if declared_hash != observed_hash:
+            raise RuntimeError(f"base OOF {name.upper()} SHA-256 mismatch")
+        first_hashes[name] = observed_hash
+
+    frame, arrays, layout = _base_oof_payloads(bound_csv, bound_npz)
+    for name, path in (("csv", bound_csv), ("npz", bound_npz)):
+        if sha256_file(path) != first_hashes[name]:
+            raise RuntimeError(f"base OOF {name.upper()} changed while loading")
+    if layout != "identity_disjoint_all_windows_v2":
+        raise RuntimeError(
+            "scientific base OOF authority requires identity-bound all-window outputs"
+        )
+
+    if (
+        document.get("scientific_eligible") is not True
+        or document.get("claim_classification")
+        != "retrospective_scientific_noncommercial"
+        or document.get("commercial_claim_allowed") is not False
+    ):
+        raise RuntimeError("base OOF provenance is not scientifically eligible")
+    if document.get("identity_disjoint") is not True or document.get(
+        "row_exact_cover"
+    ) is not True:
+        raise RuntimeError("base OOF lacks identity-disjoint exact-cover evidence")
+    label_free = document.get("label_free_forward")
+    if not isinstance(label_free, Mapping) or (
+        label_free.get("verified") is not True
+        or label_free.get("model_inputs") != ["map", "radar_mask", "aux"]
+        or label_free.get("target_or_qc_inputs") != []
+    ):
+        raise RuntimeError("base OOF lacks exact label-free forward evidence")
+
+    cache_binding = document.get("canonical_cache_provenance")
+    if not isinstance(cache_binding, Mapping):
+        raise RuntimeError("base OOF canonical cache provenance is missing")
+    if cache_binding.get("content_sha256") != _canonical_sha256(
+        {
+            key: value
+            for key, value in cache_binding.items()
+            if key != "content_sha256"
+        }
+    ):
+        raise RuntimeError("base OOF canonical cache provenance hash mismatch")
+    if (
+        cache_binding.get("classification") != "acquisition_scientific"
+        or cache_binding.get("acquisition_schema_version")
+        != _ACQUISITION_V2_SCHEMA
+        or cache_binding.get("acquisition_mode") != "strict"
+        or cache_binding.get("scientific_eligible") is not True
+    ):
+        raise RuntimeError("base OOF canonical cache is not scientific acquisition-v2")
+    canonical_manifest_path = _resolve_bound_path(
+        provenance_path.parent,
+        cache_binding.get("root_manifest_path"),
+        label="base OOF canonical cache manifest",
+    )
+    canonical_cache_value = svd_root_manifest.get("canonical_cache")
+    if not isinstance(canonical_cache_value, str) or not canonical_cache_value:
+        raise RuntimeError("SVD canonical cache path is missing")
+    canonical_cache_path = Path(canonical_cache_value)
+    if not canonical_cache_path.is_absolute():
+        canonical_cache_path = PROJECT_ROOT / canonical_cache_path
+    if canonical_manifest_path.parent != canonical_cache_path.resolve():
+        raise RuntimeError("base OOF/SVD canonical cache path mismatch")
+    if sha256_file(canonical_manifest_path) != _require_sha256(
+        cache_binding.get("root_manifest_sha256"),
+        label="base OOF canonical cache manifest SHA-256",
+    ):
+        raise RuntimeError("base OOF canonical cache manifest changed")
+    canonical_manifest = _read_strict_json(
+        canonical_manifest_path, label="base OOF canonical cache manifest"
+    )
+    if (
+        canonical_manifest.get("content_sha256")
+        != cache_binding.get("root_manifest_content_sha256")
+        or canonical_manifest.get("content_sha256")
+        != _canonical_content_sha256(canonical_manifest)
+    ):
+        raise RuntimeError("base OOF canonical cache content hash mismatch")
+    canonical_items = canonical_manifest.get("sessions")
+    if not isinstance(canonical_items, list):
+        raise RuntimeError("base OOF canonical cache session catalogue is missing")
+    canonical_session_ids = [
+        str(item.get("session_id"))
+        for item in canonical_items
+        if isinstance(item, Mapping) and item.get("status") == "ok"
+    ]
+    if canonical_session_ids != cache_binding.get("selected_sessions"):
+        raise RuntimeError("base OOF canonical cache selected sessions mismatch")
+    canonical_inventory_sha256, canonical_inventory_count = (
+        _feature_cache_inventory_sha256(
+            canonical_manifest_path.parent, canonical_manifest
+        )
+    )
+    if (
+        canonical_inventory_sha256 != cache_binding.get("inventory_sha256")
+        or canonical_inventory_count != cache_binding.get("inventory_file_count")
+    ):
+        raise RuntimeError("base OOF canonical cache inventory changed")
+    canonical_contract = svd_root_manifest.get("canonical_acquisition_contract")
+    if not isinstance(canonical_contract, Mapping):
+        raise RuntimeError("SVD root canonical acquisition contract is missing")
+    if (
+        canonical_contract.get("schema_version") != _ACQUISITION_V2_SCHEMA
+        or canonical_contract.get("mode") != "strict"
+        or canonical_contract.get("scientific_eligible") is not True
+    ):
+        raise RuntimeError("SVD canonical cache is not strict/scientifically eligible")
+    if cache_binding.get("root_manifest_sha256") != svd_root_manifest.get(
+        "canonical_manifest_sha256"
+    ):
+        raise RuntimeError("base OOF/SVD canonical cache manifest hash mismatch")
+    reconstruction_hash = svd_root_manifest.get(
+        "canonical_acquisition_reconstruction_content_sha256"
+    )
+    if (
+        cache_binding.get("reconstruction_content_sha256") != reconstruction_hash
+        or canonical_contract.get("reconstruction_content_sha256")
+        != reconstruction_hash
+    ):
+        raise RuntimeError("base OOF/SVD reconstruction hash mismatch")
+    expected_sessions = canonical_contract.get("expected_usable_session_ids")
+    if cache_binding.get("selected_sessions") != expected_sessions:
+        raise RuntimeError("base OOF/SVD canonical session coverage mismatch")
+    reconstruction_value = canonical_contract.get("reconstruction_manifest")
+    if not isinstance(reconstruction_value, str) or not reconstruction_value:
+        raise RuntimeError("SVD canonical reconstruction path is missing")
+    reconstruction_path = Path(reconstruction_value)
+    if not reconstruction_path.is_absolute():
+        reconstruction_path = canonical_manifest_path.parent / reconstruction_path
+    reconstruction_path = reconstruction_path.resolve()
+    reconstruction = _read_strict_json(
+        reconstruction_path, label="SVD canonical acquisition reconstruction"
+    )
+    if (
+        reconstruction.get("content_sha256") != reconstruction_hash
+        or _canonical_content_sha256(reconstruction) != reconstruction_hash
+    ):
+        raise RuntimeError("SVD canonical acquisition reconstruction changed")
+
+    run_signature = document.get("run_signature")
+    if not isinstance(run_signature, str) or not run_signature:
+        raise RuntimeError("base OOF run signature is missing")
+    run_config_path = _resolve_bound_path(
+        provenance_path.parent,
+        document.get("source_run_config"),
+        label="base OOF source run config",
+    )
+    if sha256_file(run_config_path) != _require_sha256(
+        document.get("source_run_config_sha256"),
+        label="base OOF source run config SHA-256",
+    ):
+        raise RuntimeError("base OOF source run config SHA-256 mismatch")
+    run_config = _read_strict_json(run_config_path, label="base OOF source run config")
+    if run_config.get("run_signature") != run_signature:
+        raise RuntimeError("base OOF source run signature mismatch")
+    run_arguments = run_config.get("arguments")
+    if not isinstance(run_arguments, Mapping) or (
+        run_arguments.get("cache_trust_mode") != "scientific"
+        or run_config.get("claim_classification")
+        != "retrospective_scientific_noncommercial"
+    ):
+        raise RuntimeError("base OOF source run is not a scientific acquisition run")
+    run_cache_binding = run_config.get("cache_provenance")
+    if not isinstance(run_cache_binding, Mapping) or dict(run_cache_binding) != dict(
+        cache_binding
+    ):
+        raise RuntimeError("base OOF source run/canonical cache provenance mismatch")
+
+    source_hashes = document.get("runtime_source_sha256")
+    if not isinstance(source_hashes, Mapping) or not source_hashes:
+        raise RuntimeError("base OOF runtime source binding is missing")
+    for relative, digest in source_hashes.items():
+        _require_sha256(digest, label=f"base OOF source {relative} SHA-256")
+        source_path = Path(str(relative))
+        if not source_path.is_absolute():
+            source_path = PROJECT_ROOT / source_path
+        if not source_path.is_file() or sha256_file(source_path) != digest:
+            raise RuntimeError(f"base OOF runtime source changed: {relative}")
+
+    owners = document.get("identity_to_test_fold")
+    if not isinstance(owners, Mapping) or not owners:
+        raise RuntimeError("base OOF identity_to_test_fold is missing")
+    identity_to_fold: dict[str, int] = {}
+    for identity, fold_value in owners.items():
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or type(fold_value) is not int
+            or not 0 <= fold_value < 6
+        ):
+            raise RuntimeError("base OOF identity_to_test_fold is invalid")
+        identity_to_fold[identity] = fold_value
+    if document.get("identity_to_test_fold_sha256") != _canonical_sha256(
+        identity_to_fold
+    ):
+        raise RuntimeError("base OOF identity-to-fold hash mismatch")
+
+    csv_index = _exact_int_vector(
+        pd.to_numeric(frame["cache_index"], errors="raise").to_numpy(),
+        label="base OOF CSV cache_index",
+    )
+    csv_identity = frame["identity"].astype(str).to_numpy()
+    csv_fold = _exact_int_vector(
+        pd.to_numeric(frame["fold"], errors="raise").to_numpy(),
+        label="base OOF CSV fold",
+    )
+    npz_index = _exact_int_vector(
+        arrays["index"], label="base OOF NPZ cache_index"
+    )
+    npz_identity = np.asarray(arrays["identity"]).astype(str)
+    npz_fold = _exact_int_vector(arrays["fold"], label="base OOF NPZ fold")
+    if not (
+        np.array_equal(csv_index, npz_index)
+        and np.array_equal(csv_identity, npz_identity)
+        and np.array_equal(csv_fold, npz_fold)
+        and len(np.unique(csv_index)) == len(csv_index)
+        and set(csv_identity) == set(identity_to_fold)
+    ):
+        raise RuntimeError("base OOF CSV/NPZ row identity/fold binding mismatch")
+    expected_folds = np.asarray(
+        [identity_to_fold[identity] for identity in csv_identity], dtype=np.int64
+    )
+    if not np.array_equal(csv_fold, expected_folds):
+        raise RuntimeError("base OOF row was not predicted by its identity test fold")
+    _assert_close_numbers(
+        arrays["target"], frame["rr_bpm"], "authority NPZ target", atol=5e-5
+    )
+    _assert_close_numbers(
+        arrays["prediction"],
+        frame["prediction_bpm"],
+        "authority NPZ prediction",
+        atol=5e-5,
+    )
+    _assert_close_numbers(
+        arrays["rr_std"], frame["rr_std_bpm"], "authority NPZ rr_std", atol=5e-5
+    )
+    row_binding = _row_fold_binding_sha256(csv_index, csv_identity, csv_fold)
+    if document.get("row_fold_binding_sha256") != row_binding:
+        raise RuntimeError("base OOF row/fold binding hash mismatch")
+    if type(document.get("row_count")) is not int or document.get(
+        "row_count"
+    ) != len(frame):
+        raise RuntimeError("base OOF provenance row count mismatch")
+
+    checkpoints = document.get("checkpoints")
+    expected_fold_keys = {str(value) for value in range(N_FOLDS)}
+    if set(identity_to_fold.values()) != set(range(N_FOLDS)):
+        raise RuntimeError("base OOF identity owners do not cover exact folds 0..5")
+    if not isinstance(checkpoints, Mapping) or set(checkpoints) != expected_fold_keys:
+        raise RuntimeError("base OOF checkpoint catalogue does not match its folds")
+    for fold_key in sorted(expected_fold_keys, key=int):
+        record = checkpoints.get(fold_key)
+        if not isinstance(record, Mapping):
+            raise RuntimeError(f"base OOF checkpoint {fold_key} binding is invalid")
+        checkpoint_path = _resolve_bound_path(
+            provenance_path.parent,
+            record.get("path"),
+            label=f"base OOF checkpoint {fold_key}",
+        )
+        checkpoint_hash = _require_sha256(
+            record.get("sha256"), label=f"base OOF checkpoint {fold_key} SHA-256"
+        )
+        if sha256_file(checkpoint_path) != checkpoint_hash:
+            raise RuntimeError(f"base OOF checkpoint {fold_key} SHA-256 mismatch")
+        expected_test_identities = sorted(
+            identity
+            for identity, owner in identity_to_fold.items()
+            if owner == int(fold_key)
+        )
+        if sorted(map(str, record.get("test_identities", ()))) != (
+            expected_test_identities
+        ):
+            raise RuntimeError(
+                f"base OOF checkpoint {fold_key} test identities mismatch"
+            )
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        checkpoint_split = (
+            checkpoint.get("split") if isinstance(checkpoint, Mapping) else None
+        )
+        normalized_split: dict[str, set[str]] = {}
+        split_is_valid = isinstance(checkpoint_split, Mapping)
+        if isinstance(checkpoint_split, Mapping):
+            for split_name in (
+                "train_identities",
+                "validation_identities",
+                "test_identities",
+            ):
+                values = checkpoint_split.get(split_name)
+                if (
+                    not isinstance(values, (list, tuple))
+                    or not values
+                    or any(not isinstance(value, str) or not value for value in values)
+                ):
+                    split_is_valid = False
+                    normalized_split[split_name] = set()
+                else:
+                    normalized_split[split_name] = set(values)
+            split_sets = list(normalized_split.values())
+            split_is_valid = bool(
+                split_is_valid
+                and not (split_sets[0] & split_sets[1])
+                and not (split_sets[0] & split_sets[2])
+                and not (split_sets[1] & split_sets[2])
+                and set.union(*split_sets) == set(identity_to_fold)
+                and normalized_split["test_identities"]
+                == set(expected_test_identities)
+            )
+        if (
+            not isinstance(checkpoint, Mapping)
+            or checkpoint.get("model_type") != "snn"
+            or checkpoint.get("run_signature") != run_signature
+            or checkpoint.get("fold") != int(fold_key)
+            or checkpoint.get("cache_provenance") != cache_binding
+            or not split_is_valid
+        ):
+            raise RuntimeError(
+                f"base OOF checkpoint {fold_key} internal authority mismatch"
+            )
+
+    inference_signature = document.get("inference_signature")
+    if not isinstance(inference_signature, str) or not inference_signature:
+        raise RuntimeError("base OOF inference signature is missing")
+    commits = document.get("verified_fold_commits")
+    if not isinstance(commits, Mapping) or set(commits) != expected_fold_keys:
+        raise RuntimeError("base OOF verified fold-commit catalogue is incomplete")
+    committed_indices: list[np.ndarray] = []
+    for fold_key in sorted(expected_fold_keys, key=int):
+        fold_number = int(fold_key)
+        marker = commits.get(fold_key)
+        checkpoint_record = checkpoints[fold_key]
+        if not isinstance(marker, Mapping):
+            raise RuntimeError(f"base OOF fold {fold_key} commit is invalid")
+        if (
+            marker.get("fold") != fold_number
+            or marker.get("run_signature") != run_signature
+            or marker.get("inference_signature") != inference_signature
+            or marker.get("checkpoint_sha256")
+            != checkpoint_record.get("sha256")
+            or marker.get("frozen_oof_sha256")
+            != document.get("frozen_valid_oof_verification", {}).get(
+                "source_sha256"
+            )
+            or marker.get("deployment_allowlist") is None
+            or "target" in marker.get("deployment_allowlist", ())
+            or "observable" in marker.get("deployment_allowlist", ())
+            or sorted(map(str, marker.get("excluded_fields", ())))
+            != ["observable", "target"]
+        ):
+            raise RuntimeError(f"base OOF fold {fold_key} commit binding mismatch")
+        artifact = marker.get("artifact")
+        if not isinstance(artifact, Mapping):
+            raise RuntimeError(f"base OOF fold {fold_key} artifact binding is missing")
+        artifact_path = _resolve_bound_path(
+            provenance_path.parent,
+            artifact.get("path"),
+            label=f"base OOF fold {fold_key} artifact",
+        )
+        if (
+            sha256_file(artifact_path)
+            != _require_sha256(
+                artifact.get("sha256"),
+                label=f"base OOF fold {fold_key} artifact SHA-256",
+            )
+            or type(artifact.get("bytes")) is not int
+            or artifact.get("bytes") != artifact_path.stat().st_size
+        ):
+            raise RuntimeError(f"base OOF fold {fold_key} artifact content mismatch")
+        with np.load(artifact_path, allow_pickle=False) as fold_archive:
+            required_fold_fields = {
+                "index",
+                "prediction",
+                "rr_std",
+                "fold",
+                "run_signature",
+                "inference_signature",
+                "checkpoint_sha256",
+            }
+            if not required_fold_fields <= set(fold_archive.files) or (
+                {"target", "observable"} & set(fold_archive.files)
+            ):
+                raise RuntimeError(
+                    f"base OOF fold {fold_key} artifact field firewall failed"
+                )
+            artifact_indices = np.asarray(fold_archive["index"], dtype=np.int64)
+            artifact_folds = np.asarray(fold_archive["fold"], dtype=np.int64)
+            expected_rows = np.flatnonzero(csv_fold == fold_number)
+            if (
+                not np.array_equal(artifact_indices, csv_index[expected_rows])
+                or not np.all(artifact_folds == fold_number)
+                or str(np.asarray(fold_archive["run_signature"]).item())
+                != run_signature
+                or str(np.asarray(fold_archive["inference_signature"]).item())
+                != inference_signature
+                or str(np.asarray(fold_archive["checkpoint_sha256"]).item())
+                != checkpoint_record.get("sha256")
+            ):
+                raise RuntimeError(
+                    f"base OOF fold {fold_key} artifact row/authority mismatch"
+                )
+            _assert_close_numbers(
+                fold_archive["prediction"],
+                np.asarray(arrays["prediction"])[expected_rows],
+                f"fold {fold_key} artifact prediction",
+                atol=5e-5,
+            )
+            _assert_close_numbers(
+                fold_archive["rr_std"],
+                np.asarray(arrays["rr_std"])[expected_rows],
+                f"fold {fold_key} artifact rr_std",
+                atol=5e-5,
+            )
+        if (
+            marker.get("row_count") != len(artifact_indices)
+            or marker.get("expected_index_sha256")
+            != hashlib.sha256(artifact_indices.astype(np.int64).tobytes()).hexdigest()
+        ):
+            raise RuntimeError(f"base OOF fold {fold_key} commit row digest mismatch")
+        committed_indices.append(artifact_indices)
+    if not np.array_equal(np.sort(np.concatenate(committed_indices)), np.sort(csv_index)):
+        raise RuntimeError("base OOF fold artifacts do not exactly cover output rows")
+
+    frozen_record = document.get("frozen_valid_oof_verification")
+    if not isinstance(frozen_record, Mapping):
+        raise RuntimeError("base OOF frozen-valid authority is missing")
+    frozen_path = _resolve_bound_path(
+        provenance_path.parent,
+        frozen_record.get("source"),
+        label="base OOF frozen valid OOF",
+    )
+    frozen_hash = _require_sha256(
+        frozen_record.get("source_sha256"),
+        label="base OOF frozen valid OOF SHA-256",
+    )
+    if sha256_file(frozen_path) != frozen_hash:
+        raise RuntimeError("base OOF frozen valid OOF SHA-256 mismatch")
+    resolved_tolerance = frozen_record.get("resolved_tolerance")
+    if not isinstance(resolved_tolerance, Mapping):
+        raise RuntimeError("base OOF frozen parity tolerance is missing")
+    try:
+        prediction_tolerance = float(resolved_tolerance["prediction_bpm"])
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise RuntimeError("base OOF frozen prediction tolerance is invalid") from error
+    if not math.isfinite(prediction_tolerance) or not 0.0 <= prediction_tolerance <= 0.4:
+        raise RuntimeError("base OOF frozen prediction tolerance exceeds authority cap")
+    with np.load(frozen_path, allow_pickle=False) as frozen_archive:
+        required_frozen = {"index", "target", "prediction", "fold", "run_signature"}
+        if not required_frozen <= set(frozen_archive.files):
+            raise RuntimeError("base OOF frozen OOF binding arrays are incomplete")
+        if str(np.asarray(frozen_archive["run_signature"]).item()) != run_signature:
+            raise RuntimeError("base OOF frozen OOF run signature mismatch")
+        frozen_index = np.asarray(frozen_archive["index"], dtype=np.int64)
+        frozen_fold = np.asarray(frozen_archive["fold"], dtype=np.int64)
+        if len(np.unique(frozen_index)) != len(frozen_index):
+            raise RuntimeError("base OOF frozen OOF contains duplicate indices")
+        output_position = {int(index): pos for pos, index in enumerate(csv_index)}
+        if not set(map(int, frozen_index)) <= set(output_position):
+            raise RuntimeError("base OOF frozen OOF indices are absent from all-window output")
+        output_rows = np.asarray(
+            [output_position[int(index)] for index in frozen_index], dtype=np.int64
+        )
+        if not np.array_equal(frozen_fold, csv_fold[output_rows]):
+            raise RuntimeError("base OOF frozen OOF fold binding mismatch")
+        _assert_close_numbers(
+            frozen_archive["target"],
+            np.asarray(arrays["target"])[output_rows],
+            "frozen OOF target",
+            atol=5e-5,
+        )
+        _assert_close_numbers(
+            frozen_archive["prediction"],
+            np.asarray(arrays["prediction"])[output_rows],
+            "frozen OOF prediction",
+            atol=prediction_tolerance,
+        )
+
+    return frame, arrays, {
+        "classification": "verified_scientific_base_oof",
+        "scientific_eligible": True,
+        "provenance_path": str(provenance_path),
+        "provenance_sha256": sha256_file(provenance_path),
+        "provenance_content_sha256": declared_content,
+        "csv_sha256": first_hashes["csv"],
+        "npz_sha256": first_hashes["npz"],
+        "run_signature": run_signature,
+        "row_fold_binding_sha256": row_binding,
+        "canonical_cache_provenance_content_sha256": cache_binding.get(
+            "content_sha256"
+        ),
+    }
+
+
+def _binding_is_acquisition_v2(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("schema_version") == _ACQUISITION_V2_SCHEMA
+    )
+
+
+def _session_has_acquisition_v2_indicator(manifest: Mapping[str, Any]) -> bool:
+    inventory = manifest.get("file_inventory")
+    return bool(
+        _binding_is_acquisition_v2(manifest.get("canonical_acquisition_binding"))
+        or manifest.get("canonical_acquisition_session_manifest_sha256") is not None
+        or manifest.get("radar_timing_valid_mask_shape") is not None
+        or manifest.get("radar_timing_summary") is not None
+        or (
+            isinstance(inventory, Mapping)
+            and "radar_timing_valid_mask" in inventory
+        )
+    )
+
+
+def _manifest_session_ids(value: Any, *, location: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"{location} must be a non-empty session-ID list")
+    session_ids: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            raise RuntimeError(f"{location} contains an invalid session ID")
+        session_ids.append(item)
+    if len(set(session_ids)) != len(session_ids):
+        raise RuntimeError(f"{location} contains duplicate session IDs")
+    return session_ids
+
+
+def _validate_acquisition_v2_svd_scope(
+    root_manifest: Mapping[str, Any],
+    session_manifests: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Derive, rather than trust, an acquisition-v2 SVD scientific claim."""
+
+    root_contract = root_manifest.get("canonical_acquisition_contract")
+    root_sessions_value = root_manifest.get("sessions")
+    root_sessions = (
+        root_sessions_value if isinstance(root_sessions_value, list) else []
+    )
+    indicated_v2 = bool(
+        _binding_is_acquisition_v2(root_contract)
+        or root_manifest.get(
+            "canonical_acquisition_reconstruction_content_sha256"
+        )
+        is not None
+        or any(
+            isinstance(item, Mapping)
+            and _session_has_acquisition_v2_indicator(item)
+            for item in root_sessions
+        )
+        or any(
+            _session_has_acquisition_v2_indicator(manifest)
+            for manifest in session_manifests.values()
+        )
+    )
+    if not indicated_v2:
+        return False
+    if not _binding_is_acquisition_v2(root_contract):
+        raise RuntimeError(
+            "acquisition-v2 SVD input lacks its canonical root acquisition contract"
+        )
+    if root_manifest.get("content_sha256") != _canonical_content_sha256(
+        root_manifest
+    ):
+        raise RuntimeError("acquisition-v2 SVD root content hash mismatch")
+
+    expected = _manifest_session_ids(
+        root_manifest.get("expected_session_ids"),
+        location="SVD expected_session_ids",
+    )
+    selected = _manifest_session_ids(
+        root_manifest.get("selected_session_ids"),
+        location="SVD selected_session_ids",
+    )
+    if root_manifest.get("expected_session_ids_sha256") != _canonical_sha256(
+        expected
+    ):
+        raise RuntimeError("SVD expected-session ID hash mismatch")
+    if root_manifest.get("selected_session_ids_sha256") != _canonical_sha256(
+        selected
+    ):
+        raise RuntimeError("SVD selected-session ID hash mismatch")
+    subjects_filter_applied = root_manifest.get("subjects_filter_applied")
+    if type(subjects_filter_applied) is not bool:
+        raise RuntimeError("SVD subjects_filter_applied must be an explicit boolean")
+    if not isinstance(root_sessions_value, list) or any(
+        not isinstance(item, dict) for item in root_sessions_value
+    ):
+        raise RuntimeError("acquisition-v2 SVD root session catalogue is malformed")
+    catalogue_ids = _manifest_session_ids(
+        [item.get("session_id") for item in root_sessions_value],
+        location="SVD root catalogue session IDs",
+    )
+    if catalogue_ids != selected:
+        raise RuntimeError("SVD selected-session IDs differ from its root catalogue")
+
+    selection_is_full = bool(not subjects_filter_applied and selected == expected)
+    derived_scope = "full_cohort" if selection_is_full else "diagnostic_subset"
+    if root_manifest.get("selection_scope") != derived_scope:
+        raise RuntimeError("SVD selection_scope does not match its selection evidence")
+
+    assert isinstance(root_contract, Mapping)
+    canonical_expected = _manifest_session_ids(
+        root_contract.get("expected_usable_session_ids"),
+        location="canonical acquisition expected usable-session IDs",
+    )
+    canonical_cache = _manifest_session_ids(
+        root_contract.get("cache_usable_session_ids"),
+        location="canonical acquisition cache usable-session IDs",
+    )
+    if root_contract.get(
+        "expected_usable_session_ids_sha256"
+    ) != _canonical_sha256(canonical_expected):
+        raise RuntimeError("canonical acquisition expected-session hash mismatch")
+    if root_contract.get("cache_usable_session_ids_sha256") != _canonical_sha256(
+        canonical_cache
+    ):
+        raise RuntimeError("canonical acquisition cache-session hash mismatch")
+    if canonical_expected != expected or canonical_cache != expected:
+        raise RuntimeError("SVD canonical cache/cohort coverage mismatch")
+
+    canonical_full = bool(
+        root_contract.get("selection_scope") == "full_cohort"
+        and root_contract.get("full_cohort_complete") is True
+        and root_contract.get("reconstruction_full_cohort_complete") is True
+    )
+    all_results_ok = bool(root_sessions_value) and all(
+        item.get("status") == "ok" for item in root_sessions_value
+    )
+    derived_complete = bool(selection_is_full and all_results_ok and canonical_full)
+    if type(root_manifest.get("full_cohort_complete")) is not bool or (
+        root_manifest.get("full_cohort_complete") != derived_complete
+    ):
+        raise RuntimeError(
+            "SVD full_cohort_complete does not match its bound cohort evidence"
+        )
+    if set(session_manifests) != set(selected):
+        raise RuntimeError("SVD child manifest set differs from selected sessions")
+
+    bindings_scientific = True
+    for item in root_sessions_value:
+        session_id = str(item["session_id"])
+        child = session_manifests[session_id]
+        declared_child_content = child.get("content_sha256")
+        if (
+            not isinstance(declared_child_content, str)
+            or declared_child_content != _canonical_content_sha256(child)
+            or item.get("content_sha256") != declared_child_content
+        ):
+            raise RuntimeError(f"SVD child manifest content mismatch: {session_id}")
+        root_binding = item.get("canonical_acquisition_binding")
+        child_binding = child.get("canonical_acquisition_binding")
+        if root_binding != child_binding:
+            raise RuntimeError(
+                f"SVD root/child acquisition binding mismatch: {session_id}"
+            )
+        bindings_scientific = bool(
+            bindings_scientific
+            and isinstance(child_binding, Mapping)
+            and child_binding.get("schema_version") == _ACQUISITION_V2_SCHEMA
+            and child_binding.get("scientific_eligible") is True
+        )
+    derived_scientific = bool(
+        derived_complete
+        and root_contract.get("mode") == "strict"
+        and root_contract.get("scientific_eligible") is True
+        and bindings_scientific
+    )
+    if type(root_manifest.get("scientific_eligible")) is not bool or (
+        root_manifest.get("scientific_eligible") != derived_scientific
+    ):
+        raise RuntimeError(
+            "SVD scientific_eligible does not match its acquisition evidence"
+        )
+    return derived_scientific
+
+
+def _validate_v2_svd_inventory(
+    session_dir: Path,
+    root_item: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    require_all_timing_valid: bool,
+    detach_from_mutable_source: bool,
+) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict[str, str]]:
+    """Verify every acquisition-v2 SVD payload against its bound inventory.
+
+    Scientific training must not retain a live mmap into cache files after
+    verification.  In that mode every array is copied into owned memory and
+    made read-only before a final source-file rehash closes the load/copy
+    interval.  Diagnostic acquisition inputs may retain the historical mmap
+    behavior because they cannot acquire a scientific claim.
+    """
+
+    session_id = str(root_item.get("session_id", ""))
+    declared_content = manifest.get("content_sha256")
+    if (
+        not isinstance(declared_content, str)
+        or declared_content != _canonical_content_sha256(manifest)
+        or root_item.get("content_sha256") != declared_content
+    ):
+        raise RuntimeError(f"SVD v2 manifest content mismatch for {session_id}")
+    if any(root_item.get(key) != value for key, value in manifest.items()):
+        raise RuntimeError(f"SVD v2 root/child manifest mismatch for {session_id}")
+    root_binding = root_item.get("canonical_acquisition_binding")
+    child_binding = manifest.get("canonical_acquisition_binding")
+    if not _binding_is_acquisition_v2(child_binding) or root_binding != child_binding:
+        raise RuntimeError(
+            f"SVD v2 root/child acquisition binding mismatch for {session_id}"
+        )
+
+    inventory = manifest.get("file_inventory")
+    if not isinstance(inventory, Mapping) or set(inventory) != set(
+        _V2_SVD_INVENTORY_NAMES
+    ):
+        raise RuntimeError(f"SVD v2 file inventory is incomplete for {session_id}")
+    if manifest.get("inventory_sha256") != _canonical_sha256(inventory):
+        raise RuntimeError(f"SVD v2 inventory hash mismatch for {session_id}")
+    if root_item.get("inventory_sha256") != manifest.get("inventory_sha256"):
+        raise RuntimeError(f"SVD v2 root/child inventory mismatch for {session_id}")
+
+    actual_hashes: dict[str, str] = {}
+    arrays: dict[str, np.ndarray] = {}
+    metadata: pd.DataFrame | None = None
+    for name, expected_name in _V2_SVD_INVENTORY_NAMES.items():
+        binding = inventory.get(name)
+        if not isinstance(binding, Mapping) or binding.get("path") != expected_name:
+            raise RuntimeError(
+                f"SVD v2 inventory redirects {name} for {session_id}"
+            )
+        path = (session_dir / expected_name).resolve()
+        try:
+            path.relative_to(session_dir.resolve())
+        except ValueError as error:
+            raise RuntimeError(
+                f"SVD v2 inventory path escapes its session for {session_id}/{name}"
+            ) from error
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"SVD v2 inventory payload is missing for {session_id}/{name}: {path}"
+            )
+        declared_bytes = binding.get("bytes")
+        if (
+            type(declared_bytes) is not int
+            or declared_bytes < 0
+            or path.stat().st_size != declared_bytes
+        ):
+            raise RuntimeError(
+                f"SVD v2 inventory byte count mismatch for {session_id}/{name}"
+            )
+        actual_sha = sha256_file(path)
+        actual_hashes[name] = actual_sha
+        if binding.get("sha256") != actual_sha:
+            raise RuntimeError(
+                f"SVD v2 inventory SHA-256 mismatch for {session_id}/{name}"
+            )
+        declared_shape = binding.get("shape")
+        declared_dtype = binding.get("dtype")
+        if not isinstance(declared_shape, list) or any(
+            type(value) is not int or value < 0 for value in declared_shape
+        ):
+            raise RuntimeError(
+                f"SVD v2 inventory shape is invalid for {session_id}/{name}"
+            )
+        if name == "metadata":
+            if declared_dtype != "csv":
+                raise RuntimeError(
+                    f"SVD v2 metadata dtype is invalid for {session_id}"
+                )
+            metadata = pd.read_csv(path)
+            if list(metadata.shape) != declared_shape:
+                raise RuntimeError(
+                    f"SVD v2 metadata shape mismatch for {session_id}"
+                )
+        else:
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            arrays[name] = array
+            if list(array.shape) != declared_shape or str(array.dtype) != declared_dtype:
+                raise RuntimeError(
+                    f"SVD v2 array declaration mismatch for {session_id}/{name}"
+                )
+
+    timing = arrays["radar_timing_valid_mask"]
+    spectra = arrays["spectra"]
+    component_signals = arrays["component_signals"]
+    attributes = arrays["attributes"]
+    frequencies = arrays["frequencies_hz"]
+    if metadata is None:
+        raise RuntimeError(f"SVD v2 metadata inventory is absent for {session_id}")
+    row_count = len(metadata)
+    if (
+        timing.dtype != np.bool_
+        or timing.shape != (row_count, 3, 320)
+        or spectra.ndim != 5
+        or spectra.shape[0] != row_count
+        or spectra.shape[1] != 3
+        or component_signals.shape != (*spectra.shape[:4], 320)
+        or attributes.shape != (*spectra.shape[:4], 5)
+        or frequencies.ndim != 1
+        or spectra.shape[-1] != len(frequencies)
+    ):
+        raise RuntimeError(f"SVD v2 payload shapes are inconsistent for {session_id}")
+    if manifest.get("radar_timing_valid_mask_shape") != list(timing.shape):
+        raise RuntimeError(f"SVD v2 timing-mask shape claim mismatch for {session_id}")
+    invalid_count = int(np.size(timing) - np.count_nonzero(timing))
+    if manifest.get("radar_timing_invalid_interval_count") != invalid_count:
+        raise RuntimeError(f"SVD v2 timing-mask count claim mismatch for {session_id}")
+    expected_mask_contract = {
+        "mask_required_for_gap_tolerant_consumers": True,
+        "scientific_source_requires_all_true": True,
+        "diagnostic_output_trainable": False,
+        "invalid_cells_are_exact_zero_but_not_semantic_measurements": True,
+    }
+    if manifest.get("radar_timing_mask_contract") != expected_mask_contract:
+        raise RuntimeError(f"SVD v2 timing-mask policy mismatch for {session_id}")
+    if require_all_timing_valid and not bool(np.asarray(timing).all()):
+        raise RuntimeError(
+            f"scientific SVD input contains invalid radar timing for {session_id}"
+        )
+    if detach_from_mutable_source:
+        detached: dict[str, np.ndarray] = {}
+        for name, array in arrays.items():
+            owned = np.array(array, copy=True, order="C")
+            if not owned.flags.owndata or isinstance(owned, np.memmap):
+                raise RuntimeError(
+                    f"scientific SVD array was not detached for {session_id}/{name}"
+                )
+            owned.setflags(write=False)
+            detached[name] = owned
+        arrays = detached
+    for name, expected_name in _V2_SVD_INVENTORY_NAMES.items():
+        if sha256_file(session_dir / expected_name) != actual_hashes[name]:
+            raise RuntimeError(
+                f"SVD v2 inventory payload changed during validation for "
+                f"{session_id}/{name}"
+            )
+    return arrays, metadata, actual_hashes
 
 
 def _json_ready(value: Any) -> Any:
@@ -322,6 +1443,7 @@ def load_aligned_experiment(
     oof_csv: Path,
     oof_npz: Path | None = None,
     *,
+    base_oof_provenance: Path | None = None,
     verify_file_hashes: bool = True,
 ) -> AlignedSVDExperiment:
     """Load memmapped SVD sessions and enforce an exact OOF row binding."""
@@ -336,20 +1458,57 @@ def load_aligned_experiment(
     root_manifest_path = cache_root / "manifest.json"
     if not (root_manifest_path.is_file() and oof_csv.is_file() and oof_npz.is_file()):
         raise FileNotFoundError("SVD manifest, base OOF CSV and base OOF NPZ are required")
-    root_manifest = json.loads(root_manifest_path.read_text(encoding="utf-8"))
+    root_manifest = _read_strict_json(root_manifest_path, label="SVD root manifest")
     if not bool(root_manifest.get("valid_only", False)):
         raise RuntimeError("this trainer requires a valid-reference-only SVD cache")
+
+    root_contract = root_manifest.get("canonical_acquisition_contract")
+    root_is_v2 = _binding_is_acquisition_v2(root_contract)
+    root_sessions_value = root_manifest.get("sessions")
+    root_session_items = (
+        root_sessions_value if isinstance(root_sessions_value, list) else []
+    )
+    root_indicates_v2 = bool(
+        root_is_v2
+        or root_manifest.get(
+            "canonical_acquisition_reconstruction_content_sha256"
+        )
+        is not None
+        or any(
+            isinstance(item, Mapping)
+            and _session_has_acquisition_v2_indicator(item)
+            for item in root_session_items
+        )
+    )
+    if root_indicates_v2 and not root_is_v2:
+        raise RuntimeError(
+            "acquisition-v2 SVD input lacks its canonical root acquisition contract"
+        )
+    if root_is_v2:
+        declared_root_content = root_manifest.get("content_sha256")
+        if (
+            not isinstance(declared_root_content, str)
+            or declared_root_content != _canonical_content_sha256(root_manifest)
+        ):
+            raise RuntimeError("acquisition-v2 SVD root content hash mismatch")
+        if root_manifest.get("pipeline_sha256") != _current_svd_pipeline_sha256():
+            raise RuntimeError("acquisition-v2 SVD pipeline source hash mismatch")
+    root_scientific = root_manifest.get("scientific_eligible") is True
 
     sessions: list[SVDSessionArrays] = []
     metadata_parts: list[pd.DataFrame] = []
     common_frequencies: np.ndarray | None = None
     file_manifest: dict[str, Any] = {}
-    listed = [item for item in root_manifest.get("sessions", []) if item.get("status") == "ok"]
+    listed = [item for item in root_session_items if item.get("status") == "ok"]
     if not listed:
         raise RuntimeError("SVD root manifest contains no usable sessions")
     for slot, item in enumerate(listed):
         session_id = str(item["session_id"])
-        session_dir = cache_root / session_id
+        session_dir = (cache_root / session_id).resolve()
+        try:
+            session_dir.relative_to(cache_root)
+        except ValueError as error:
+            raise RuntimeError(f"SVD session path escapes its cache: {session_id}") from error
         paths = {
             "manifest": session_dir / "manifest.json",
             "metadata": session_dir / "metadata.csv",
@@ -360,11 +1519,44 @@ def load_aligned_experiment(
         missing = [str(path) for path in paths.values() if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"incomplete SVD session {session_id}: {missing}")
-        manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
-        session_metadata = pd.read_csv(paths["metadata"])
-        spectra = np.load(paths["spectra"], mmap_mode="r", allow_pickle=False)
-        attributes = np.load(paths["attributes"], mmap_mode="r", allow_pickle=False)
-        frequencies = np.load(paths["frequencies_hz"], allow_pickle=False)
+        manifest = _read_strict_json(
+            paths["manifest"], label=f"SVD session manifest {session_id}"
+        )
+        child_indicates_v2 = _session_has_acquisition_v2_indicator(manifest)
+        item_indicates_v2 = _session_has_acquisition_v2_indicator(item)
+        if root_is_v2 != child_indicates_v2 or root_is_v2 != item_indicates_v2:
+            raise RuntimeError(
+                f"SVD acquisition-v2 provenance is partial for {session_id}"
+            )
+        component_signals: np.ndarray | None = None
+        radar_timing_valid_mask: np.ndarray | None = None
+        if root_is_v2:
+            arrays, session_metadata, inventory_hashes = _validate_v2_svd_inventory(
+                session_dir,
+                item,
+                manifest,
+                require_all_timing_valid=root_scientific,
+                detach_from_mutable_source=root_scientific,
+            )
+            spectra = arrays["spectra"]
+            component_signals = arrays["component_signals"]
+            attributes = arrays["attributes"]
+            frequencies = arrays["frequencies_hz"]
+            radar_timing_valid_mask = arrays["radar_timing_valid_mask"]
+            hashes = {
+                "manifest": sha256_file(paths["manifest"]),
+                **inventory_hashes,
+            }
+        else:
+            session_metadata = pd.read_csv(paths["metadata"])
+            spectra = np.load(paths["spectra"], mmap_mode="r", allow_pickle=False)
+            attributes = np.load(paths["attributes"], mmap_mode="r", allow_pickle=False)
+            frequencies = np.load(paths["frequencies_hz"], allow_pickle=False)
+            hashes = (
+                {name: sha256_file(path) for name, path in paths.items()}
+                if verify_file_hashes
+                else {"manifest": sha256_file(paths["manifest"])}
+            )
         count = len(session_metadata)
         if spectra.ndim != 5 or spectra.shape[:1] != (count,) or spectra.shape[1] != 3:
             raise RuntimeError(f"invalid spectra shape for {session_id}: {spectra.shape}")
@@ -385,11 +1577,6 @@ def load_aligned_experiment(
         if session_metadata["cache_index"].duplicated().any():
             raise RuntimeError(f"duplicate cache_index inside {session_id}")
 
-        hashes = (
-            {name: sha256_file(path) for name, path in paths.items()}
-            if verify_file_hashes
-            else {"manifest": sha256_file(paths["manifest"])}
-        )
         file_manifest[session_id] = hashes
         sessions.append(
             SVDSessionArrays(
@@ -400,6 +1587,8 @@ def load_aligned_experiment(
                 metadata=session_metadata,
                 manifest=manifest,
                 files_sha256=hashes,
+                radar_timing_valid_mask=radar_timing_valid_mask,
+                component_signals=component_signals,
             )
         )
         part = session_metadata.copy()
@@ -416,7 +1605,82 @@ def load_aligned_experiment(
     if len(source) != int(root_manifest.get("row_count", -1)):
         raise RuntimeError("SVD root manifest row count does not bind loaded sessions")
 
-    base = pd.read_csv(oof_csv).sort_values("cache_index", kind="stable").reset_index(drop=True)
+    if root_is_v2:
+        root_scientific = _validate_acquisition_v2_svd_scope(
+            root_manifest,
+            {session.session_id: session.manifest for session in sessions},
+        )
+
+    authority_path = (
+        Path(base_oof_provenance).resolve()
+        if base_oof_provenance is not None
+        else (oof_csv.parent / "provenance.json").resolve()
+    )
+    if base_oof_provenance is not None and not authority_path.is_file():
+        raise FileNotFoundError(
+            f"explicit base OOF provenance is missing: {authority_path}"
+        )
+    if root_is_v2 and root_scientific:
+        if not authority_path.is_file():
+            raise RuntimeError(
+                "scientific acquisition-v2 SVD training requires an explicit "
+                "--base-oof-provenance or the exact CSV-sibling provenance.json"
+            )
+        base, base_arrays, base_authority = _validate_base_oof_authority(
+            csv_path=oof_csv,
+            npz_path=oof_npz,
+            provenance_path=authority_path,
+            svd_root_manifest=root_manifest,
+        )
+    else:
+        base, base_arrays, base_layout = _base_oof_payloads(oof_csv, oof_npz)
+        base_authority = {
+            "classification": "historical_diagnostic_unverified_base_oof",
+            "scientific_eligible": False,
+            "layout": base_layout,
+            "provenance_path": (
+                str(authority_path) if authority_path.is_file() else None
+            ),
+            "reason": (
+                "legacy or diagnostic SVD input; base predictions were not "
+                "accepted as scientific OOF authority"
+            ),
+        }
+
+    # Scientific authority is validated over the complete canonical cache.
+    # The SVD cache is valid-reference-only, so select its exact immutable
+    # cache indices only after validating the full publication and row owners.
+    source_indices = source["cache_index"].to_numpy(dtype=np.int64)
+    base_indices = pd.to_numeric(base["cache_index"], errors="raise").to_numpy(
+        dtype=np.int64
+    )
+    if root_is_v2 and root_scientific:
+        positions_by_index = {
+            int(index): position for position, index in enumerate(base_indices)
+        }
+        if len(positions_by_index) != len(base_indices):
+            raise RuntimeError("base OOF cache_index must be unique")
+        missing_indices = sorted(set(source_indices) - set(positions_by_index))
+        if missing_indices:
+            raise RuntimeError(
+                "scientific base OOF does not cover SVD cache indices: "
+                f"{missing_indices[:5]}"
+            )
+        selected_positions = np.asarray(
+            [positions_by_index[int(index)] for index in source_indices],
+            dtype=np.int64,
+        )
+        base = base.iloc[selected_positions].reset_index(drop=True)
+        base_arrays = {
+            name: (
+                np.asarray(value)[selected_positions]
+                if np.asarray(value).ndim >= 1
+                and len(np.asarray(value)) == len(base_indices)
+                else np.asarray(value)
+            )
+            for name, value in base_arrays.items()
+        }
+
     if base["cache_index"].duplicated().any():
         raise RuntimeError("base OOF cache_index must be unique")
     if not np.array_equal(
@@ -434,21 +1698,29 @@ def load_aligned_experiment(
     ):
         _assert_close_numbers(source[column], base[column], column, atol=tolerance)
 
-    with np.load(oof_npz, allow_pickle=False) as archive:
-        required = {"index", "target", "prediction", "rr_std", "fold"}
-        missing = sorted(required - set(archive.files))
-        if missing:
-            raise RuntimeError(f"base OOF NPZ is missing binding arrays: {missing}")
-        if not np.array_equal(
-            archive["index"].astype(np.int64), base["cache_index"].to_numpy(np.int64)
-        ):
-            raise RuntimeError("base OOF CSV/NPZ cache_index binding failed")
-        _assert_close_numbers(archive["target"], base["rr_bpm"], "NPZ target", atol=5e-5)
-        _assert_close_numbers(
-            archive["prediction"], base["prediction_bpm"], "NPZ prediction", atol=5e-5
-        )
-        if not np.array_equal(archive["fold"].astype(np.int64), base["fold"].to_numpy(np.int64)):
-            raise RuntimeError("base OOF CSV/NPZ fold binding failed")
+    required = {"index", "target", "prediction", "rr_std", "fold"}
+    missing = sorted(required - set(base_arrays))
+    if missing:
+        raise RuntimeError(f"base OOF NPZ is missing binding arrays: {missing}")
+    if not np.array_equal(
+        np.asarray(base_arrays["index"]).astype(np.int64),
+        base["cache_index"].to_numpy(np.int64),
+    ):
+        raise RuntimeError("base OOF CSV/NPZ cache_index binding failed")
+    _assert_close_numbers(
+        base_arrays["target"], base["rr_bpm"], "NPZ target", atol=5e-5
+    )
+    _assert_close_numbers(
+        base_arrays["prediction"],
+        base["prediction_bpm"],
+        "NPZ prediction",
+        atol=5e-5,
+    )
+    if not np.array_equal(
+        np.asarray(base_arrays["fold"]).astype(np.int64),
+        base["fold"].to_numpy(np.int64),
+    ):
+        raise RuntimeError("base OOF CSV/NPZ fold binding failed")
 
     # Preserve SVD labels/metadata as the canonical side and copy only
     # deployment outputs plus the already-frozen fold from the base OOF.
@@ -475,13 +1747,29 @@ def load_aligned_experiment(
         "root_manifest_sha256": sha256_file(root_manifest_path),
         "base_oof_csv_sha256": sha256_file(oof_csv),
         "base_oof_npz_sha256": sha256_file(oof_npz),
+        "base_oof_authority": base_authority,
+        "claim_classification": (
+            "retrospective_scientific_noncommercial"
+            if base_authority["scientific_eligible"] is True
+            else "historical_diagnostic_noncommercial"
+        ),
         "session_files_sha256": file_manifest,
         "row_binding_sha256": hashlib.sha256(
             binding_payload.to_csv(index=False, float_format="%.9g").encode("utf-8")
         ).hexdigest(),
         "row_count": int(len(joined)),
         "feature_allowlist": list(resolve_base_feature_columns(joined)),
-        "component_signals_status": "retained_for_future_temporal_extension_not_loaded_or_input",
+        "component_signals_status": (
+            "acquisition_v2_hash_verified_not_model_input"
+            if root_is_v2
+            else "retained_for_future_temporal_extension_not_loaded_or_input"
+        ),
+        "radar_availability_authority": (
+            "radar_timing_valid_mask_all_320_intervals"
+            if root_is_v2
+            else "legacy_numeric_fallback"
+        ),
+        "acquisition_v2_authority_hashes_mandatory": bool(root_is_v2),
     }
     return AlignedSVDExperiment(
         cache_root=cache_root,
@@ -639,7 +1927,19 @@ class SVDSourceDataset(Dataset[dict[str, Tensor]]):
         # not intentionally mutate inputs.
         spectra_array = np.array(spectra, copy=True)
         attributes_array = np.array(attributes, copy=True)
-        radar_mask = spectra_array.sum(axis=(1, 2, 3)) > 0
+        structural_mask = self.experiment.structural_radar_mask_for_position(position)
+        if structural_mask is None:
+            # Historical caches have no structural timing mask.  Preserve their
+            # legacy numeric-availability behavior without allowing it to act as
+            # authority for acquisition-v2 inputs.
+            radar_mask = np.any(np.abs(spectra_array) > 0, axis=(1, 2, 3))
+        else:
+            radar_mask = np.asarray(structural_mask, dtype=np.bool_)
+            if radar_mask.shape != (spectra_array.shape[0],):
+                raise RuntimeError("structural radar mask has an invalid shape")
+            spectra_array[~radar_mask] = 0
+            attributes_array[~radar_mask] = 0
+        base_feature_array = np.array(self.base_features[position], copy=True)
         classical = np.asarray(
             [
                 row.get("classical_rr_bpm", np.nan),
@@ -654,6 +1954,29 @@ class SVDSourceDataset(Dataset[dict[str, Tensor]]):
             [1.0 + 3.0 * (1.0 - np.clip(confidence, 0.0, 1.0)), 1.5, 1.5, 1.5],
             dtype=np.float32,
         )
+        if structural_mask is not None:
+            classical[1:][~radar_mask] = 0
+            classical_std[1:][~radar_mask] = 0
+            feature_columns = tuple(
+                self.experiment.provenance.get("feature_allowlist", ())
+            )
+            if not bool(radar_mask.all()):
+                # The fused classical candidate/confidence were computed from
+                # all three cached views before structural timing was known.
+                # They are not valid evidence when any contributing view is
+                # unavailable.
+                classical[0] = 0
+                classical_std[0] = 0
+                if "classical_confidence" in feature_columns:
+                    base_feature_array[
+                        feature_columns.index("classical_confidence")
+                    ] = 0
+            for radar_index, available in enumerate(radar_mask, start=1):
+                column = f"radar_peak_{radar_index}_bpm"
+                if not available and column in feature_columns:
+                    base_feature_array[feature_columns.index(column)] = 0
+            if not bool(radar_mask.all()) and "radar_peak_spread_bpm" in feature_columns:
+                base_feature_array[feature_columns.index("radar_peak_spread_bpm")] = 0
         reference_sigma = float(row.get("reference_sigma_bpm", 1.0))
         reference_quality = float(row.get("reference_quality", 1.0))
         observable = bool(row.get("radar_observable", True))
@@ -664,7 +1987,7 @@ class SVDSourceDataset(Dataset[dict[str, Tensor]]):
             "base_std": torch.tensor(
                 max(0.25, float(row.get("rr_std_bpm", 1.5))), dtype=torch.float32
             ),
-            "base_features": torch.from_numpy(self.base_features[position]),
+            "base_features": torch.from_numpy(base_feature_array),
             "classical_rr": torch.from_numpy(classical),
             "classical_std": torch.from_numpy(classical_std),
             "radar_mask": torch.from_numpy(radar_mask),
@@ -1687,6 +3010,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=PROJECT_ROOT / "artifacts/runs/ensemble_structured_exact/ensemble_oof.npz",
     )
     parser.add_argument(
+        "--base-oof-provenance",
+        type=Path,
+        help=(
+            "authority JSON for scientific acquisition-v2 base predictions; "
+            "defaults only to provenance.json beside --base-oof-csv"
+        ),
+    )
+    parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "artifacts/runs/svd_source_snn"
     )
     parser.add_argument("--fold", default="all")
@@ -1694,7 +3025,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--verify-file-hashes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--verify-file-hashes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "verify legacy-cache payload hashes when available; acquisition-v2 "
+            "authority hashes are always mandatory"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--preset", choices=("tiny", "compact", "full"), default="compact")
@@ -1760,6 +3099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.svd_cache,
         args.base_oof_csv,
         args.base_oof_npz,
+        base_oof_provenance=args.base_oof_provenance,
         verify_file_hashes=args.verify_file_hashes,
     )
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

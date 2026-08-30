@@ -37,5 +37,10 @@ _base._runtime_sources = _runtime_sources_v4
 _base.default_freeze_spec = _default_freeze_spec_v4
 
 
+def main() -> int:
+    verifier_v4.configure_deterministic_cpu_runtime()
+    return int(_base.main())
+
+
 if __name__ == "__main__":
-    raise SystemExit(_base.main())
+    raise SystemExit(main())

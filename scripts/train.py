@@ -13,6 +13,10 @@ Full six-fold teacher and distilled SNN run::
 
     python scripts/train.py --model both
 
+Historical-cache reproduction (always classified noncommercial)::
+
+    python scripts/train.py --model both --cache-trust-mode legacy
+
 One-fold smoke run on CPU::
 
     python scripts/train.py --fold 0 --model teacher --epochs 1 \
@@ -56,6 +60,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from snn_rr.cache import (  # noqa: E402
+    ACQUISITION_CACHE_SCHEMA_VERSION_V2,
     FeatureCache,
     append_causal_history_features,
     fit_aux_scaler,
@@ -250,6 +255,78 @@ def apply_coupled_radar_dropout(
     return dropped_map, kept, masked_aux
 
 
+def append_mask_aware_causal_history_features(
+    cache: FeatureCache,
+) -> tuple[np.ndarray, list[str]]:
+    """Append history without treating structurally invalid windows as evidence."""
+
+    metadata = cache.metadata
+    timing_mask = cache.radar_timing_valid_mask
+    if timing_mask is not None:
+        timing = np.asarray(timing_mask, dtype=np.bool_)
+        if timing.ndim != 3 or timing.shape[:2] != (len(metadata), 3):
+            raise ValueError(
+                "radar_timing_valid_mask must have shape [row, 3, samples]"
+            )
+        # Classical RR/confidence/spread fuse the current radar views.  If any
+        # required interval of any view is invalid, none of those fused values
+        # may become a later window's apparently available history feature.
+        complete_window = timing.all(axis=(1, 2))
+        if not bool(complete_window.all()):
+            metadata = metadata.copy()
+            metadata.loc[
+                ~complete_window,
+                [
+                    "classical_rr_bpm",
+                    "classical_confidence",
+                    "radar_peak_spread_bpm",
+                ],
+            ] = np.nan
+    return append_causal_history_features(cache.aux, metadata)
+
+
+def _mask_structural_radar_inputs(
+    radar_map: Tensor,
+    aux: Tensor,
+    available: Tensor,
+    *,
+    layout: AuxiliaryLayout | None,
+) -> tuple[Tensor, Tensor]:
+    """Zero structurally invalid radar cells after all numeric scaling."""
+
+    if radar_map.ndim < 2 or radar_map.shape[0] != 3:
+        raise ValueError("cached radar map must have a three-view leading axis")
+    if available.shape != (3,):
+        raise ValueError("structural radar availability must have shape [3]")
+    available = available.to(dtype=torch.bool)
+    masked_map = radar_map.clone()
+    masked_map[~available] = 0
+    masked_aux = aux.clone()
+    if bool(available.all()) or masked_aux.numel() == 0:
+        return masked_map, masked_aux
+    if layout is None:
+        # A caller that does not declare the flattened layout cannot safely
+        # retain any auxiliary cell after a structural view failure.
+        masked_aux.zero_()
+        return masked_map, masked_aux
+    if masked_aux.ndim != 1 or masked_aux.shape[0] < layout.base_dim:
+        raise ValueError("aux tensor is shorter than its declared base layout")
+    frequency_bins = layout.frequency_bins
+    spectra_per_radar = 2 * frequency_bins
+    scalar_start = 3 * spectra_per_radar
+    for radar in range(3):
+        if not bool(available[radar]):
+            masked_aux[
+                radar * spectra_per_radar : (radar + 1) * spectra_per_radar
+            ] = 0
+            masked_aux[
+                scalar_start + radar * 8 : scalar_start + (radar + 1) * 8
+            ] = 0
+    fused_start = scalar_start + 3 * 8
+    masked_aux[fused_start : layout.base_dim] = 0
+    return masked_map, masked_aux
+
+
 class CachedRadarDataset(Dataset[dict[str, Any]]):
     """Zero-copy view over cache rows (conversion happens one batch at a time)."""
 
@@ -258,11 +335,26 @@ class CachedRadarDataset(Dataset[dict[str, Any]]):
         cache: FeatureCache,
         aux_scaled: np.ndarray,
         indices: Sequence[int] | np.ndarray,
+        auxiliary_layout: AuxiliaryLayout | None = None,
     ) -> None:
         self.maps = cache.maps
         self.aux = aux_scaled
         self.indices = np.asarray(indices, dtype=np.int64)
+        self.radar_timing_valid_mask = cache.radar_timing_valid_mask
+        self.auxiliary_layout = auxiliary_layout
         metadata = cache.metadata
+        if self.radar_timing_valid_mask is not None:
+            timing = np.asarray(self.radar_timing_valid_mask)
+            if (
+                timing.dtype != np.bool_
+                or timing.ndim != 3
+                or timing.shape[0] != len(metadata)
+                or timing.shape[1] != self.maps.shape[1]
+                or timing.shape[2] <= 0
+            ):
+                raise ValueError(
+                    "radar_timing_valid_mask must be bool [row, radar, samples]"
+                )
         self.rr = pd.to_numeric(metadata["rr_bpm"], errors="coerce").to_numpy(
             dtype=np.float32
         )
@@ -288,11 +380,26 @@ class CachedRadarDataset(Dataset[dict[str, Any]]):
         index = int(self.indices[item])
         # Cache maps are finite float16 arrays.  Keep them in float16 through
         # collation/transfer, then cast once on the target device.
-        radar_map = torch.from_numpy(np.asarray(self.maps[index]))
-        available = torch.ones(radar_map.shape[0], dtype=torch.bool)
+        radar_map = torch.from_numpy(np.array(self.maps[index], copy=True))
+        aux = torch.from_numpy(
+            np.array(self.aux[index], dtype=np.float32, copy=True)
+        )
+        if self.radar_timing_valid_mask is None:
+            available = torch.ones(radar_map.shape[0], dtype=torch.bool)
+        else:
+            timing = np.asarray(
+                self.radar_timing_valid_mask[index], dtype=np.bool_
+            )
+            available = torch.from_numpy(np.all(timing, axis=1))
+            radar_map, aux = _mask_structural_radar_inputs(
+                radar_map,
+                aux,
+                available,
+                layout=self.auxiliary_layout,
+            )
         return {
             "map": radar_map,
-            "aux": torch.from_numpy(np.asarray(self.aux[index], dtype=np.float32)),
+            "aux": aux,
             "radar_mask": available,
             "rr": torch.tensor(self.rr[index], dtype=torch.float32),
             "reference_valid": torch.tensor(
@@ -491,8 +598,14 @@ def make_loader(
     rr_balance_power: float = 0.0,
     rr_balance_bin_width: float = 5.0,
     samples_per_epoch: int | None = None,
+    auxiliary_layout: AuxiliaryLayout | None = None,
 ) -> DataLoader[dict[str, Any]]:
-    dataset = CachedRadarDataset(cache, aux_scaled, indices)
+    dataset = CachedRadarDataset(
+        cache,
+        aux_scaled,
+        indices,
+        auxiliary_layout=auxiliary_layout,
+    )
     generator = torch.Generator().manual_seed(seed)
     sampler = None
     if train:
@@ -1325,6 +1438,7 @@ def _base_checkpoint(
     aux_scale: np.ndarray,
     run_signature: str,
     rng_state: Mapping[str, Any],
+    cache_provenance: Mapping[str, Any],
     distillation_teacher_provenance: Mapping[str, Any] | None,
     split_authority_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1342,6 +1456,7 @@ def _base_checkpoint(
         "aux_scale": torch.from_numpy(aux_scale),
         "run_signature": run_signature,
         "rng_state": dict(rng_state),
+        "cache_provenance": dict(cache_provenance),
         "distillation_teacher_provenance": (
             dict(distillation_teacher_provenance)
             if distillation_teacher_provenance is not None
@@ -1396,6 +1511,11 @@ def teacher_checkpoint_provenance(
                 split_provenance.get("excluded_identities", ())
             ),
             scaler_identities=list(split_provenance.get("scaler_identities", ())),
+        )
+    cache_provenance = checkpoint.get("cache_provenance")
+    if isinstance(cache_provenance, Mapping):
+        provenance["cache_provenance_sha256"] = str(
+            cache_provenance.get("content_sha256", "")
         )
     return provenance
 
@@ -1467,6 +1587,12 @@ def validate_external_teacher_checkpoint(
     checkpoint_split_provenance = checkpoint.get("split_authority_provenance")
     if checkpoint_split_provenance != expected_split_provenance:
         errors.append("split authority provenance mismatch")
+    expected_cache_provenance = current_run_context.get("cache_provenance")
+    if (
+        expected_cache_provenance is not None
+        and checkpoint.get("cache_provenance") != expected_cache_provenance
+    ):
+        errors.append("cache provenance mismatch")
 
     model_kwargs = checkpoint.get("model_kwargs")
     if not isinstance(model_kwargs, Mapping):
@@ -1587,6 +1713,11 @@ def validate_external_teacher_checkpoint(
             errors.append("teacher cache shape is incompatible with the student run")
         if teacher_run.get("split_authority") != expected_split_provenance:
             errors.append("teacher run split authority provenance mismatch")
+        if (
+            expected_cache_provenance is not None
+            and teacher_run.get("cache_provenance") != expected_cache_provenance
+        ):
+            errors.append("teacher run cache provenance mismatch")
 
     if errors:
         raise RuntimeError(
@@ -1614,6 +1745,7 @@ def train_stage(
     args: argparse.Namespace,
     quality_positive_weight: float,
     auxiliary_layout: AuxiliaryLayout | None,
+    cache_provenance: Mapping[str, Any],
     distill_bank: Tensor | None = None,
     distillation_teacher_provenance: Mapping[str, Any] | None = None,
     split_authority_provenance: Mapping[str, Any] | None = None,
@@ -1645,6 +1777,8 @@ def train_stage(
         checkpoint = torch.load(last_path, map_location=device, weights_only=False)
         if checkpoint.get("run_signature") != run_signature:
             raise RuntimeError(f"resume signature mismatch: {last_path}")
+        if checkpoint.get("cache_provenance") != dict(cache_provenance):
+            raise RuntimeError(f"resume cache provenance mismatch: {last_path}")
         if checkpoint.get("distillation_teacher_provenance") != (
             dict(distillation_teacher_provenance)
             if distillation_teacher_provenance is not None
@@ -1752,6 +1886,7 @@ def train_stage(
             aux_scale=aux_scale,
             run_signature=run_signature,
             rng_state=rng_state,
+            cache_provenance=cache_provenance,
             distillation_teacher_provenance=distillation_teacher_provenance,
             split_authority_provenance=split_authority_provenance,
         )
@@ -1840,6 +1975,7 @@ def train_stage(
         "best_validation": validation_summary,
         "best_checkpoint": str(best_path),
         "last_checkpoint": str(last_path),
+        "cache_provenance": dict(cache_provenance),
         "distillation_teacher_provenance": (
             dict(distillation_teacher_provenance)
             if distillation_teacher_provenance is not None
@@ -2110,6 +2246,8 @@ def _run_signature(args: argparse.Namespace) -> str:
         "deterministic",
         "amp",
         "cache_dir",
+        "cache_trust_mode",
+        "cache_provenance_sha256",
         "identity_split_manifest_sha256",
         "folds",
         "rr_range",
@@ -2161,6 +2299,8 @@ def _run_signature(args: argparse.Namespace) -> str:
     # authority binding is present only when that mode is explicitly enabled.
     if payload["identity_split_manifest_sha256"] is None:
         payload.pop("identity_split_manifest_sha256")
+    if payload["cache_provenance_sha256"] is None:
+        payload.pop("cache_provenance_sha256")
     encoded = json.dumps(_strict_json_value(payload), sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
 
@@ -2181,7 +2321,66 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
     amp_enabled = bool(args.amp and device.type == "cuda")
 
-    cache = load_feature_cache(args.cache_dir)
+    trust_mode = str(args.cache_trust_mode)
+    cache = load_feature_cache(
+        args.cache_dir,
+        require_acquisition_contract=trust_mode != "legacy",
+        require_scientific_eligible=trust_mode == "scientific",
+    )
+    if cache.provenance is None:
+        raise RuntimeError("feature cache loader returned no verified provenance")
+    cache_classification = cache.provenance.classification
+    if trust_mode == "scientific":
+        if cache_classification != "acquisition_scientific":
+            raise ValueError(
+                "scientific cache trust mode requires a verified v2 full-cohort "
+                "acquisition cache"
+            )
+        if cache.radar_timing_valid_mask is None:
+            raise RuntimeError(
+                "scientific acquisition training requires the bound structural "
+                "radar timing mask"
+            )
+        if not bool(np.asarray(cache.radar_timing_valid_mask, dtype=np.bool_).all()):
+            raise RuntimeError(
+                "scientific acquisition training requires every radar interval "
+                "to be structurally valid"
+            )
+        claim_classification = "retrospective_scientific_noncommercial"
+    elif trust_mode == "acquisition-diagnostic":
+        if not cache_classification.startswith("acquisition_"):
+            raise ValueError(
+                "acquisition-diagnostic trust mode requires an acquisition-aware cache"
+            )
+        if (
+            cache.provenance.acquisition_schema_version
+            != ACQUISITION_CACHE_SCHEMA_VERSION_V2
+            or cache.radar_timing_valid_mask is None
+        ):
+            raise ValueError(
+                "acquisition-diagnostic training requires a verified v2 cache and "
+                "its structural radar timing mask; older acquisition caches are "
+                "inspection-only"
+            )
+        claim_classification = "acquisition_diagnostic_noncommercial"
+    elif trust_mode == "legacy":
+        if cache_classification != "legacy":
+            raise ValueError(
+                "legacy trust mode cannot downgrade an acquisition-aware cache; "
+                "use scientific or acquisition-diagnostic"
+            )
+        claim_classification = "retrospective_legacy_noncommercial"
+    else:  # argparse guards this; keep programmatic callers fail closed.
+        raise ValueError(f"unknown cache trust mode: {trust_mode}")
+    cache_provenance = cache.provenance.to_dict()
+    cache_provenance["content_sha256"] = cache.provenance.content_sha256
+    args.cache_provenance_sha256 = cache.provenance.content_sha256
+    args.claim_classification = claim_classification
+    args.radar_timing_mask_policy = (
+        "all_required_window_intervals"
+        if cache.radar_timing_valid_mask is not None
+        else "legacy_all_views_assumed"
+    )
     stored_range_bins = int(cache.maps.shape[-1])
     if stored_range_bins % 2:
         raise ValueError(
@@ -2218,6 +2417,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         aux=cache.aux,
         metadata=cache.metadata,
         frequencies_hz=cache.frequencies_hz,
+        provenance=cache.provenance,
+        radar_timing_valid_mask=cache.radar_timing_valid_mask,
     )
     base_aux_dim = int(cache.aux.shape[1])
     auxiliary_layout = (
@@ -2232,14 +2433,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     history_names: list[str] = []
     if args.use_aux and args.causal_history:
-        augmented_aux, history_names = append_causal_history_features(
-            cache.aux, cache.metadata
-        )
+        augmented_aux, history_names = append_mask_aware_causal_history_features(cache)
         cache = FeatureCache(
             maps=cache.maps,
             aux=augmented_aux,
             metadata=cache.metadata,
             frequencies_hz=cache.frequencies_hz,
+            provenance=cache.provenance,
+            radar_timing_valid_mask=cache.radar_timing_valid_mask,
         )
     if cache.maps.shape[-1] % args.input_branches:
         raise ValueError(
@@ -2280,6 +2481,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(
                 f"output directory contains a different run signature: {output_dir}"
             )
+        if existing.get("cache_provenance") != cache_provenance:
+            raise RuntimeError(
+                f"output directory contains different cache provenance: {output_dir}"
+            )
         expected_authority = (
             split_authority.checkpoint_provenance()
             if split_authority is not None
@@ -2302,6 +2507,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "torch_version": torch.__version__,
         "determinism": determinism_audit(args.deterministic),
+        "cache_provenance": cache_provenance,
+        "claim_classification": claim_classification,
+        "commercial_claim_allowed": False,
         "cache_shape": {
             "maps": list(cache.maps.shape),
             "aux": list(cache.aux.shape),
@@ -2469,6 +2677,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             rr_balance_power=args.rr_balance_power,
             rr_balance_bin_width=args.rr_balance_bin_width,
             samples_per_epoch=args.samples_per_epoch,
+            auxiliary_layout=auxiliary_layout,
         )
         validation_loader = make_loader(
             cache,
@@ -2479,6 +2688,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             device=device,
             seed=fold_seed + 1,
             train=False,
+            auxiliary_layout=auxiliary_layout,
         )
         test_loader = make_loader(
             cache,
@@ -2489,6 +2699,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             device=device,
             seed=fold_seed + 2,
             train=False,
+            auxiliary_layout=auxiliary_layout,
         )
         quality_positive_weight = _quality_positive_weight(
             cache.metadata, train_index
@@ -2527,6 +2738,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args=args,
                 quality_positive_weight=quality_positive_weight,
                 auxiliary_layout=auxiliary_layout,
+                cache_provenance=cache_provenance,
                 split_authority_provenance=(
                     split_authority.checkpoint_provenance()
                     if split_authority is not None
@@ -2605,6 +2817,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             "maps": list(cache.maps.shape),
                             "aux": list(cache.aux.shape),
                         },
+                        "cache_provenance": cache_provenance,
                         "split_authority_provenance": (
                             split_authority.checkpoint_provenance()
                             if split_authority is not None
@@ -2651,6 +2864,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     device=device,
                     seed=fold_seed + 3,
                     train=False,
+                    auxiliary_layout=auxiliary_layout,
                 )
                 distill_bank = precompute_teacher_bank(
                     teacher,
@@ -2690,6 +2904,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args=args,
                 quality_positive_weight=quality_positive_weight,
                 auxiliary_layout=auxiliary_layout,
+                cache_provenance=cache_provenance,
                 distill_bank=distill_bank,
                 distillation_teacher_provenance=distillation_teacher_provenance,
                 split_authority_provenance=(
@@ -2734,6 +2949,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     report: dict[str, Any] = {
         "run_signature": signature,
+        "cache_provenance": cache_provenance,
+        "claim_classification": claim_classification,
+        "commercial_claim_allowed": False,
         "determinism": determinism_audit(args.deterministic),
         "selected_folds": selected_folds,
         "folds": fold_reports,
@@ -2791,6 +3009,17 @@ def build_parser(config: Mapping[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, default=Path("configs/default.yaml"))
     parser.add_argument("--cache-dir", type=Path, default=Path(data.get("cache_dir", "artifacts/cache/rf32s")))
+    parser.add_argument(
+        "--cache-trust-mode",
+        choices=("scientific", "acquisition-diagnostic", "legacy"),
+        default="scientific",
+        help=(
+            "scientific (default) requires a verified v2 full-cohort acquisition "
+            "cache; acquisition-diagnostic explicitly declares a structural-mask-aware "
+            "diagnostic-only path and forbids scientific claims; legacy is an explicit noncommercial "
+            "compatibility mode for historical caches"
+        ),
+    )
     parser.add_argument(
         "--identity-split-manifest",
         type=Path,

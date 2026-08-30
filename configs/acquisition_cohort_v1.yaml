@@ -1,0 +1,125 @@
+schema: snn_rr.acquisition_cohort_authority.v1
+content_sha256: 9fe44a6fd0b809dde063f845c3fdfdc60352eda462abc0d0a40e15207d814454
+
+expected_session_count: 30
+expected_usable_session_count: 29
+expected_physical_identity_count: 18
+
+expected_session_ids:
+  - S01_CMS
+  - S02_RJS
+  - S03_PSJ
+  - S04_KTW
+  - S05_LHS
+  - S06_LDW
+  - S07_KDM
+  - S08_MDO
+  - S09_HDH
+  - S10_JKH
+  - S11_SJE
+  - S12_KDH
+  - S13_KTW
+  - S14_MDO
+  - S15_JKH
+  - S16_LJH
+  - S17_RJS
+  - S18_LJH
+  - S19_CHW
+  - S20_YSE
+  - S21_PSJ
+  - S22_KJH
+  - S23_KDM
+  - S24_KHJ
+  - S25_GEC
+  - S26_LDW
+  - S27_HDH
+  - S28_KDH
+  - S29_LHS
+  - S30_SJE
+
+expected_usable_session_ids:
+  - S01_CMS
+  - S02_RJS
+  - S03_PSJ
+  - S04_KTW
+  - S05_LHS
+  - S06_LDW
+  - S07_KDM
+  - S08_MDO
+  - S09_HDH
+  - S10_JKH
+  - S11_SJE
+  - S12_KDH
+  - S13_KTW
+  - S14_MDO
+  - S15_JKH
+  - S16_LJH
+  - S17_RJS
+  - S18_LJH
+  - S19_CHW
+  - S20_YSE
+  - S21_PSJ
+  - S22_KJH
+  - S23_KDM
+  - S25_GEC
+  - S26_LDW
+  - S27_HDH
+  - S28_KDH
+  - S29_LHS
+  - S30_SJE
+
+excluded_sessions:
+  - session_id: S24_KHJ
+    reason: empty_three_radar_streams
+
+session_identities:
+  - {session_id: S01_CMS, physical_identity: CMS}
+  - {session_id: S02_RJS, physical_identity: RJS}
+  - {session_id: S03_PSJ, physical_identity: PSJ}
+  - {session_id: S04_KTW, physical_identity: KTW}
+  - {session_id: S05_LHS, physical_identity: LHS}
+  - {session_id: S06_LDW, physical_identity: LDW}
+  - {session_id: S07_KDM, physical_identity: KDM}
+  - {session_id: S08_MDO, physical_identity: MDO}
+  - {session_id: S09_HDH, physical_identity: HDH}
+  - {session_id: S10_JKH, physical_identity: JKH}
+  - {session_id: S11_SJE, physical_identity: SJE}
+  - {session_id: S12_KDH, physical_identity: KDH}
+  - {session_id: S13_KTW, physical_identity: KTW}
+  - {session_id: S14_MDO, physical_identity: MDO}
+  - {session_id: S15_JKH, physical_identity: JKH}
+  - {session_id: S16_LJH, physical_identity: LJH}
+  - {session_id: S17_RJS, physical_identity: PJS}
+  - {session_id: S18_LJH, physical_identity: LJH}
+  - {session_id: S19_CHW, physical_identity: CHW}
+  - {session_id: S20_YSE, physical_identity: YSE}
+  - {session_id: S21_PSJ, physical_identity: PSJ}
+  - {session_id: S22_KJH, physical_identity: KJH}
+  - {session_id: S23_KDM, physical_identity: KDM}
+  - {session_id: S24_KHJ, physical_identity: KHJ}
+  - {session_id: S25_GEC, physical_identity: GEC}
+  - {session_id: S26_LDW, physical_identity: LDW}
+  - {session_id: S27_HDH, physical_identity: HDH}
+  - {session_id: S28_KDH, physical_identity: KDH}
+  - {session_id: S29_LHS, physical_identity: LHS}
+  - {session_id: S30_SJE, physical_identity: SJE}
+
+expected_physical_identities:
+  - CMS
+  - RJS
+  - PSJ
+  - KTW
+  - LHS
+  - LDW
+  - KDM
+  - MDO
+  - HDH
+  - JKH
+  - SJE
+  - KDH
+  - LJH
+  - PJS
+  - CHW
+  - YSE
+  - KJH
+  - GEC

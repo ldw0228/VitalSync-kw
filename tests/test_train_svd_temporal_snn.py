@@ -8,6 +8,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from snn_rr.svd_temporal_models import TemporalSourceSeparatedRRSNN
@@ -31,6 +32,87 @@ fit_temporal_signal_normalizer = _TRAIN.fit_temporal_signal_normalizer
 fit_train_only_action_calibration = _TRAIN.fit_train_only_action_calibration
 load_temporal_aligned_experiment = _TRAIN.load_temporal_aligned_experiment
 main = _TRAIN.main
+
+
+def _svd_provenance_fields() -> dict[str, object]:
+    return {
+        "valid_only": True,
+        "label_inputs": [
+            "canonical_metadata.reference_valid (row_selection_only)"
+        ],
+        "feature_value_label_inputs": [],
+        "target_dependent_row_selection": True,
+        "causality_scope": {
+            "window_end_prediction_uses_only_past_32s": True,
+            "within_window_prefix_causal_representation": False,
+            "streaming_prefix_causality_claim_allowed": False,
+        },
+    }
+
+
+def _acquisition_v2_scope_fixture(
+    *,
+    expected: list[str] | None = None,
+    selected: list[str] | None = None,
+    subjects_filter_applied: bool = False,
+    canonical_scientific: bool = True,
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    expected_ids = ["S01_A", "S02_B"] if expected is None else list(expected)
+    selected_ids = list(expected_ids if selected is None else selected)
+    binding = {
+        "schema_version": "snn_rr.feature_cache_acquisition.v2",
+        "scientific_eligible": True,
+    }
+    children: dict[str, dict[str, object]] = {}
+    catalogue: list[dict[str, object]] = []
+    for session_id in selected_ids:
+        child: dict[str, object] = {
+            "canonical_acquisition_binding": dict(binding),
+            "valid_only": True,
+        }
+        child["content_sha256"] = _TRAIN._canonical_content_sha256(child)
+        children[session_id] = child
+        catalogue.append(
+            {
+                "session_id": session_id,
+                "status": "ok",
+                "canonical_acquisition_binding": dict(binding),
+                "content_sha256": child["content_sha256"],
+            }
+        )
+    selection_is_full = bool(
+        not subjects_filter_applied and selected_ids == expected_ids
+    )
+    canonical_contract = {
+        "schema_version": "snn_rr.feature_cache_acquisition.v2",
+        "mode": "strict",
+        "selection_scope": "full_cohort",
+        "reconstruction_full_cohort_complete": True,
+        "full_cohort_complete": True,
+        "scientific_eligible": canonical_scientific,
+        "expected_usable_session_ids": expected_ids,
+        "expected_usable_session_ids_sha256": _TRAIN._canonical_sha256(
+            expected_ids
+        ),
+        "cache_usable_session_ids": expected_ids,
+        "cache_usable_session_ids_sha256": _TRAIN._canonical_sha256(expected_ids),
+    }
+    root: dict[str, object] = {
+        "canonical_acquisition_contract": canonical_contract,
+        "expected_session_ids": expected_ids,
+        "expected_session_ids_sha256": _TRAIN._canonical_sha256(expected_ids),
+        "selected_session_ids": selected_ids,
+        "selected_session_ids_sha256": _TRAIN._canonical_sha256(selected_ids),
+        "subjects_filter_applied": subjects_filter_applied,
+        "selection_scope": (
+            "full_cohort" if selection_is_full else "diagnostic_subset"
+        ),
+        "full_cohort_complete": selection_is_full,
+        "scientific_eligible": selection_is_full and canonical_scientific,
+        "sessions": catalogue,
+    }
+    root["content_sha256"] = _TRAIN._canonical_content_sha256(root)
+    return root, children
 
 
 def _metadata(rows: int) -> pd.DataFrame:
@@ -79,7 +161,7 @@ def _memory_experiment(*, rows: int = 12, time_steps: int = 32) -> TemporalAlign
         component_signals=signals,
         attributes=attributes,
         metadata=metadata,
-        manifest={"valid_only": True, "label_inputs": []},
+        manifest=_svd_provenance_fields(),
         component_signals_sha256="synthetic",
     )
     return TemporalAlignedExperiment(
@@ -112,8 +194,7 @@ def _write_disk_experiment(root: Path, *, rows: int = 12) -> tuple[Path, Path, P
     session_manifest = {
         "session_id": "SYNTH",
         "row_count": rows,
-        "valid_only": True,
-        "label_inputs": [],
+        **_svd_provenance_fields(),
         "component_signals_shape": list(signals.shape),
         "attributes_shape": list(attributes.shape),
         "spectra_shape": list(spectra.shape),
@@ -169,6 +250,78 @@ def test_train_only_normalizer_and_action_threshold_ignore_outer_rows() -> None:
     assert 0.05 <= calibration.gate_margin_bpm <= 0.50
     assert calibration.fit_identity_count == len(
         np.unique(experiment.metadata.iloc[train]["identity"])
+    )
+
+
+def test_acquisition_v2_training_scope_accepts_bound_full_cohort() -> None:
+    root, children = _acquisition_v2_scope_fixture()
+    _TRAIN._validate_acquisition_v2_training_scope(root, children)
+
+
+def test_acquisition_v2_subset_is_diagnostic_and_not_trainable() -> None:
+    root, children = _acquisition_v2_scope_fixture(
+        selected=["S01_A"], subjects_filter_applied=True
+    )
+    with pytest.raises(RuntimeError, match="requires a strict.*full-cohort"):
+        _TRAIN._validate_acquisition_v2_training_scope(root, children)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("selected_session_ids_sha256", "0" * 64, "selected-session ID hash"),
+        ("selection_scope", "full_cohort", "selection_scope"),
+        ("full_cohort_complete", True, "full_cohort_complete"),
+        ("scientific_eligible", True, "scientific_eligible"),
+    ],
+)
+def test_acquisition_v2_subset_claim_tampering_fails_closed(
+    field: str, value: object, message: str
+) -> None:
+    root, children = _acquisition_v2_scope_fixture(
+        selected=["S01_A"], subjects_filter_applied=True
+    )
+    root[field] = value
+    root["content_sha256"] = _TRAIN._canonical_content_sha256(root)
+    with pytest.raises(RuntimeError, match=message):
+        _TRAIN._validate_acquisition_v2_training_scope(root, children)
+
+
+def test_acquisition_v2_canonical_downgrade_or_binding_strip_fails_closed() -> None:
+    root, children = _acquisition_v2_scope_fixture()
+    del root["canonical_acquisition_contract"]
+    root["content_sha256"] = _TRAIN._canonical_content_sha256(root)
+    with pytest.raises(RuntimeError, match="lacks its canonical root"):
+        _TRAIN._validate_acquisition_v2_training_scope(root, children)
+
+    root, children = _acquisition_v2_scope_fixture(canonical_scientific=False)
+    with pytest.raises(RuntimeError, match="requires a strict.*full-cohort"):
+        _TRAIN._validate_acquisition_v2_training_scope(root, children)
+
+    root, children = _acquisition_v2_scope_fixture()
+    del root["canonical_acquisition_contract"]
+    for child in children.values():
+        del child["canonical_acquisition_binding"]
+        child["radar_timing_valid_mask_shape"] = [1, 3, 320]
+        child["content_sha256"] = _TRAIN._canonical_content_sha256(child)
+    for item in root["sessions"]:
+        session_id = str(item["session_id"])
+        replacement = {
+            "session_id": session_id,
+            "status": "ok",
+            **children[session_id],
+        }
+        item.clear()
+        item.update(replacement)
+    root["content_sha256"] = _TRAIN._canonical_content_sha256(root)
+    with pytest.raises(RuntimeError, match="lacks its canonical root"):
+        _TRAIN._validate_acquisition_v2_training_scope(root, children)
+
+
+def test_acquisition_scope_validator_preserves_legacy_behavior() -> None:
+    _TRAIN._validate_acquisition_v2_training_scope(
+        {"sessions": [{"session_id": "LEGACY", "status": "ok"}]},
+        {"LEGACY": {"valid_only": True}},
     )
 
 
@@ -253,6 +406,30 @@ def test_coupled_radar_dropout_never_leaks_attributes_or_drops_everything() -> N
     )
 
 
+def test_temporal_dataset_uses_structural_mask_not_numeric_signal_values() -> None:
+    experiment = _memory_experiment(rows=12)
+    experiment.sessions[0].component_signals[:, 0] = 0
+    timing = np.ones((12, 3, 320), dtype=np.bool_)
+    timing[:, 1, 0] = False
+    experiment.sessions[0].radar_timing_valid_mask = timing
+    normalizer = _TRAIN.TemporalSignalNormalizer(
+        center=np.zeros(2, dtype=np.float32),
+        scale=np.ones(2, dtype=np.float32),
+        clip=np.full(2, 10.0, dtype=np.float32),
+        fit_positions_sha256="synthetic",
+        sampled_values_per_variant=1,
+    )
+    sample = _TRAIN.TemporalSVDDataset(experiment, [0], normalizer)[0]
+
+    assert bool(sample["radar_mask"][0]) is True
+    assert torch.count_nonzero(sample["component_signals"][0]) == 0
+    assert bool(sample["radar_mask"][1]) is False
+    assert torch.count_nonzero(sample["component_signals"][1]) == 0
+    assert torch.count_nonzero(sample["attributes"][1]) == 0
+    assert sample["classical_rr"][0] == 0
+    assert sample["classical_rr"][2] == 0
+
+
 def test_valid_only_disk_alignment_loads_component_signal_binding(tmp_path: Path) -> None:
     cache, base_csv, base_npz = _write_disk_experiment(tmp_path)
     experiment = load_temporal_aligned_experiment(
@@ -261,7 +438,9 @@ def test_valid_only_disk_alignment_loads_component_signal_binding(tmp_path: Path
     assert len(experiment.metadata) == 12
     assert experiment.sessions[0].component_signals.shape == (12, 3, 2, 2, 320)
     assert experiment.provenance["valid_only_alignment_enforced"] is True
-    assert experiment.provenance["component_signals_status"].startswith("loaded")
+    assert experiment.provenance["component_signals_status"].startswith(
+        "window_end"
+    )
     np.testing.assert_array_equal(
         experiment.metadata["cache_index"].to_numpy(), np.arange(100, 112)
     )

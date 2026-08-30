@@ -125,48 +125,72 @@ def test_temporal_snn_shapes_finite_chronology_and_backward() -> None:
 
 
 def test_causal_prefix_is_invariant_to_future_samples() -> None:
-    model = _small_model().eval()
-    signals, attributes, base_rr, base_std, classical_rr = _inputs()
-    full = model(
-        signals,
-        attributes,
-        base_rr,
-        base_std,
-        classical_rr,
-        return_sequences=True,
-    )
-
-    changed = signals.clone()
-    changed[..., 160:] = 50.0 * torch.randn_like(changed[..., 160:])
-    future_changed = model(
-        changed,
-        attributes,
-        base_rr,
-        base_std,
-        classical_rr,
-        return_sequences=True,
-    )
-    prefix_only = model(
-        signals[..., :160],
-        attributes,
-        base_rr,
-        base_std,
-        classical_rr,
-        return_sequences=True,
-    )
-
-    for key in (
-        "downsampled_sequence",
-        "temporal_state_sequence",
-        "multiscale_token_sequence",
-    ):
-        torch.testing.assert_close(
-            full[key][:, :40], future_changed[key][:, :40], atol=0.0, rtol=0.0
+    # Single-thread CPU selected the shape-dependent 1x1-convolution path that
+    # exposed the historical order-sensitive full-suite failure.
+    original_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        model = _small_model().eval()
+        signals, attributes, base_rr, base_std, classical_rr = _inputs()
+        full = model(
+            signals,
+            attributes,
+            base_rr,
+            base_std,
+            classical_rr,
+            return_sequences=True,
         )
-        torch.testing.assert_close(
-            full[key][:, :40], prefix_only[key], atol=0.0, rtol=0.0
+
+        changed = signals.clone()
+        changed[..., 160:] = 50.0 * torch.randn_like(changed[..., 160:])
+        future_changed = model(
+            changed,
+            attributes,
+            base_rr,
+            base_std,
+            classical_rr,
+            return_sequences=True,
         )
-    assert prefix_only["downsampled_steps"].item() == 40
+        prefix_only = model(
+            signals[..., :160],
+            attributes,
+            base_rr,
+            base_std,
+            classical_rr,
+            return_sequences=True,
+        )
+
+        for key in (
+            "downsampled_sequence",
+            "temporal_state_sequence",
+            "multiscale_token_sequence",
+        ):
+            torch.testing.assert_close(
+                full[key][:, :40], future_changed[key][:, :40], atol=0.0, rtol=0.0
+            )
+            torch.testing.assert_close(
+                full[key][:, :40], prefix_only[key], atol=0.0, rtol=0.0
+            )
+        assert prefix_only["downsampled_steps"].item() == 40
+    finally:
+        torch.set_num_threads(original_threads)
+
+
+def test_prefix_invariant_projection_preserves_cpu_autocast_dtype() -> None:
+    original_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        model = _small_model().eval()
+        values = torch.randn(2, 8, 320)
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            full = model.downsample(values)
+            prefix = model.downsample(values[..., :160])
+        assert full.dtype == prefix.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            full[..., :40], prefix, atol=0.0, rtol=0.0
+        )
+    finally:
+        torch.set_num_threads(original_threads)
 
 
 def test_negative_gate_is_safe_and_initial_residual_is_zero() -> None:

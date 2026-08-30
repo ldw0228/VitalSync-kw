@@ -11,15 +11,26 @@ from __future__ import annotations
 
 import torch
 
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-
 import verify_harmonic_set_deployment as _base  # noqa: E402
+
+
+def configure_deterministic_cpu_runtime() -> None:
+    """Pin the CLI process without mutating a process that merely imports us."""
+
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    if torch.get_num_threads() != 1 or torch.get_num_interop_threads() != 1:
+        raise RuntimeError("failed to enforce the locked single-thread CPU runtime")
 
 
 def __getattr__(name: str):
     return getattr(_base, name)
 
 
+def main() -> int:
+    configure_deterministic_cpu_runtime()
+    return int(_base.main())
+
+
 if __name__ == "__main__":
-    raise SystemExit(_base.main())
+    raise SystemExit(main())

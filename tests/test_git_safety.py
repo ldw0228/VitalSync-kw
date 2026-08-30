@@ -12,6 +12,7 @@ def test_git_safety_allows_reviewed_core_files() -> None:
         "configs/default.yaml",
         "restore/bootstrap_env.sh",
         "artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-30.md",
+        "artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md",
     )
 
     for path in safe_paths:
@@ -40,4 +41,3 @@ def test_git_safety_rejects_secrets_and_unreviewed_files() -> None:
     assert path_reasons("credentials-production.json")
     assert path_reasons("new_unreviewed_root_file.txt")
     assert path_reasons("artifacts/new_report.md")
-

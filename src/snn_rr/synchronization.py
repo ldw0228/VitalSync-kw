@@ -79,6 +79,9 @@ class SynchronizationConfig:
     ambiguity_rmse_margin_s: float = 0.05
     ambiguity_score_margin: float = 1.0
     manual_review_min_pairs: int = 2
+    radar_metadata_warning_allowlist: Mapping[str, Sequence[str]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "SynchronizationConfig":
@@ -102,7 +105,14 @@ class SynchronizationConfig:
 
         flattened: dict[str, Any] = {}
         scalar_names = set(cls.__dataclass_fields__)
-        category_names = {"input", "radar_motion", "rsp_marker", "matching", "decision"}
+        category_names = {
+            "input",
+            "radar_motion",
+            "rsp_marker",
+            "matching",
+            "decision",
+            "radar_metadata",
+        }
         unknown_root = sorted(set(root) - scalar_names - category_names)
         if unknown_root:
             raise SynchronizationError(f"unknown synchronization keys: {unknown_root}")
@@ -136,6 +146,26 @@ class SynchronizationConfig:
             raise SynchronizationError(
                 "sync v1 is bound to the exact 182-float XeThru payload"
             )
+        allowlist = self.radar_metadata_warning_allowlist
+        if not isinstance(allowlist, Mapping):
+            raise SynchronizationError(
+                "radar_metadata_warning_allowlist must be a session mapping"
+            )
+        for session_id, warnings in allowlist.items():
+            if not isinstance(session_id, str) or not session_id:
+                raise SynchronizationError(
+                    "radar metadata warning allowlist has an invalid session ID"
+                )
+            if not isinstance(warnings, (list, tuple)) or any(
+                not isinstance(value, str) or not value for value in warnings
+            ):
+                raise SynchronizationError(
+                    f"radar metadata warning allowlist is invalid for {session_id}"
+                )
+            if len(set(warnings)) != len(warnings):
+                raise SynchronizationError(
+                    f"radar metadata warning allowlist repeats a value for {session_id}"
+                )
         positive = {
             "radar_sample_rate_hz": self.radar_sample_rate_hz,
             "rsp_sample_rate_hz": self.rsp_sample_rate_hz,
@@ -1140,6 +1170,25 @@ def _require_sha256(value: Any, label: str) -> str:
     return digest
 
 
+def _require_json_number(value: Any, label: str) -> float:
+    """Return a finite JSON number without accepting booleans or strings."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SynchronizationError(f"{label} must be a finite JSON number")
+    number = float(value)
+    if not np.isfinite(number):
+        raise SynchronizationError(f"{label} must be a finite JSON number")
+    return number
+
+
+def _require_json_index(value: Any, label: str) -> int:
+    """Return a non-negative JSON integer without lossy coercion."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SynchronizationError(f"{label} must be a non-negative JSON integer")
+    return value
+
+
 def _utc_timestamp(value: str | None) -> str:
     if value is None:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1244,13 +1293,15 @@ def validate_sync_receipt(
     decision = result.get("decision")
     if decision not in {"accepted", "manual_review_required", "rejected"}:
         raise SynchronizationError("sync receipt decision is invalid")
-    if bool(result.get("automatically_authorized")) != (decision == "accepted"):
+    automatically_authorized = result.get("automatically_authorized")
+    if not isinstance(automatically_authorized, bool):
+        raise SynchronizationError(
+            "sync receipt automatically_authorized must be boolean"
+        )
+    if automatically_authorized != (decision == "accepted"):
         raise SynchronizationError("sync receipt authorization/decision mismatch")
-    confidence = result.get("confidence")
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-        raise SynchronizationError("sync receipt confidence must be numeric")
-    confidence = float(confidence)
-    if not np.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+    confidence = _require_json_number(result.get("confidence"), "sync receipt confidence")
+    if not 0.0 <= confidence <= 1.0:
         raise SynchronizationError("sync receipt confidence must be finite and in [0, 1]")
     reasons = result.get("reasons")
     if not isinstance(reasons, list) or any(
@@ -1269,15 +1320,86 @@ def validate_sync_receipt(
     if decision == "accepted" and ambiguous:
         raise SynchronizationError("ambiguous sync receipt cannot be accepted")
 
+    prior_offset_s = _require_json_number(
+        result.get("prior_offset_s"), "sync receipt prior_offset_s"
+    )
+
+    parsed_markers: dict[str, tuple[MarkerCandidate, ...]] = {}
+    for marker_label in ("radar_markers", "rsp_markers"):
+        markers = result.get(marker_label)
+        if not isinstance(markers, list):
+            raise SynchronizationError(f"sync receipt {marker_label} must be an array")
+        candidates: list[MarkerCandidate] = []
+        previous_time = -float("inf")
+        seen_sample_indices: set[int] = set()
+        for marker_position, marker in enumerate(markers):
+            if not isinstance(marker, Mapping):
+                raise SynchronizationError(
+                    f"sync receipt {marker_label} entries must be objects"
+                )
+            marker_index = _require_json_index(
+                marker.get("index"),
+                f"sync receipt {marker_label}[{marker_position}].index",
+            )
+            marker_time = _require_json_number(
+                marker.get("time_s"),
+                f"sync receipt {marker_label}[{marker_position}].time_s",
+            )
+            marker_score = _require_json_number(
+                marker.get("score"),
+                f"sync receipt {marker_label}[{marker_position}].score",
+            )
+            source = marker.get("source")
+            if (
+                marker_time <= previous_time
+                or marker_index in seen_sample_indices
+                or not isinstance(source, str)
+                or not source
+            ):
+                raise SynchronizationError(
+                    f"sync receipt {marker_label} entry is invalid"
+                )
+            candidates.append(
+                MarkerCandidate(
+                    index=marker_index,
+                    time_s=marker_time,
+                    score=marker_score,
+                    source=source,
+                )
+            )
+            previous_time = marker_time
+            seen_sample_indices.add(marker_index)
+        parsed_markers[marker_label] = tuple(candidates)
+
     mapping_raw = result.get("mapping")
     mapping: TimeMapping | None = None
     if mapping_raw is not None:
-        mapping = TimeMapping.from_dict(mapping_raw)
-        stated_drift = float(mapping_raw.get("drift_ppm"))
-        if not np.isclose(stated_drift, mapping.drift_ppm, rtol=0.0, atol=1e-9):
+        if not isinstance(mapping_raw, Mapping):
+            raise SynchronizationError("sync receipt mapping must be an object")
+        mode = mapping_raw.get("mode")
+        if not isinstance(mode, str):
+            raise SynchronizationError("sync receipt mapping mode must be a string")
+        offset_s = _require_json_number(
+            mapping_raw.get("offset_s"), "sync receipt mapping offset_s"
+        )
+        scale = _require_json_number(
+            mapping_raw.get("scale"), "sync receipt mapping scale"
+        )
+        stated_drift = _require_json_number(
+            mapping_raw.get("drift_ppm"), "sync receipt mapping drift_ppm"
+        )
+        mapping = TimeMapping(mode=mode, offset_s=offset_s, scale=scale)  # type: ignore[arg-type]
+        if stated_drift != mapping.drift_ppm:
             raise SynchronizationError("sync receipt mapping drift is inconsistent")
     elif decision != "rejected":
         raise SynchronizationError("accepted/review sync receipt must contain a mapping")
+
+    if decision == "accepted":
+        assert mapping is not None  # Established by the mapping requirement above.
+        if abs(mapping.offset_s - prior_offset_s) > config_object.prior_tolerance_s:
+            raise SynchronizationError("accepted sync receipt violates epoch prior gate")
+        if abs(mapping.drift_ppm) > config_object.max_drift_ppm:
+            raise SynchronizationError("accepted sync receipt violates drift gate")
 
     matches = result.get("matches")
     if not isinstance(matches, list):
@@ -1288,45 +1410,72 @@ def validate_sync_receipt(
     for index, match in enumerate(matches):
         if not isinstance(match, Mapping):
             raise SynchronizationError(f"sync receipt match {index} must be an object")
-        try:
-            radar_index = int(match["radar_index"])
-            rsp_index = int(match["rsp_index"])
-            radar_time = float(match["radar_time_s"])
-            rsp_time = float(match["rsp_time_s"])
-            residual = float(match["residual_s"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise SynchronizationError(f"sync receipt match {index} is invalid") from exc
+        radar_index = _require_json_index(
+            match.get("radar_index"), f"sync receipt match {index}.radar_index"
+        )
+        rsp_index = _require_json_index(
+            match.get("rsp_index"), f"sync receipt match {index}.rsp_index"
+        )
+        radar_time = _require_json_number(
+            match.get("radar_time_s"), f"sync receipt match {index}.radar_time_s"
+        )
+        rsp_time = _require_json_number(
+            match.get("rsp_time_s"), f"sync receipt match {index}.rsp_time_s"
+        )
+        residual = _require_json_number(
+            match.get("residual_s"), f"sync receipt match {index}.residual_s"
+        )
         if (
-            radar_index < 0
-            or rsp_index < 0
-            or radar_index <= previous_pair[0]
+            radar_index <= previous_pair[0]
             or rsp_index <= previous_pair[1]
         ):
             raise SynchronizationError("sync receipt matches are not strictly monotonic")
-        if not np.isfinite([radar_time, rsp_time, residual]).all():
-            raise SynchronizationError("sync receipt match values must be finite")
-        if mapping is not None:
-            expected_residual = rsp_time - (
-                mapping.offset_s + mapping.scale * radar_time
+        radar_markers = parsed_markers["radar_markers"]
+        rsp_markers = parsed_markers["rsp_markers"]
+        if radar_index >= len(radar_markers) or rsp_index >= len(rsp_markers):
+            raise SynchronizationError("sync receipt match marker index is out of range")
+        if radar_time != radar_markers[radar_index].time_s:
+            raise SynchronizationError(
+                "sync receipt match radar time does not bind to its marker index"
             )
-            if not np.isclose(residual, expected_residual, rtol=0.0, atol=1e-9):
-                raise SynchronizationError("sync receipt match residual is inconsistent")
+        if rsp_time != rsp_markers[rsp_index].time_s:
+            raise SynchronizationError(
+                "sync receipt match RSP time does not bind to its marker index"
+            )
+        if mapping is None:
+            raise SynchronizationError("sync receipt has matches without a mapping")
+        expected_residual = rsp_time - (
+            mapping.offset_s + mapping.scale * radar_time
+        )
+        if residual != expected_residual:
+            raise SynchronizationError("sync receipt match residual is inconsistent")
+        if abs(residual) > config_object.match_residual_gate_s:
+            raise SynchronizationError("sync receipt match violates residual matching gate")
         residuals.append(residual)
         radar_match_times.append(radar_time)
         previous_pair = (radar_index, rsp_index)
 
     reported_rmse = result.get("residual_rmse_s")
     reported_max = result.get("residual_max_abs_s")
+    marker_span_s = _require_json_number(
+        result.get("marker_span_s"), "sync receipt marker_span_s"
+    )
+    if marker_span_s < 0.0:
+        raise SynchronizationError("sync receipt marker span must be non-negative")
     if residuals:
+        reported_rmse_value = _require_json_number(
+            reported_rmse, "sync receipt residual_rmse_s"
+        )
+        reported_max_value = _require_json_number(
+            reported_max, "sync receipt residual_max_abs_s"
+        )
+        if reported_rmse_value < 0.0 or reported_max_value < 0.0:
+            raise SynchronizationError("sync receipt residual summaries must be non-negative")
         expected_rmse = float(np.sqrt(np.mean(np.square(residuals))))
         expected_max = float(np.max(np.abs(residuals)))
-        if reported_rmse is None or not np.isclose(
-            float(reported_rmse), expected_rmse, rtol=0.0, atol=1e-9
-        ):
+        if not np.isclose(reported_rmse_value, expected_rmse, rtol=0.0, atol=1e-9):
             raise SynchronizationError("sync receipt residual RMSE is inconsistent")
-        if reported_max is None or not np.isclose(
-            float(reported_max), expected_max, rtol=0.0, atol=1e-9
-        ):
+        if not np.isclose(reported_max_value, expected_max, rtol=0.0, atol=1e-9):
             raise SynchronizationError("sync receipt maximum residual is inconsistent")
         expected_span = (
             max(radar_match_times) - min(radar_match_times)
@@ -1334,12 +1483,74 @@ def validate_sync_receipt(
             else 0.0
         )
         if not np.isclose(
-            float(result.get("marker_span_s")), expected_span, rtol=0.0, atol=1e-9
+            marker_span_s, expected_span, rtol=0.0, atol=1e-9
         ):
             raise SynchronizationError("sync receipt marker span is inconsistent")
-    elif reported_rmse is not None or reported_max is not None:
-        raise SynchronizationError("sync receipt reports residuals without matches")
+    else:
+        if reported_rmse is not None or reported_max is not None:
+            raise SynchronizationError("sync receipt reports residuals without matches")
+        if marker_span_s != 0.0:
+            raise SynchronizationError("sync receipt reports marker span without matches")
 
+    # A content hash proves byte integrity, not that a re-hashed result is the
+    # deterministic proposal implied by its marker lists.  Reconstruct that
+    # proposal and require authority-relevant geometry to agree.  A caller may
+    # conservatively downgrade the decision or confidence for an independent
+    # acquisition-quality failure, but may never promote the estimator result.
+    reconstructed = estimate_marker_time_mapping(
+        parsed_markers["radar_markers"],
+        parsed_markers["rsp_markers"],
+        epoch_prior_offset_s=prior_offset_s,
+        config=config_object,
+    )
+    if (mapping is None) != (reconstructed.mapping is None):
+        raise SynchronizationError(
+            "sync receipt mapping is inconsistent with its marker proposal"
+        )
+    if mapping is not None and reconstructed.mapping is not None:
+        if (
+            mapping.mode != reconstructed.mapping.mode
+            or not np.isclose(
+                mapping.offset_s,
+                reconstructed.mapping.offset_s,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            or not np.isclose(
+                mapping.scale,
+                reconstructed.mapping.scale,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            raise SynchronizationError(
+                "sync receipt mapping is inconsistent with its marker proposal"
+            )
+    receipt_pairs = [
+        (int(match["radar_index"]), int(match["rsp_index"])) for match in matches
+    ]
+    reconstructed_pairs = [
+        (match.radar_index, match.rsp_index) for match in reconstructed.matches
+    ]
+    if receipt_pairs != reconstructed_pairs:
+        raise SynchronizationError(
+            "sync receipt matches are inconsistent with its marker proposal"
+        )
+    if ambiguous != reconstructed.ambiguous:
+        raise SynchronizationError(
+            "sync receipt ambiguity is inconsistent with its marker proposal"
+        )
+    decision_rank = {"rejected": 0, "manual_review_required": 1, "accepted": 2}
+    if decision_rank[str(decision)] > decision_rank[reconstructed.decision]:
+        raise SynchronizationError(
+            "sync receipt decision is more permissive than its marker proposal"
+        )
+    missing_reasons = sorted(set(reconstructed.reasons) - set(reasons))
+    if missing_reasons:
+        raise SynchronizationError(
+            "sync receipt omits estimator failure reasons: "
+            + ", ".join(missing_reasons)
+        )
     if decision == "accepted":
         if len(matches) < config_object.min_marker_pairs:
             raise SynchronizationError("accepted sync receipt violates marker pair gate")
@@ -1349,30 +1560,6 @@ def validate_sync_receipt(
             raise SynchronizationError("accepted sync receipt violates residual RMSE gate")
         if float(reported_max) > config_object.accept_max_abs_residual_s:
             raise SynchronizationError("accepted sync receipt violates maximum residual gate")
-
-    for marker_label in ("radar_markers", "rsp_markers"):
-        markers = result.get(marker_label)
-        if not isinstance(markers, list):
-            raise SynchronizationError(f"sync receipt {marker_label} must be an array")
-        previous_time = -float("inf")
-        for marker in markers:
-            if not isinstance(marker, Mapping):
-                raise SynchronizationError(f"sync receipt {marker_label} entries must be objects")
-            try:
-                marker_index = int(marker["index"])
-                marker_time = float(marker["time_s"])
-                marker_score = float(marker["score"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise SynchronizationError(f"sync receipt {marker_label} entry is invalid") from exc
-            if (
-                marker_index < 0
-                or not np.isfinite([marker_time, marker_score]).all()
-                or marker_time <= previous_time
-                or not isinstance(marker.get("source"), str)
-                or not marker["source"]
-            ):
-                raise SynchronizationError(f"sync receipt {marker_label} entry is invalid")
-            previous_time = marker_time
     return document
 
 
@@ -1412,6 +1599,37 @@ def _mapping_sha256(receipt: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(result["mapping"])).hexdigest()
 
 
+def _validate_manual_decision_scope(
+    receipt: Mapping[str, Any], decision: str
+) -> None:
+    """Fail closed when a manual decision exceeds its review scope.
+
+    A human rejection may revoke any otherwise usable proposal.  Approval is
+    narrower: it may only release a non-ambiguous proposal that the automated
+    gates explicitly classified as requiring review.  A rejected proposal has
+    insufficient evidence, while an ambiguous proposal has no uniquely bound
+    mapping for the reviewer to release through this approval schema.
+    """
+
+    if decision != "approve":
+        return
+    result = receipt.get("result")
+    if not isinstance(result, Mapping):
+        raise SynchronizationError("sync receipt result must be an object")
+    if result.get("decision") != "manual_review_required":
+        raise SynchronizationError(
+            "manual approve is allowed only for a review-required synchronization mapping"
+        )
+    if result.get("ambiguous") is not False:
+        raise SynchronizationError(
+            "ambiguous synchronization mapping cannot be manually approved"
+        )
+    if not isinstance(result.get("mapping"), Mapping):
+        raise SynchronizationError(
+            "manual approve requires a concrete synchronization mapping"
+        )
+
+
 def build_manual_approval(
     receipt: Mapping[str, Any],
     *,
@@ -1429,6 +1647,7 @@ def build_manual_approval(
         raise SynchronizationError("manual decision must be approve or reject")
     if not isinstance(rationale, str) or not rationale.strip():
         raise SynchronizationError("manual approval requires a non-empty rationale")
+    _validate_manual_decision_scope(validated, decision)
     approval: dict[str, Any] = {
         "schema": MANUAL_APPROVAL_SCHEMA,
         "session_id": validated["session_id"],
@@ -1471,6 +1690,7 @@ def validate_manual_approval(
     if not isinstance(document.get("rationale"), str) or not document["rationale"].strip():
         raise SynchronizationError("manual approval rationale is invalid")
     _utc_timestamp(document.get("reviewed_at_utc"))
+    _validate_manual_decision_scope(validated_receipt, str(document["decision"]))
     return document
 
 
@@ -1483,15 +1703,17 @@ def synchronization_is_authorized(
 
     validated = validate_sync_receipt(receipt)
     result = validated["result"]
+    approval = (
+        None
+        if manual_approval is None
+        else validate_manual_approval(manual_approval, validated)
+    )
     if result["decision"] == "accepted":
-        if manual_approval is not None:
-            decision = validate_manual_approval(manual_approval, validated)["decision"]
-            return decision == "approve"
-        return True
-    if manual_approval is None:
+        # Manual rejection remains a fail-safe override of automatic approval.
+        return approval is None or approval["decision"] != "reject"
+    if result["decision"] != "manual_review_required" or result["ambiguous"]:
         return False
-    approval = validate_manual_approval(manual_approval, validated)
-    return approval["decision"] == "approve"
+    return approval is not None and approval["decision"] == "approve"
 
 
 __all__ = [

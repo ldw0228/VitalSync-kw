@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from snn_rr.cache import CacheProvenance, FeatureCache
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "predict_all_windows.py"
 _SPEC = importlib.util.spec_from_file_location("snn_rr_predict_all_windows", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -162,6 +164,67 @@ def test_cli_defaults_are_locked_to_full_cache() -> None:
     assert args.output_dir.name == "all_windows"
     assert not args.amp
     assert args.verify_raw_sources
+
+
+def test_prepare_cache_preserves_timing_mask_and_provenance_through_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = pd.DataFrame(
+        {
+            "session_id": ["S01_A", "S01_A"],
+            "window_number": [0, 1],
+            "classical_rr_bpm": [12.0, 13.0],
+            "classical_confidence": [0.8, 0.9],
+            "radar_peak_spread_bpm": [0.4, 0.3],
+        }
+    )
+    timing = np.ones((2, 3, 5), dtype=np.bool_)
+    timing[0, 1, 0] = False
+    provenance = CacheProvenance(
+        classification="acquisition_diagnostic",
+        root_manifest_path="manifest.json",
+        root_manifest_sha256="1" * 64,
+        root_manifest_content_sha256="2" * 64,
+        acquisition_schema_version="snn_rr.feature_cache_acquisition.v2",
+        acquisition_mode="strict",
+        scientific_eligible=False,
+        config_sha256="3" * 64,
+        pipeline_sha256="4" * 64,
+        reconstruction_content_sha256="5" * 64,
+        inventory_sha256="6" * 64,
+        inventory_file_count=10,
+        selected_sessions=("S01_A",),
+    )
+    cache = FeatureCache(
+        maps=np.ones((2, 3, 2, 4), dtype=np.float16),
+        aux=np.ones((2, 37), dtype=np.float32),
+        metadata=metadata,
+        frequencies_hz=np.asarray([0.1, 0.2], dtype=np.float32),
+        provenance=provenance,
+        radar_timing_valid_mask=timing,
+    )
+    expected_aux, expected_names = (
+        _PREDICT.append_mask_aware_causal_history_features(cache)
+    )
+    monkeypatch.setattr(_PREDICT, "load_feature_cache", lambda *args, **kwargs: cache)
+    run_config = {
+        "arguments": {"use_aux": True, "causal_history": True},
+        "cache_shape": {
+            "maps": list(cache.maps.shape),
+            "aux": list(expected_aux.shape),
+        },
+        "causal_history_feature_names": expected_names,
+    }
+
+    prepared, base_aux_dim, names = _PREDICT.prepare_cache(
+        Path("unused"), run_config
+    )
+
+    assert base_aux_dim == 37
+    assert names == expected_names
+    assert prepared.provenance == provenance
+    np.testing.assert_array_equal(prepared.radar_timing_valid_mask, timing)
+    np.testing.assert_array_equal(prepared.aux, expected_aux)
 
 
 def test_deployment_freeze_fails_closed_without_raw_source_verification() -> None:

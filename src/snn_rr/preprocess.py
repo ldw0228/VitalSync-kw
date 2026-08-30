@@ -78,6 +78,29 @@ def causal_block_mean(x: np.ndarray, factor: int = 4) -> np.ndarray:
     return x[:usable].reshape(shape).mean(axis=1, dtype=np.float32)
 
 
+def replace_radar_outliers_past_only(
+    values: np.ndarray, threshold: float = 0.1
+) -> tuple[np.ndarray, int]:
+    """Replace implausible radar cells using only earlier valid samples.
+
+    The operation is session-causal and target-free. A corrupt cell is
+    replaced by the median of at most four earlier finite, in-threshold values
+    from the same range bin, or exact zero when no such history exists.
+    """
+
+    corrected = np.asarray(values, dtype=np.float32).copy()
+    locations = np.argwhere(np.abs(corrected) > float(threshold))
+    for frame, range_bin in locations:
+        history = corrected[max(0, frame - 4) : frame, range_bin]
+        history = history[
+            np.isfinite(history) & (np.abs(history) <= float(threshold))
+        ]
+        corrected[frame, range_bin] = (
+            float(np.median(history)) if len(history) else 0.0
+        )
+    return corrected, len(locations)
+
+
 def filter_reference_rsp(
     rsp: np.ndarray,
     fs: float = 250.0,

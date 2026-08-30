@@ -1,0 +1,54 @@
+schema: snn_rr.sync_marker_affine.config.v1
+
+# Acquisition-reconstruction v2 contract. Radar motion is extracted only
+# after measured-timestamp, causal 10 Hz interval resampling. BIOPAC remains
+# at 250 Hz. The remaining locked marker/mapping gates match v1 so timing-grid
+# correction can be evaluated independently of threshold changes.
+synchronization:
+  input:
+    expected_payload_bins: 182
+    radar_sample_rate_hz: 10.0
+    rsp_sample_rate_hz: 250.0
+
+  radar_motion:
+    motion_smoothing_s: 0.25
+    motion_clip_z: 30.0
+    motion_range_quantile: 0.90
+    radar_marker_z: 6.0
+    radar_marker_prominence_z: 2.0
+    radar_marker_merge_s: 4.0
+
+  rsp_marker:
+    rsp_adaptive_z: 6.0
+    rsp_fixed_high: 8.5
+    rsp_fixed_low: null
+    rsp_marker_merge_s: 4.0
+
+  matching:
+    prior_tolerance_s: 12.0
+    match_residual_gate_s: 0.80
+    max_drift_ppm: 1000.0
+    min_marker_pairs: 3
+    good_marker_pairs: 5
+    min_marker_span_s: 120.0
+    min_affine_span_s: 300.0
+    min_affine_pairs: 3
+    min_affine_improvement_s: 0.015
+    min_affine_drift_ppm: 25.0
+
+  decision:
+    accept_max_rmse_s: 0.30
+    accept_max_abs_residual_s: 0.75
+    accept_min_confidence: 0.80
+    ambiguity_mapping_separation_s: 0.40
+    ambiguity_rmse_margin_s: 0.05
+    ambiguity_score_margin: 1.0
+    manual_review_min_pairs: 2
+
+  # Metadata parser warnings fail closed unless the exact warning content is
+  # declared for the physical session.  The declaration is applied to each
+  # of the three radar views independently and is bound by the config hash.
+  radar_metadata:
+    radar_metadata_warning_allowlist:
+      S07_KDM:
+        - "unwrapped 1 relative-timestamp counter reset(s)"

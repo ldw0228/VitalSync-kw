@@ -50,10 +50,11 @@ from scripts.train import (  # noqa: E402
     CachedRadarDataset,
     FeatureCache,
     PredictionBundle,
-    append_causal_history_features,
+    append_mask_aware_causal_history_features,
     build_model,
     concatenate_bundles,
     fit_aux_scaler,
+    infer_auxiliary_layout,
     load_feature_cache,
     make_loader,
     predict,
@@ -66,6 +67,7 @@ DEFAULT_CACHE = PROJECT_ROOT / "artifacts/cache/rf32s"
 DEFAULT_RUN = PROJECT_ROOT / "artifacts/runs/final_alias_gate_s12_deterministic"
 DEFAULT_OUTPUT = DEFAULT_RUN / "all_windows"
 FORMAT_VERSION = 2
+BASE_OOF_AUTHORITY_SCHEMA = "snn_rr.base_oof_authority.v1"
 
 # Per-fold restart artifacts are deployment-output caches, not training/eval
 # bundles.  In particular, target and observable/QC values are never persisted.
@@ -160,6 +162,11 @@ def _runtime_source_hashes() -> dict[str, str]:
         PROJECT_ROOT / "src/snn_rr/metrics.py",
         PROJECT_ROOT / "src/snn_rr/data.py",
         PROJECT_ROOT / "src/snn_rr/preprocess.py",
+        PROJECT_ROOT / "src/snn_rr/acquisition_contract.py",
+        PROJECT_ROOT / "src/snn_rr/acquisition_protocol.py",
+        PROJECT_ROOT / "src/snn_rr/synchronization.py",
+        PROJECT_ROOT / "src/snn_rr/radar_timing.py",
+        PROJECT_ROOT / "src/snn_rr/range_tracking.py",
     )
     return {
         str(path.resolve().relative_to(PROJECT_ROOT)): _sha256_file(path.resolve())
@@ -171,13 +178,16 @@ def _cache_session_content_binding(cache_dir: Path, session_id: str) -> dict[str
     """Bind actual tensor/metadata bytes absent from the legacy manifest."""
 
     session_dir = cache_dir / session_id
-    names = (
+    names = [
         "maps.npy",
         "aux.npy",
         "metadata.csv",
         "frequencies_hz.npy",
         "manifest.json",
-    )
+    ]
+    for optional_name in ("radar_timing_valid_mask.npy", "range_aux.npy"):
+        if (session_dir / optional_name).is_file():
+            names.append(optional_name)
     files: dict[str, dict[str, Any]] = {}
     for name in names:
         path = session_dir / name
@@ -197,11 +207,184 @@ def _cache_session_content_binding(cache_dir: Path, session_id: str) -> dict[str
     }
 
 
+def _cache_inventory_sha256(
+    cache_dir: Path, session_ids: Sequence[str]
+) -> tuple[str, int]:
+    paths = [cache_dir / "manifest.json"]
+    for session_id in session_ids:
+        session_dir = cache_dir / str(session_id)
+        paths.extend(
+            session_dir / name
+            for name in (
+                "manifest.json",
+                "maps.npy",
+                "aux.npy",
+                "metadata.csv",
+                "frequencies_hz.npy",
+            )
+        )
+        for optional_name in ("radar_timing_valid_mask.npy", "range_aux.npy"):
+            optional_path = session_dir / optional_name
+            if optional_path.is_file():
+                paths.append(optional_path)
+    inventory: list[dict[str, Any]] = []
+    for path in sorted(set(paths), key=lambda item: str(item.relative_to(cache_dir))):
+        if not path.is_file():
+            raise RuntimeError(f"cache inventory file is missing: {path}")
+        inventory.append(
+            {
+                "path": str(path.relative_to(cache_dir)),
+                "bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+    return _canonical_sha256(inventory), len(inventory)
+
+
+def _verify_acquisition_raw_sha_bindings(
+    *,
+    cache_dir: Path,
+    cache_root_manifest: Mapping[str, Any],
+    session_ids: Sequence[str],
+) -> tuple[str, int]:
+    """Rehash exact raw payloads bound by the v2 reconstruction graph."""
+
+    contract = cache_root_manifest.get("acquisition_contract")
+    if not isinstance(contract, Mapping):
+        raise RuntimeError("acquisition-v2 cache contract is missing")
+    reconstruction_value = contract.get("reconstruction_manifest")
+    if not isinstance(reconstruction_value, str) or not reconstruction_value:
+        raise RuntimeError("acquisition-v2 reconstruction path is missing")
+    reconstruction_path = Path(reconstruction_value)
+    if not reconstruction_path.is_absolute():
+        reconstruction_path = cache_dir / reconstruction_path
+    reconstruction_path = reconstruction_path.resolve()
+    reconstruction = _load_json(reconstruction_path)
+    if reconstruction.get("content_sha256") != contract.get(
+        "reconstruction_content_sha256"
+    ) or reconstruction.get("content_sha256") != _canonical_content_sha256(
+        reconstruction
+    ):
+        raise RuntimeError("acquisition reconstruction content binding mismatch")
+    entries = reconstruction.get("sessions")
+    if not isinstance(entries, list):
+        raise RuntimeError("acquisition reconstruction session catalogue is missing")
+    by_id = {
+        str(entry.get("session_id")): entry
+        for entry in entries
+        if isinstance(entry, Mapping)
+    }
+    dataset_root = _resolve_recorded_path(cache_root_manifest.get("dataset_root"))
+    observed: list[dict[str, Any]] = []
+    for session_id in session_ids:
+        entry = by_id.get(str(session_id))
+        if not isinstance(entry, Mapping):
+            raise RuntimeError(
+                f"acquisition reconstruction is missing raw authority for {session_id}"
+            )
+        manifest_value = entry.get("manifest")
+        if not isinstance(manifest_value, str) or not manifest_value:
+            raise RuntimeError(f"acquisition session manifest path is missing: {session_id}")
+        session_manifest_path = Path(manifest_value)
+        if not session_manifest_path.is_absolute():
+            session_manifest_path = reconstruction_path.parent / session_manifest_path
+        session_manifest_path = session_manifest_path.resolve()
+        session_manifest = _load_json(session_manifest_path)
+        if (
+            _sha256_file(session_manifest_path) != entry.get("manifest_sha256")
+            or session_manifest.get("content_sha256") != entry.get("content_sha256")
+            or session_manifest.get("content_sha256")
+            != _canonical_content_sha256(session_manifest)
+        ):
+            raise RuntimeError(
+                f"acquisition session manifest binding mismatch: {session_id}"
+            )
+        bindings = session_manifest.get("raw_input_bindings")
+        if not isinstance(bindings, Mapping) or not bindings:
+            raise RuntimeError(f"raw SHA-256 bindings are missing: {session_id}")
+        if session_manifest.get("raw_input_bindings_sha256") != _canonical_sha256(
+            bindings
+        ):
+            raise RuntimeError(f"raw binding catalogue hash mismatch: {session_id}")
+        for name, binding in sorted(bindings.items()):
+            if not isinstance(binding, Mapping):
+                raise RuntimeError(f"raw binding is malformed: {session_id}/{name}")
+            relative = binding.get("path")
+            if not isinstance(relative, str) or not relative:
+                raise RuntimeError(f"raw binding path is missing: {session_id}/{name}")
+            raw_path = (dataset_root / relative).resolve()
+            try:
+                raw_path.relative_to(dataset_root)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"raw binding escapes dataset root: {session_id}/{name}"
+                ) from error
+            if not raw_path.is_file():
+                raise RuntimeError(f"raw bound input is missing: {raw_path}")
+            size = raw_path.stat().st_size
+            digest = _sha256_file(raw_path)
+            if size != binding.get("bytes") or digest != binding.get("sha256"):
+                raise RuntimeError(
+                    f"raw bound input content changed: {session_id}/{name}"
+                )
+            observed.append(
+                {
+                    "session_id": str(session_id),
+                    "name": str(name),
+                    "path": str(relative),
+                    "bytes": size,
+                    "sha256": digest,
+                }
+            )
+    return _canonical_sha256(observed), len(observed)
+
+
 def _canonical_signature(value: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_content_sha256(document: Mapping[str, Any]) -> str:
+    payload = dict(document)
+    payload.pop("content_sha256", None)
+    return _canonical_sha256(payload)
+
+
+def _row_fold_binding_sha256(
+    cache_index: Sequence[Any], identity: Sequence[Any], fold: Sequence[Any]
+) -> str:
+    indices = np.asarray(cache_index, dtype=np.int64)
+    identities = np.asarray(identity).astype(str)
+    folds = np.asarray(fold, dtype=np.int64)
+    if not (indices.ndim == identities.ndim == folds.ndim == 1) or not (
+        len(indices) == len(identities) == len(folds)
+    ):
+        raise RuntimeError("all-window row/fold binding arrays are inconsistent")
+    return _canonical_sha256(
+        [
+            {
+                "cache_index": int(index),
+                "identity": str(person),
+                "fold": int(fold_id),
+            }
+            for index, person, fold_id in zip(
+                indices, identities, folds, strict=True
+            )
+        ]
+    )
 
 
 def _strict_json(value: Any) -> Any:
@@ -301,12 +484,19 @@ def validate_cache_sources(
     metadata: pd.DataFrame,
     *,
     verify_raw_sources: bool = True,
+    verified_cache_provenance: Any = None,
 ) -> dict[str, Any]:
     """Validate cache manifests, current pipeline/config, and raw bindings."""
 
     cache_dir = cache_dir.resolve()
     manifest_path = cache_dir / "manifest.json"
     root = _load_json(manifest_path)
+    root_contract = root.get("acquisition_contract")
+    acquisition_v2 = bool(
+        isinstance(root_contract, Mapping)
+        and root_contract.get("schema_version")
+        == "snn_rr.feature_cache_acquisition.v2"
+    )
     sessions = root.get("sessions")
     if not isinstance(sessions, list) or not sessions:
         raise RuntimeError("cache manifest contains no sessions")
@@ -332,14 +522,71 @@ def validate_cache_sources(
     expected_config_hash = str(root.get("config_sha256", ""))
     if not config_path.is_file() or _sha256_file(config_path) != expected_config_hash:
         raise RuntimeError("cache configuration SHA-256 no longer matches its manifest")
-    pipeline_paths = (
+    pipeline_paths = [
         PROJECT_ROOT / "scripts/build_features.py",
         PROJECT_ROOT / "src/snn_rr/data.py",
         PROJECT_ROOT / "src/snn_rr/preprocess.py",
-    )
+    ]
+    if acquisition_v2:
+        pipeline_paths.extend(
+            [
+                PROJECT_ROOT / "src/snn_rr/acquisition_contract.py",
+                PROJECT_ROOT / "src/snn_rr/synchronization.py",
+                PROJECT_ROOT / "src/snn_rr/radar_timing.py",
+                PROJECT_ROOT / "src/snn_rr/range_tracking.py",
+            ]
+        )
     expected_pipeline_hash = str(root.get("pipeline_sha256", ""))
     if _sha256_pipeline(pipeline_paths) != expected_pipeline_hash:
         raise RuntimeError("cache feature-pipeline SHA-256 no longer matches its manifest")
+
+    canonical_cache_provenance: dict[str, Any] | None = None
+    if verified_cache_provenance is not None:
+        to_dict = getattr(verified_cache_provenance, "to_dict", None)
+        content_hash = getattr(verified_cache_provenance, "content_sha256", None)
+        if not callable(to_dict) or not isinstance(content_hash, str):
+            raise RuntimeError("cache loader returned malformed provenance authority")
+        canonical_cache_provenance = dict(to_dict())
+        canonical_cache_provenance["content_sha256"] = content_hash
+        if _canonical_content_sha256(canonical_cache_provenance) != content_hash:
+            raise RuntimeError("cache loader provenance canonical hash mismatch")
+    if acquisition_v2:
+        if canonical_cache_provenance is None:
+            raise RuntimeError(
+                "acquisition-v2 all-window inference requires verified cache provenance"
+            )
+        if (
+            canonical_cache_provenance.get("root_manifest_path")
+            != str(manifest_path.resolve())
+            or canonical_cache_provenance.get("root_manifest_sha256")
+            != _sha256_file(manifest_path)
+            or canonical_cache_provenance.get("root_manifest_content_sha256")
+            != root.get("content_sha256")
+            or canonical_cache_provenance.get("acquisition_schema_version")
+            != "snn_rr.feature_cache_acquisition.v2"
+            or canonical_cache_provenance.get("config_sha256")
+            != expected_config_hash
+            or canonical_cache_provenance.get("pipeline_sha256")
+            != expected_pipeline_hash
+            or canonical_cache_provenance.get("reconstruction_content_sha256")
+            != root_contract.get("reconstruction_content_sha256")
+            or canonical_cache_provenance.get("selected_sessions") != session_ids
+        ):
+            raise RuntimeError(
+                "verified cache provenance does not bind the loaded acquisition-v2 cache"
+            )
+        current_inventory_sha256, current_inventory_count = _cache_inventory_sha256(
+            cache_dir, session_ids
+        )
+        if (
+            current_inventory_sha256
+            != canonical_cache_provenance.get("inventory_sha256")
+            or current_inventory_count
+            != canonical_cache_provenance.get("inventory_file_count")
+        ):
+            raise RuntimeError(
+                "cache files changed between feature loading and provenance validation"
+            )
 
     source_by_session: dict[str, str] = {}
     content_by_session: dict[str, dict[str, Any]] = {}
@@ -375,6 +622,9 @@ def validate_cache_sources(
         )
 
     raw_verified = False
+    raw_sha256_verified = False
+    raw_sha256_binding_digest: str | None = None
+    raw_sha256_binding_count = 0
     dataset_root = _resolve_recorded_path(root.get("dataset_root"))
     if verify_raw_sources:
         raw_manifest = build_dataset_manifest(
@@ -391,6 +641,16 @@ def validate_cache_sources(
                     f"raw source fingerprint changed for cached session {session_id}"
                 )
         raw_verified = True
+        if acquisition_v2:
+            (
+                raw_sha256_binding_digest,
+                raw_sha256_binding_count,
+            ) = _verify_acquisition_raw_sha_bindings(
+                cache_dir=cache_dir,
+                cache_root_manifest=root,
+                session_ids=session_ids,
+            )
+            raw_sha256_verified = True
 
     ordered_content_signatures = [
         content_by_session[session_id]["content_signature_sha256"]
@@ -410,13 +670,77 @@ def validate_cache_sources(
         "pipeline_sha256": expected_pipeline_hash,
         "dataset_root": str(dataset_root),
         "raw_source_fingerprints_verified": raw_verified,
+        "raw_input_sha256_bindings_verified": raw_sha256_verified,
+        "raw_input_sha256_binding_digest": raw_sha256_binding_digest,
+        "raw_input_sha256_binding_count": raw_sha256_binding_count,
         "source_fingerprint_by_session": source_by_session,
         "session_content_binding": content_by_session,
         "cache_content_signature_sha256": cache_content_signature,
         "row_count": len(metadata),
         "session_count": len(session_ids),
         "unavailable_catalogue_sessions": unavailable,
+        "canonical_cache_provenance": canonical_cache_provenance,
     }
+
+
+def _assert_publication_sources_current(
+    cache_source: Mapping[str, Any], runtime_source_sha256: Mapping[str, str]
+) -> None:
+    """Publication barrier for the exact cache/source generation used in RAM."""
+
+    cache_dir = Path(str(cache_source["cache_dir"])).resolve()
+    manifest_path = Path(str(cache_source["cache_manifest_path"])).resolve()
+    if _sha256_file(manifest_path) != cache_source.get("cache_manifest_sha256"):
+        raise RuntimeError("cache root manifest changed during all-window inference")
+    canonical = cache_source.get("canonical_cache_provenance")
+    if isinstance(canonical, Mapping):
+        session_ids = canonical.get("selected_sessions")
+        if not isinstance(session_ids, list):
+            raise RuntimeError("canonical cache selected-session authority is malformed")
+        inventory_sha256, inventory_count = _cache_inventory_sha256(
+            cache_dir, list(map(str, session_ids))
+        )
+        if (
+            inventory_sha256 != canonical.get("inventory_sha256")
+            or inventory_count != canonical.get("inventory_file_count")
+        ):
+            raise RuntimeError("cache inventory changed during all-window inference")
+        if cache_source.get("raw_input_sha256_bindings_verified") is True:
+            raw_digest, raw_count = _verify_acquisition_raw_sha_bindings(
+                cache_dir=cache_dir,
+                cache_root_manifest=_load_json(manifest_path),
+                session_ids=list(map(str, session_ids)),
+            )
+            if (
+                raw_digest != cache_source.get("raw_input_sha256_binding_digest")
+                or raw_count != cache_source.get("raw_input_sha256_binding_count")
+            ):
+                raise RuntimeError("raw input SHA-256 graph changed during inference")
+    config_path = Path(str(cache_source["config_path"])).resolve()
+    if _sha256_file(config_path) != cache_source.get("config_sha256"):
+        raise RuntimeError("cache configuration changed during all-window inference")
+    pipeline_paths = [
+        PROJECT_ROOT / "scripts/build_features.py",
+        PROJECT_ROOT / "src/snn_rr/data.py",
+        PROJECT_ROOT / "src/snn_rr/preprocess.py",
+    ]
+    if isinstance(canonical, Mapping) and canonical.get(
+        "acquisition_schema_version"
+    ) == "snn_rr.feature_cache_acquisition.v2":
+        pipeline_paths.extend(
+            [
+                PROJECT_ROOT / "src/snn_rr/acquisition_contract.py",
+                PROJECT_ROOT / "src/snn_rr/synchronization.py",
+                PROJECT_ROOT / "src/snn_rr/radar_timing.py",
+                PROJECT_ROOT / "src/snn_rr/range_tracking.py",
+            ]
+        )
+    if _sha256_pipeline(pipeline_paths) != cache_source.get("pipeline_sha256"):
+        raise RuntimeError("cache pipeline changed during all-window inference")
+    for relative, expected_hash in runtime_source_sha256.items():
+        source_path = PROJECT_ROOT / str(relative)
+        if not source_path.is_file() or _sha256_file(source_path) != expected_hash:
+            raise RuntimeError(f"runtime inference source changed: {relative}")
 
 
 def prepare_cache(
@@ -433,14 +757,14 @@ def prepare_cache(
         raise RuntimeError("the frozen run is not bound to auxiliary features")
     history_names: list[str] = []
     if bool(arguments.get("causal_history", False)):
-        augmented, history_names = append_causal_history_features(
-            cache.aux, cache.metadata
-        )
+        augmented, history_names = append_mask_aware_causal_history_features(cache)
         cache = FeatureCache(
             maps=cache.maps,
             aux=augmented,
             metadata=cache.metadata,
             frequencies_hz=cache.frequencies_hz,
+            provenance=cache.provenance,
+            radar_timing_valid_mask=cache.radar_timing_valid_mask,
         )
     recorded_shape = run_config.get("cache_shape")
     actual_shape = {"maps": list(cache.maps.shape), "aux": list(cache.aux.shape)}
@@ -544,6 +868,28 @@ def validate_fold_checkpoint(
         raise RuntimeError(f"checkpoint fold mismatch: {checkpoint_path}")
     if checkpoint.get("run_signature") != run_signature:
         raise RuntimeError(f"checkpoint run signature mismatch: {checkpoint_path}")
+    run_arguments = run_config.get("arguments")
+    if not isinstance(run_arguments, Mapping):
+        raise RuntimeError("source run arguments are missing")
+    run_cache_provenance = run_config.get("cache_provenance")
+    checkpoint_cache_provenance = checkpoint.get("cache_provenance")
+    if run_arguments.get("cache_trust_mode") == "scientific":
+        if (
+            not isinstance(run_cache_provenance, Mapping)
+            or run_cache_provenance.get("classification")
+            != "acquisition_scientific"
+            or run_cache_provenance.get("scientific_eligible") is not True
+            or checkpoint_cache_provenance != run_cache_provenance
+        ):
+            raise RuntimeError(
+                f"scientific checkpoint/cache authority mismatch: {checkpoint_path}"
+            )
+    elif (
+        checkpoint_cache_provenance is not None
+        and run_cache_provenance is not None
+        and checkpoint_cache_provenance != run_cache_provenance
+    ):
+        raise RuntimeError(f"checkpoint/run cache provenance mismatch: {checkpoint_path}")
     validate_model_kwargs(
         checkpoint, cache, base_aux_dim=base_aux_dim, run_config=run_config
     )
@@ -1171,6 +1517,12 @@ def _verify_complete_reuse(
     if not all(present):
         raise RuntimeError("--reuse found a partial completed-output set")
     provenance = _load_json(provenance_path)
+    authority_v1 = provenance.get("schema_version") == BASE_OOF_AUTHORITY_SCHEMA
+    if authority_v1:
+        if provenance.get("content_sha256") != _canonical_content_sha256(
+            provenance
+        ):
+            raise RuntimeError("--reuse provenance canonical content hash mismatch")
     if provenance.get("inference_signature") != inference_signature:
         raise RuntimeError("--reuse inference signature mismatch")
     frozen_record = provenance.get("frozen_valid_oof_verification", {})
@@ -1183,6 +1535,11 @@ def _verify_complete_reuse(
         raise RuntimeError("--reuse completed NPZ SHA-256 mismatch")
     if recorded_outputs.get("csv_sha256") != _sha256_file(csv_path):
         raise RuntimeError("--reuse completed CSV SHA-256 mismatch")
+    if authority_v1:
+        if recorded_outputs.get("npz_bytes") != npz_path.stat().st_size:
+            raise RuntimeError("--reuse completed NPZ byte-count mismatch")
+        if recorded_outputs.get("csv_bytes") != csv_path.stat().st_size:
+            raise RuntimeError("--reuse completed CSV byte-count mismatch")
     with np.load(npz_path, allow_pickle=False) as data:
         if str(np.asarray(data["inference_signature"]).item()) != inference_signature:
             raise RuntimeError("--reuse completed NPZ signature mismatch")
@@ -1247,6 +1604,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         cache_dir,
         cache.metadata,
         verify_raw_sources=args.verify_raw_sources,
+        verified_cache_provenance=cache.provenance,
     )
 
     bindings: list[FoldBinding] = []
@@ -1371,6 +1729,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 device=device,
                 seed=int(arguments.get("seed", 0)) + 1009 * binding.fold + 2,
                 train=False,
+                auxiliary_layout=infer_auxiliary_layout(base_aux_dim),
             )
             if not isinstance(loader.dataset, CachedRadarDataset):
                 raise RuntimeError("shared loader no longer uses CachedRadarDataset")
@@ -1438,7 +1797,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cache_source["raw_source_fingerprints_verified"]
         ),
     )
+    canonical_cache_provenance = cache_source.get("canonical_cache_provenance")
+    run_cache_provenance = run_config.get("cache_provenance")
+    source_claims_scientific = bool(
+        arguments.get("cache_trust_mode") == "scientific"
+        and run_config.get("claim_classification")
+        == "retrospective_scientific_noncommercial"
+    )
+    scientific_eligible = bool(
+        source_claims_scientific
+        and isinstance(canonical_cache_provenance, Mapping)
+        and canonical_cache_provenance.get("classification")
+        == "acquisition_scientific"
+        and canonical_cache_provenance.get("scientific_eligible") is True
+        and run_cache_provenance == canonical_cache_provenance
+        and cache_source["raw_input_sha256_bindings_verified"] is True
+    )
+    if source_claims_scientific and not scientific_eligible:
+        raise RuntimeError(
+            "scientific source run cannot publish without exact canonical cache "
+            "and raw-source authority"
+        )
+    identity_to_test_fold_sha256 = _canonical_sha256(expected_assignment)
+    row_fold_binding_sha256 = _row_fold_binding_sha256(
+        combined.index,
+        cache.metadata.iloc[np.asarray(combined.index, dtype=np.int64)]["identity"],
+        fold_for_row[np.asarray(combined.index, dtype=np.int64)],
+    )
     provenance: dict[str, Any] = {
+        "schema_version": BASE_OOF_AUTHORITY_SCHEMA,
         "format_version": FORMAT_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_run_dir": str(run_dir),
@@ -1449,6 +1836,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "signature_payload": signature_payload,
         "runtime_source_sha256": source_hashes,
         "cache": cache_source,
+        "canonical_cache_provenance": canonical_cache_provenance,
+        "scientific_eligible": scientific_eligible,
+        "claim_classification": (
+            "retrospective_scientific_noncommercial"
+            if scientific_eligible
+            else "historical_diagnostic_noncommercial"
+        ),
+        "commercial_claim_allowed": False,
         "cache_shape": {
             "maps": list(cache.maps.shape),
             "aux": list(cache.aux.shape),
@@ -1464,6 +1859,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             (~cache.metadata["reference_valid"].to_numpy(dtype=bool)).sum()
         ),
         "identity_to_test_fold": expected_assignment,
+        "identity_to_test_fold_sha256": identity_to_test_fold_sha256,
+        "row_fold_binding_sha256": row_fold_binding_sha256,
         "checkpoints": {
             str(binding.fold): {
                 "path": str(binding.checkpoint_path),
@@ -1480,6 +1877,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "reference_valid_role": "evaluation/output mask only; never a model input",
         },
         "label_free_forward": {
+            "verified": True,
             "model_inputs": ["map", "radar_mask", "aux"],
             "target_or_qc_inputs": [],
             "reference_valid_usage": "output evaluation/masking only",
@@ -1566,6 +1964,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise RuntimeError("CSV serialization lost or reordered cache rows")
     _atomic_csv(output_dir / "snn_all_windows.csv", csv)
+    _assert_publication_sources_current(cache_source, source_hashes)
     provenance["outputs"].update(
         {
             "npz_sha256": _sha256_file(output_dir / "snn_all_windows.npz"),
@@ -1574,6 +1973,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "csv_bytes": (output_dir / "snn_all_windows.csv").stat().st_size,
         }
     )
+    provenance = _strict_json(provenance)
+    provenance["content_sha256"] = _canonical_content_sha256(provenance)
     _atomic_json(output_dir / "provenance.json", provenance)
     return provenance
 

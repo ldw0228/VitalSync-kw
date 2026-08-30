@@ -6,6 +6,7 @@ from snn_rr.preprocess import (
     filter_reference_rsp,
     fuse_auxiliary_features,
     range_frequency_features,
+    replace_radar_outliers_past_only,
 )
 
 
@@ -46,3 +47,15 @@ def test_causal_block_mean_drops_only_incomplete_tail():
     x = np.arange(18, dtype=np.float32).reshape(9, 2)
     result = causal_block_mean(x, factor=4)
     np.testing.assert_allclose(result, [[3, 4], [11, 12]])
+
+
+def test_radar_outlier_repair_uses_only_past_same_bin_history():
+    values = np.asarray(
+        [[0.01, 0.02], [0.03, 0.04], [0.05, 0.06], [9.0, 0.08]],
+        dtype=np.float32,
+    )
+    repaired, count = replace_radar_outliers_past_only(values, threshold=0.1)
+    assert count == 1
+    assert repaired[3, 0] == np.median(values[:3, 0])
+    np.testing.assert_array_equal(repaired[:3], values[:3])
+    np.testing.assert_array_equal(repaired[:, 1], values[:, 1])
