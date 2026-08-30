@@ -1,0 +1,40 @@
+seed: 20260827
+data:
+  root: HAI_EXPERIMENT
+  cache_dir: artifacts/cache/rf32s
+  radar_hz: 40.0
+  model_hz: 10.0
+  window_seconds: 32.0
+  stride_seconds: 4.0
+  respiration_band_hz: [0.08, 0.80]
+  rr_range_bpm: [6.0, 45.0]
+  rr_bin_width_bpm: 0.25
+  range_pool: 2
+  fft_size: 2048
+  causal_windows: true
+reference_qc:
+  band_hz: [0.10, 0.75]
+  min_cycles: 3
+  max_clip_fraction: 0.02
+  min_spectral_concentration: 0.42
+  min_periodicity: 0.28
+  max_interval_cv: 0.27
+  max_estimator_disagreement_bpm: 2.5
+  max_phase_residual_rad: 1.25
+model:
+  input_branches: 2
+  simulation_steps: 12
+  hidden_dim: 192
+  radar_dropout: 0.20
+training:
+  folds: 6
+  epochs: 80
+  batch_size: 48
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  patience: 12
+  amp: true
+  spike_rate_weight: 0.0005
+evaluation:
+  bootstrap_samples: 2000
+  uncertainty_coverages: [1.0, 0.9, 0.8, 0.7, 0.5]

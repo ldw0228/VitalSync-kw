@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=78"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snn-rr"
+version = "0.1.0"
+description = "Subject-independent respiratory-rate estimation from three XeThru UWB radars with a quality-aware SNN"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "matplotlib>=3.11,<4",
+  "numpy>=2.5,<3",
+  "openpyxl>=3.1,<4",
+  "pandas>=3.0,<4",
+  "pyyaml>=6,<7",
+  "scikit-learn>=1.9,<2",
+  "scipy>=1.18,<2",
+  "snntorch>=1.0,<2",
+  "torch>=2.13,<2.14",
+  "tqdm>=4.70,<5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

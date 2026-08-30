@@ -1,0 +1,250 @@
+campaign_id: directed_harmonic_factor_expert_snn_v3
+classification: retrospective_historical_cohort_engineering
+
+data:
+  cohort_status: historical_repeatedly_observed
+  identity_count: 18
+  session_count: 29
+  fold_count: 6
+  split_unit: physical_identity
+  validation_rule: validation_fold=(outer_fold+1)%6
+  rr_min_bpm: 6.0
+  rr_max_bpm: 45.0
+  discovery_outer_folds: [3, 4]
+  seeds: [20260828, 20260829, 20260830]
+  cache_feature_width: 571
+  candidate_count_max: 12
+  classical_factor_centers: [1.0, 2.0, 3.0, 4.0]
+
+feature_layout:
+  schema_reference:
+    path: artifacts/cache/harmonic_set_v2_i2r_nested_o3_s20260828_nms125_base_emap_svd12_m050/feature_names.json
+    file_sha256: 97e18a11ec7672d96ec41ae90c22e5e9c7d8744e265d146b10b72895f306da54
+    ordered_names_semantic_sha256: d7553f8b11733903393575d02bc6acd4a8edefd5ce0e538491295ec84d938f05
+  order: [core, rf, svd]
+  total_width: 571
+  core:
+    offset: 0
+    width: 46
+    shape: [46]
+    encoder: [46, 32, 32]
+  rf:
+    offset: 46
+    width: 378
+    shape: [3, 7, 2, 9]
+    axis_order: [radar, ratio, branch, statistic]
+    ratios: [0.25, 0.3333333333333333, 0.5, 1.0, 2.0, 3.0, 4.0]
+    branches: [raw_power, candidate_iq_phase]
+    branch_availability:
+      raw_power: candidate_and_radar_and_native_grid_in_band
+      candidate_iq_phase: false_under_frozen_raw_only_cache
+    statistics:
+      - power_mean
+      - power_max
+      - power_entropy
+      - power_peak_concentration
+      - power_top1_value
+      - power_top1_range_index_unit
+      - power_top2_value
+      - power_top2_range_index_unit
+      - power_cross_radar_consensus
+    shared_cell_encoder: [9, 16, 16]
+  svd:
+    offset: 424
+    width: 147
+    shape: [3, 7, 7]
+    axis_order: [radar, ratio, statistic]
+    ratios: [0.25, 0.3333333333333333, 0.5, 1.0, 2.0, 3.0, 4.0]
+    statistics:
+      - reliability_weighted_mean
+      - max
+      - component_entropy
+      - reliability_weighted_peak_distance_bpm
+      - closest_peak_distance_bpm
+      - reliability_mean
+      - reliability_max
+    shared_cell_encoder: [7, 16, 16]
+  embeddings:
+    radar_count: 3
+    ratio_count: 7
+    rf_branch_count: 2
+    mask_aware_pooling: true
+    cell_mask_rule: derive_from_candidate_mask_joint_radar_mask_native_grid_in_band_and_frozen_branch_availability_never_from_feature_value
+    masked_cells_after_scaling: exact_zero
+  node_projection_width: 64
+  scaler_fit_scope: outer_train_only
+
+model:
+  family: DHFER-SNN
+  full_name: Directed Harmonic Factor-Expert Spiking Neural Network
+  hidden_channels: 64
+  graph_blocks: 2
+  graph_cell: plif
+  factor_temporal_cells: [plif, alif]
+  simulation_steps: 8
+  dropout: 0.05
+  graph_relations:
+    - near
+    - receiver_is_2x_sender
+    - sender_is_2x_receiver
+    - receiver_is_3x_sender
+    - sender_is_3x_receiver
+    - receiver_is_4x_sender
+    - sender_is_4x_receiver
+  near_tolerance_bpm: 0.5
+  ratio_tolerance_bpm: 0.75
+  graph_relation_rule: abs(receiver_rr-ratio_times_sender_rr)<=relation_tolerance
+  graph_self_edges: false_residual_path_carries_self_information
+  factor_centers_from_classical_rr: [1.0, 2.0, 3.0, 4.0]
+  factor_affinity: exp(-abs(candidate_rr-factor_center)/0.75)
+  fixed_factor_logit_boost: 2.0
+  factor_unavailable_policy: zero_factor_affinity_zero_route_boost_and_mask_factor_loss
+  decoder: hard_joint_expert_argmax
+  experts: [corrected_anchor, candidate_0_to_K_minus_1]
+  continuous_anchor_candidate_blending_allowed: false
+  arithmetic_midpoint_or_pull_allowed: false
+  initialization:
+    candidate_head_weights_and_bias: exact_zero
+    anchor_expert_bias: 4.0
+    anchor_residual: exact_zero
+    maximum_factor_route_boost: 2.0
+  anchor_expert:
+    inputs: [causal_proposer_anchor_bpm, causal_proposer_anchor_std_bpm, causal_proposer_anchor_available]
+    residual_limit_bpm: 12.0
+    minimum_scale_bpm: 0.25
+    initial_scale_bpm: 1.5
+    maximum_scale_bpm: 12.0
+    unavailable_fallback: hard_candidate_argmax_then_raw_classical_rr
+    if_every_source_unavailable: emit_no_numeric_estimate_and_availability_false
+    future_lags_allowed: false
+  maximum_parameters: 400000
+  hard_parameter_cap: true
+
+variants:
+  H0_no_factor:
+    structured_encoder: true
+    directed_graph: true
+    hard_joint_expert: true
+    factor_router: false
+    factor_focal_loss: false
+    wrong_harmonic_margin_loss: false
+    factor_candidate_js_loss: false
+  H1_factor:
+    structured_encoder: true
+    directed_graph: true
+    hard_joint_expert: true
+    factor_router: true
+    fixed_factor_logit_boost: 2.0
+    factor_focal_loss: true
+    wrong_harmonic_margin_loss: false
+    factor_candidate_js_loss: false
+  H2_full:
+    structured_encoder: true
+    directed_graph: true
+    hard_joint_expert: true
+    factor_router: true
+    fixed_factor_logit_boost: 2.0
+    factor_focal_loss: true
+    wrong_harmonic_margin_loss: true
+    factor_candidate_js_loss: true
+
+training:
+  optimizer: adamw
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  epochs_max: 120
+  minimum_epochs: 20
+  patience: 18
+  chunk_windows: 32
+  warmup_windows: 2
+  gradient_accumulation_sessions: 4
+  gradient_clip: 2.0
+  deterministic: true
+  amp: true
+  identity_balanced: true
+  weak_invalid_supervised_weight: 0.0
+  invalid_windows_update_state: true
+  checkpoint_selection:
+    data: non_test_outer_validation_fold_only
+    key:
+      - failed_accuracy_gates
+      - worst_normalized_gate_violation
+      - summed_normalized_gate_violation
+      - identity_macro_mae_bpm
+      - overall_mae_bpm
+      - epoch
+    ordering: lexicographic_ascending
+    outer_test_targets_allowed: false
+  losses:
+    listwise_kl: 1.0
+    mixture_nll: 0.25
+    component_smooth_l1: 0.30
+    anchor_residual_smooth_l1: 0.50
+    anchor_nll: 0.15
+    confident_class_balanced_factor_focal: 0.35
+    wrong_harmonic_margin: 0.25
+    factor_candidate_js_consistency: 0.10
+    quality_bce: 0.10
+    spike_rate: 0.005
+    cvar20: 0.15
+  factor_focal_gamma: 2.0
+  wrong_harmonic_margin_bpm: 1.0
+  wrong_harmonic_hardest_negatives: 2
+  tail_weight: 2.0
+  cvar_quantile: 0.20
+  factor_supervision:
+    label: argmin_abs_reference_rr_minus_classical_rr_times_factor
+    confident_only: true
+    confidence_rule: min_abs_error_bpm<=2.0
+    class_balancing: inverse_frequency_from_outer_train_only
+
+selection:
+  discovery_variants: [H0_no_factor, H1_factor, H2_full]
+  discovery_release_modes: [raw_anchor, hard_source_argmax, fixed_confidence_switch]
+  discovery_outer_folds: [3, 4]
+  seeds: [20260828, 20260829, 20260830]
+  discovery_jobs: 18
+  common_variant_and_release_mode_required: true
+  per_fold_or_seed_variant_or_release_mode_selection_allowed: false
+  strict_improvement_over: v2_i3_locked_common_selection_key
+  selection_key:
+    - total_failed_accuracy_gates
+    - worst_normalized_gate_violation
+    - summed_normalized_gate_violation
+    - worst_unit_identity_macro_mae_bpm
+    - mean_identity_macro_mae_bpm
+    - mean_overall_mae_bpm
+    - parameter_count
+  ordering: lexicographic_ascending
+  tie_break: earlier_variant_in_discovery_variants
+  promotion_outer_folds: [0, 1, 2, 3, 4, 5]
+  promotion_seeds: [20260828, 20260829, 20260830]
+  promotion_jobs: 18
+  promotion_variant: one_locked_common_variant
+  promotion_release_mode: one_locked_common_release_mode
+
+release:
+  modes:
+    - raw_anchor
+    - hard_source_argmax
+    - fixed_confidence_switch
+  fixed_confidence_switch:
+    hard_source_probability_min: 0.80
+    otherwise: raw_anchor
+  stable_mode_tie_order: [raw_anchor, hard_source_argmax, fixed_confidence_switch]
+  learned_or_post_test_threshold_search_allowed: false
+
+resource_budget:
+  gpu_hours_hard: 10.0
+  maximum_parallel_gpu_training_jobs: 1
+  discovery_jobs_max: 18
+  promotion_jobs_max: 18
+  total_training_jobs_max: 36
+  proposer_retraining_allowed: false
+
+inference_context:
+  sanitized_fields: [cache_index, classical_rr_bpm]
+  target_fields_allowed: []
+  identity_fields_allowed: []
+  protocol_fields_allowed: []
+  future_fields_allowed: []

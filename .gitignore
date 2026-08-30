@@ -1,0 +1,102 @@
+# SnnProject Git boundary
+# Source/config/tests/docs only. Private physiological data and scientific
+# payloads stay in the restricted restore backup, never in Git.
+
+# Private acquisition inputs
+/HAI_EXPERIMENT/
+/HAI_EXPERIMENT-*.zip
+/HAI_Experiment_UWB_GuideLine.pptx
+/sync_tool_S02.m
+*.acq
+*.dat
+*.mat
+*.xlsx
+*.xls
+
+# Archives and backup payloads
+*.zip
+*.tar
+*.tar.*
+*.tgz
+*.gz
+*.zst
+*.7z
+*.rar
+
+# Python environments and generated state
+/.venv/
+/venv/
+/env/
+**/__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+
+# Local agent/editor/OS state
+/.agents/
+/.codex/
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets and local overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# Models, tensors, predictions, and tabular/log outputs
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.arrow
+*.csv
+*.jsonl
+*.log
+
+# Generated roots outside artifacts
+/runs/
+/outputs/
+/checkpoints/
+/logs/
+/tmp/
+
+# Restore transport/evidence metadata is private-backup-only. Restore code and
+# requirements are staged explicitly.
+/restore/*
+!/restore/bootstrap_env.sh
+!/restore/verify_restore.sh
+!/restore/build_integrity_manifest.py
+!/restore/requirements-top-level.txt
+!/restore/requirements-linux-cu130.txt
+
+# Artifacts are deny-by-default. Only reviewed narrative documents are eligible.
+/artifacts/**
+!/artifacts/COMMERCIAL_GOAL_AUDIT.md
+!/artifacts/COMMERCIAL_SNN_CONTINUOUS_EXECUTION_PLAN_V4.md
+!/artifacts/COMMERCIAL_SNN_CONTINUOUS_EXECUTION_PLAN_V4_AMENDMENT_01.md
+!/artifacts/COMMERCIAL_SNN_GOAL_V2.md
+!/artifacts/COMMERCIAL_SNN_MASTER_EXECUTION_PLAN_V3.md
+!/artifacts/COMMERCIAL_SNN_PROGRESS_V2.md
+!/artifacts/SNN_PROJECT_COMPACT_TECH_STACK_2026-08-30.md
+!/artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-30.md
+!/artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md
+!/artifacts/SNN_PROJECT_WORKSTREAM_TECHNOLOGY_BLUEPRINT_2026-08-30.md
+!/artifacts/SNN_TRAINING_METHODOLOGY_RECOMMENDATION_2026-08-30.md

@@ -1,0 +1,118 @@
+schema_version: acquisition_protocol_v1
+time_basis: seconds_from_biopac_start
+
+# These annotations are for retrospective acquisition reconstruction and QC.
+# They are metadata, never deployable model inputs.  In particular, any
+# boundary derived from BIOPAC/RSP would leak the reference modality at
+# inference time.
+annotation_contract:
+  purpose: offline_acquisition_segmentation_and_evaluation
+  inference_feature_allowed: false
+  biopac_derived_annotation:
+    inference_feature_allowed: false
+    permitted_uses:
+      - offline_alignment_audit
+      - label_construction
+      - retrospective_stage_evaluation
+  phase7_assignment:
+    inference_feature_allowed: false
+    semantics: assigned action in phase 7 only; not a whole-session activity label
+
+# Durations and gaps are soft priors reconstructed from the visible acquisition
+# guide and the hand-written S02/S03 timings.  They are deliberately not hard
+# clipping rules: setup, retries, and operator delays varied between sessions.
+# Phase 2 is 360 s because its detailed substeps sum to 6 minutes even though
+# one overview label in the slide deck says 4 min 30 s.
+stages:
+  - id: phase1
+    order: 1
+    name: angled_seated_respiration
+    nominal_duration_s: 180.0
+    duration_scale_s: 35.0
+    plausible_duration_s: [120.0, 260.0]
+    nominal_gap_before_s: 25.0
+    gap_scale_s: 25.0
+    plausible_gap_before_s: [0.0, 120.0]
+  - id: phase2
+    order: 2
+    name: breathing_challenge_and_exercise_recovery
+    nominal_duration_s: 360.0
+    duration_scale_s: 55.0
+    plausible_duration_s: [240.0, 480.0]
+    nominal_gap_before_s: 45.0
+    gap_scale_s: 35.0
+    plausible_gap_before_s: [0.0, 160.0]
+  - id: phase3
+    order: 3
+    name: pickup_two_courses
+    nominal_duration_s: 55.0
+    duration_scale_s: 30.0
+    plausible_duration_s: [15.0, 160.0]
+    nominal_gap_before_s: 75.0
+    gap_scale_s: 55.0
+    plausible_gap_before_s: [0.0, 240.0]
+  - id: phase4
+    order: 4
+    name: fall_scenarios_two_courses
+    nominal_duration_s: 150.0
+    duration_scale_s: 45.0
+    plausible_duration_s: [60.0, 320.0]
+    nominal_gap_before_s: 90.0
+    gap_scale_s: 60.0
+    plausible_gap_before_s: [0.0, 260.0]
+  - id: phase5
+    order: 5
+    name: sixteen_cell_timed_course
+    nominal_duration_s: 170.0
+    duration_scale_s: 35.0
+    plausible_duration_s: [120.0, 280.0]
+    nominal_gap_before_s: 45.0
+    gap_scale_s: 40.0
+    plausible_gap_before_s: [0.0, 180.0]
+  - id: phase6
+    order: 6
+    name: continuous_round_trip
+    nominal_duration_s: 25.0
+    duration_scale_s: 15.0
+    plausible_duration_s: [8.0, 90.0]
+    nominal_gap_before_s: 50.0
+    gap_scale_s: 35.0
+    plausible_gap_before_s: [0.0, 180.0]
+  - id: phase7
+    order: 7
+    name: assigned_free_action
+    nominal_duration_s: 15.0
+    duration_scale_s: 12.0
+    plausible_duration_s: [4.0, 120.0]
+    nominal_gap_before_s: 30.0
+    gap_scale_s: 25.0
+    plausible_gap_before_s: [0.0, 180.0]
+
+fall_protocol:
+  v2_candidate_from_session: 4
+  v1_id: fall_v1_three_scenarios
+  v2_id: fall_v2_four_scenarios
+
+decoder:
+  candidate_grid_step_s: 5.0
+  marker_match_sigma_s: 1.5
+  duration_penalty_weight: 1.0
+  gap_penalty_weight: 0.65
+  plausible_range_penalty_weight: 1.5
+  manual_boundaries_are_locked: true
+  minimum_stage_duration_s: 1.0
+  confidence:
+    auto_threshold: 0.80
+    review_threshold: 0.45
+    manual_boundary: 0.99
+    prior_only_boundary: 0.32
+  source_weights:
+    radar_marker: 1.0
+    radar_motion: 0.9
+    biopac_marker: 1.0
+    fused_marker: 1.2
+    unknown: 0.7
+
+window_assignment:
+  minimum_overlap_fraction: 0.80
+  transition_guard_s: 2.0

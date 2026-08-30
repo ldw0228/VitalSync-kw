@@ -1,0 +1,221 @@
+campaign_id: harmonic_candidate_set_snn_v2
+classification: retrospective_adaptive_engineering
+
+data:
+  rf_cache: artifacts/cache/rf32s
+  svd_cache: artifacts/cache/svd_components_all_v1
+  fold_assignments: artifacts/runs/final_alias_gate_s12_deterministic/fold_assignments.json
+  exploratory_all_window_proposer: artifacts/runs/final_alias_gate_s12_deterministic/all_windows_cuda_v3
+  frozen_fallback_oof: artifacts/runs/ensemble_structured_exact/ensemble_oof.csv
+  rr_min_bpm: 6.0
+  rr_max_bpm: 45.0
+  rr_bin_width_bpm: 0.25
+  window_seconds: 32.0
+  stride_seconds: 4.0
+
+candidate:
+  maximum_candidates: 12
+  posterior_modes: 5
+  proposal_selection_i1: topk
+  merge_radius_bpm: 0.5
+  harmonic_ratios: [0.25, 0.3333333333333333, 0.5, 1.0, 2.0, 3.0, 4.0]
+  evidence_durations_seconds: [8, 16, 32]
+  svd_verified_variants: [0, 1, 2, 3, 4, 5]
+  svd_components_by_iteration:
+    v2_i1_candidate_graph: 6
+    v2_i2_harmonic_evidence: 12
+  rf_branch: raw
+  allow_unverified_phase_branch: false
+  out_of_band_policy: zero_and_mask
+
+model:
+  node_channels: 64
+  graph_channels: 64
+  graph_blocks: 2
+  graph_cell: plif
+  episode_cells: [plif, alif]
+  simulation_steps: 8
+  dropout: 0.05
+  beta: 0.92
+  adaptation_decay: 0.97
+  adaptation_strength: 0.40
+  maximum_residual_bpm: 0.75
+  minimum_scale_bpm: 0.25
+  maximum_parameters: 750000
+
+training:
+  seeds: [20260828, 20260829, 20260830]
+  discovery_outer_folds: [3, 4]
+  epochs: 120
+  minimum_epochs: 20
+  patience: 18
+  learning_rate: 0.0003
+  weight_decay: 0.0002
+  optimizer: adamw
+  gradient_clip: 2.0
+  session_chunks_per_batch: 2
+  gradient_accumulation: 4
+  chunk_windows: 32
+  warmup_windows: 8
+  radar_dropout: 0.15
+  weak_invalid_supervised_weight: 0.0
+  loss:
+    listwise_kl: 1.0
+    source_smooth_l1: 0.6
+    factor_cross_entropy: 0.35
+    residual_smooth_l1: 0.15
+    uncertainty_nll: 0.08
+    view_consistency_js: 0.05
+    quality_bce: 0.03
+    spike_rate: 0.01
+  spike_rate_band: [0.02, 0.25]
+  identity_balanced: true
+  rr_band_weight_cap: 4.0
+
+policy:
+  probability_thresholds: [0.50, 0.525, 0.55, 0.575, 0.60, 0.625, 0.65, 0.675, 0.70, 0.725, 0.75, 0.775, 0.80, 0.825, 0.85, 0.875, 0.90, 0.925, 0.95]
+  margin_thresholds: [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+  entropy_thresholds: [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+  quality_thresholds: [0.50, 0.60, 0.70, 0.80]
+  pulls: [0.25, 0.50, 0.75, 1.00]
+  maximum_coverage: 0.20
+  minimum_correction_precision: 0.80
+  minimum_correction_recall: 0.20
+  maximum_base_good_false_positive_fraction: 0.01
+
+targets:
+  overall_mae_bpm_max: 1.0
+  identity_macro_mae_bpm_max: 1.0
+  rmse_bpm_max: 1.8
+  within_2_fraction_min: 0.90
+  over_5_fraction_max: 0.03
+  high_rr_25_35_mae_bpm_max: 2.0
+
+adaptive_iterations:
+  - id: v2_i1_candidate_graph
+    enabled: true
+  - id: v2_i2_harmonic_evidence
+    entry: i1_misses_any_accuracy_target
+    retrospective_design_amendment:
+      classification: retrospective_adaptive_not_confirmatory
+      proposal_selection: posterior-nms
+      posterior_nms_suppression_bpm: 1.25
+      posterior_modes: 5
+      base_proposals_priority: [expected, map]
+      base_proposal_source: BASE
+      direct_proposal_source: DIRECT_MODE
+      remaining_priority: [classical_x1_x2_x3_x4, radar_peaks_1_2_3]
+      maximum_candidates_unchanged: 12
+      proposer_node_features:
+        - direct_mode_rank_and_reciprocal_rank
+        - posterior_peak_and_local_mass_pm0p5_pm1p0_bpm
+        - normalized_posterior_entropy
+        - log_rr_std_quality_alias_probability_spike_rate
+        - expected_and_map_distance
+        - radar_weights_and_proposal_availability
+        - per_source_confidence
+      svd_components: 12
+      compact_node_width_policy: aggregate_over_components_without_component_axis_expansion
+      outer_test_unavailable_policy: no_BASE_or_DIRECT_candidate_and_zero_proposer_features
+  - id: v2_i3_tail_risk
+    entry: i2_misses_any_accuracy_target
+    retrospective_design_amendment:
+      id: v2_i3_causal_posterior_anchor_after_i2_router_failure
+      classification: retrospective_adaptive_not_confirmatory
+      declared_before_any_i3_score: true
+      effective_campaign_id: v2_i3_causal_posterior_anchor
+      effective_iteration: 3
+      final_model_family_iteration: true
+      creates_iteration_4: false
+      historical_i3_text_preserved: true
+      pre_amendment_bindings:
+        contract_sha256: 3daea99becdf0e9e533ed90a2ff4e418066015349a54a4f28205689bc37942e4
+        config_sha256: 23e4e16cd1b46da2c1957714bb389639b98b9a3da257a38d3eb4d556280c7f68
+        immutable_snapshot_required_before_edit: true
+      entry_evidence:
+        i2_outer3_seed_20260828_failed_gates: 6
+        i2_outer4_seed_20260828_failed_gates: 1
+        outer_test_consulted: false
+        outer3_hash_bound_recovery_available: false
+      cache:
+        reuse_i2_posterior_nms_cache: true
+        svd_components: 12
+        maximum_candidates: 12
+      anchor:
+        mode: causal_posterior
+        binding: strict_nested_cache_index
+        inputs: [anchor_rr, anchor_std, anchor_available]
+        residual_limit_bpm: 12.0
+        minimum_scale_bpm: 0.25
+        initial_scale_bpm: 1.5
+        maximum_scale_bpm: 12.0
+        distance_weight: 1.0
+        source_mode: learned_blend
+        gate_initialization: exact_zero
+        unavailable_fallback: bit_exact_candidate_source_then_raw_fallback
+        future_lags_allowed: false
+      loss:
+        tail_weight: 2.0
+        cvar_weight: 0.15
+        anchor_residual_weight: 0.75
+        anchor_nll_weight: 0.20
+        anchor_gate_weight: 0.08
+      optimization:
+        epochs: 120
+        minimum_epochs: 20
+        patience: 18
+        learning_rate: 0.0003
+        effective_weight_decay: 0.0001
+        declared_weight_decay_discrepancy_retrospective: true
+        warmup_windows: 2
+        gradient_accumulation_sessions: 4
+        chunk_windows: 32
+        deterministic: true
+        amp: true
+      capacity_variants:
+        primary: default
+        default:
+          hidden_channels: 64
+          attention_heads: 4
+          parameter_count_at_571_features: 195603
+        large:
+          hidden_channels: 96
+          attention_heads: 4
+          parameter_count_at_571_features: 410131
+          entry: default_misses_any_accuracy_gate_on_any_discovery_unit
+        maximum_parameters: 750000
+        hard_limit: true
+        other_variants_allowed: false
+        common_variant_across_folds_and_seeds: true
+        tie_break: default
+      checkpoint_selection:
+        objective:
+          - failed_gate_count
+          - maximum_normalized_violation
+          - summed_normalized_violation
+          - identity_macro_mae
+          - mae
+      policy:
+        maximum_coverage: 0.20
+        maximum_fpr: 0.01
+        minimum_correction_precision: 0.80
+        minimum_correction_recall: 0.20
+        macro_mae_noninferior: true
+        catastrophic_rate_noninferior: true
+        no_safe_policy: fail_closed_no_action
+        no_safe_policy_promotion_eligible: false
+        common_joint_discovery_policy_required: true
+      test_status:
+        strict_nested_outer_test_opened: false
+        prelaunch_recheck_required: true
+        discovery_only_required: true
+        commercial_claim_allowed: false
+        prospective_confirmation_required: true
+      execution_governance_deviation:
+        id: gpu_parallelism_limit_exceeded_during_retrospective_discovery
+        declared_maximum_parallel_gpu_training_jobs: 1
+        exact_peak_concurrency_reconstructed: false
+        concealment_allowed: false
+        affected_scores: retrospective_design_feedback_only
+        future_gpu_jobs_must_be_serialized: true
+        gpu_admission_lock_required: true

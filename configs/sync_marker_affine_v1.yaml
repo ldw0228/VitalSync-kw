@@ -1,0 +1,48 @@
+schema: snn_rr.sync_marker_affine.config.v1
+
+# Offline label-construction synchronization only.  Radar marker extraction
+# is target-free; the RSP channel is used solely to locate deliberate chest
+# presses.  Time convention:
+#   rsp_time_s = offset_s + scale * radar_time_s
+synchronization:
+  input:
+    expected_payload_bins: 182
+    radar_sample_rate_hz: 40.0
+    rsp_sample_rate_hz: 250.0
+
+  radar_motion:
+    motion_smoothing_s: 0.25
+    motion_clip_z: 30.0
+    motion_range_quantile: 0.90
+    radar_marker_z: 6.0
+    radar_marker_prominence_z: 2.0
+    radar_marker_merge_s: 4.0
+
+  rsp_marker:
+    rsp_adaptive_z: 6.0
+    # Acquisition guide/tool evidence: ordinary respiration was roughly
+    # 2.5--7.5 V and the deliberate chest press was roughly 10 V.
+    rsp_fixed_high: 8.5
+    rsp_fixed_low: null
+    rsp_marker_merge_s: 4.0
+
+  matching:
+    prior_tolerance_s: 12.0
+    match_residual_gate_s: 0.80
+    max_drift_ppm: 1000.0
+    min_marker_pairs: 3
+    good_marker_pairs: 5
+    min_marker_span_s: 120.0
+    min_affine_span_s: 300.0
+    min_affine_pairs: 3
+    min_affine_improvement_s: 0.015
+    min_affine_drift_ppm: 25.0
+
+  decision:
+    accept_max_rmse_s: 0.30
+    accept_max_abs_residual_s: 0.75
+    accept_min_confidence: 0.80
+    ambiguity_mapping_separation_s: 0.40
+    ambiguity_rmse_margin_s: 0.05
+    ambiguity_score_margin: 1.0
+    manual_review_min_pairs: 2
