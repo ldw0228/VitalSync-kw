@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -17,10 +18,18 @@ from snn_rr.data import build_dataset_manifest
 from snn_rr.cache import (
     ACQUISITION_CACHE_SCHEMA_VERSION,
     ACQUISITION_CACHE_SCHEMA_VERSION_V2,
+    ACQUISITION_CACHE_SCHEMA_VERSION_V3,
+    ACQUISITION_CACHE_ROOT_SCHEMA_VERSION_V3,
+    ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3,
+    ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3,
     REQUIRED_ACQUISITION_ANNOTATION_COLUMNS,
     load_feature_cache,
 )
 from snn_rr.preprocess import identity_for_session
+from snn_rr.radar_timing import (
+    CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+    CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1,
+)
 from snn_rr.synchronization import (
     MarkerCandidate,
     MarkerMatch,
@@ -41,6 +50,21 @@ _RECONSTRUCTION_CONTEXT = {
 }
 
 _SESSION_ID = "S12_KDH"
+_V3_REAL_UNMAPPED_SESSION_IDS = frozenset(
+    {
+        "S01_CMS",
+        "S03_PSJ",
+        "S09_HDH",
+        "S11_SJE",
+        "S12_KDH",
+        "S21_PSJ",
+        "S22_KJH",
+        "S25_GEC",
+        "S27_HDH",
+        "S28_KDH",
+        "S29_LHS",
+    }
+)
 _COHORT_AUTHORITY_PATH = (
     Path(__file__).resolve().parents[1]
     / "configs"
@@ -959,6 +983,529 @@ def _reseal_cache_files(cache: Path, session_id: str = _SESSION_ID) -> None:
     _write_json(root_path, root)
 
 
+def _v3_file_binding(path: Path, *, shape: list[int], dtype: str) -> dict[str, object]:
+    return {
+        "path": path.name,
+        "sha256": _file_sha256(path),
+        "bytes": path.stat().st_size,
+        "shape": shape,
+        "dtype": dtype,
+    }
+
+
+def _v3_upstream_reference_documents(
+    session_id: str,
+    *,
+    mapping: dict[str, object] | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build canonical embedded V3 upstream evidence for one session."""
+
+    receipt: dict[str, object] = {
+        "schema_version": "snn_rr.synthetic_sync_receipt.v1",
+        "session_id": session_id,
+        "result": {"mapping": mapping},
+        "content_sha256": "",
+    }
+    receipt["content_sha256"] = _content_sha256(receipt)
+    session: dict[str, object] = {
+        "schema_version": ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3,
+        "session_id": session_id,
+        "protocol": _protocol_document(session_id),
+        "synchronization": {
+            "mapping": mapping,
+            "receipt_content_sha256": receipt["content_sha256"],
+        },
+        "content_sha256": "",
+    }
+    session["content_sha256"] = _content_sha256(session)
+    return session, receipt
+
+
+def _write_v3_cache(
+    tmp_path: Path,
+    *,
+    claimed_scientific: bool = False,
+    frequency_overrides: dict[str, np.ndarray] | None = None,
+    unmapped_session_ids: frozenset[str] | None = None,
+) -> Path:
+    """Write a realistic full-30/usable-29 diagnostic V3 cache contract.
+
+    V3 cache production in this source generation is diagnostic by design.
+    The fixture therefore models the actual 30-session reconstruction and its
+    exact 29-session usable projection rather than permitting a subset or a
+    self-asserted scientific variant.
+    """
+
+    cohort = load_acquisition_cohort_authority(_COHORT_AUTHORITY_PATH)
+    all_ids = list(cohort.expected_session_ids)
+    expected_ids = list(cohort.expected_usable_session_ids)
+    cache_ids = list(expected_ids)
+    unmapped_ids = (
+        _V3_REAL_UNMAPPED_SESSION_IDS
+        if unmapped_session_ids is None
+        else frozenset(unmapped_session_ids)
+    )
+    unexpected_unmapped = sorted(unmapped_ids - set(expected_ids))
+    if unexpected_unmapped:
+        raise ValueError(
+            f"unmapped V3 fixture sessions are not usable: {unexpected_unmapped}"
+        )
+    if claimed_scientific:
+        raise ValueError("the current version-3 producer is diagnostic-only")
+
+    cache = tmp_path / "cache_v3"
+    cache.mkdir(parents=True)
+    config_sha256 = "5" * 64
+    pipeline_sha256 = "6" * 64
+    annotation_columns = sorted(
+        cache_module.V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS
+    )
+    root_items: list[dict[str, object]] = []
+    inventory_bindings: dict[str, str] = {}
+    constant_mapping = TimeMapping(mode="constant", offset_s=2.0).to_dict()
+    upstream_documents: dict[
+        str, tuple[dict[str, object], dict[str, object]]
+    ] = {}
+    for session_id in all_ids:
+        mapping = (
+            None
+            if session_id in unmapped_ids or session_id == "S24_KHJ"
+            else constant_mapping
+        )
+        upstream_documents[session_id] = _v3_upstream_reference_documents(
+            session_id,
+            mapping=mapping,
+        )
+    upstream_hashes = {
+        session_id: str(documents[0]["content_sha256"])
+        for session_id, documents in upstream_documents.items()
+    }
+
+    for index, session_id in enumerate(cache_ids):
+        session_dir = cache / session_id
+        session_dir.mkdir()
+        frequency_grid = np.asarray(
+            (
+                frequency_overrides[session_id]
+                if frequency_overrides is not None
+                and session_id in frequency_overrides
+                else [0.1, 0.2]
+            ),
+            dtype=np.float64,
+        )
+        maps = np.full(
+            (1, 3, len(frequency_grid), 182),
+            np.float16(index + 1),
+            dtype=np.float16,
+        )
+        auxiliary_frequency_bins = 2 * len(frequency_grid)
+        aux_names = cache_module._v3_aux_feature_names(auxiliary_frequency_bins)
+        aux = np.full((1, len(aux_names)), index + 0.5, dtype=np.float32)
+        timing_valid = np.ones((1, 3, 320), dtype=np.bool_)
+        timing_reasons = np.zeros(timing_valid.shape, dtype=np.uint8)
+        # V3 measured-timing eligibility is based on complete reason coverage,
+        # not on every output being valid.  Preserve one explained invalid cell.
+        timing_valid[0, 1, 2] = False
+        timing_reasons[0, 1, 2] = 1
+        metadata = _metadata(
+            session_id,
+            eligible=False,
+            sync_authorized=False,
+        )
+        reference_mapping_available = session_id not in unmapped_ids
+        metadata["reference_mapping_available"] = reference_mapping_available
+        target_values: dict[str, object] = {
+            "rr_bpm": np.nan,
+            "rr_spectral_bpm": np.nan,
+            "rr_phase_bpm": np.nan,
+            "rr_events_bpm": np.nan,
+            "reference_valid": False,
+            "reference_quality": np.nan,
+            "reference_sigma_bpm": np.nan,
+            "spectral_concentration": np.nan,
+            "periodicity": np.nan,
+            "interval_cv": np.nan,
+            "estimator_disagreement_bpm": np.nan,
+            "phase_residual_rad": np.nan,
+            "clip_fraction": np.nan,
+            "guard_clip_fraction": np.nan,
+            "plateau_fraction": np.nan,
+            "breath_count": np.nan,
+            "classical_error_bpm": np.nan,
+            "radar_observable": False,
+            "classical_acceptable_within_2bpm": False,
+            "classical_rr_bpm": 12.0,
+        }
+        for column, value in target_values.items():
+            metadata[column] = value
+        if not reference_mapping_available:
+            for column in cache_module._V3_REFERENCE_FLOAT_NAN_COLUMNS:
+                metadata[column] = np.nan
+            for column in cache_module._V3_REFERENCE_INTEGER_MINUS_ONE_COLUMNS:
+                metadata[column] = -1
+            for column in cache_module._V3_REFERENCE_NULL_STRING_COLUMNS:
+                metadata[column] = None
+            for column in cache_module._V3_REFERENCE_FALSE_BOOLEAN_COLUMNS:
+                metadata[column] = False
+
+        (
+            map_available,
+            aux_available,
+            expected_aux_names,
+            availability_names,
+        ) = cache_module._v3_expected_feature_availability(
+            timing_valid,
+            auxiliary_frequency_bins=auxiliary_frequency_bins,
+        )
+        assert expected_aux_names == aux_names
+        maps[~map_available] = np.float16(0.0)
+        aux[~aux_available] = np.float32(0.0)
+        feature_availability = np.concatenate(
+            (map_available, aux_available), axis=1
+        ).astype(np.bool_, copy=False)
+
+        np.save(session_dir / "maps.npy", maps, allow_pickle=False)
+        np.save(session_dir / "aux.npy", aux, allow_pickle=False)
+        np.save(
+            session_dir / "frequencies_hz.npy", frequency_grid, allow_pickle=False
+        )
+        np.save(
+            session_dir / "radar_timing_valid_mask.npy",
+            timing_valid,
+            allow_pickle=False,
+        )
+        np.save(
+            session_dir / "radar_timing_invalid_reason_mask.npy",
+            timing_reasons,
+            allow_pickle=False,
+        )
+        np.save(
+            session_dir / "feature_availability_mask.npy",
+            feature_availability,
+            allow_pickle=False,
+        )
+        metadata.to_csv(session_dir / "metadata.csv", index=False)
+
+        inventory = {
+            "maps": _v3_file_binding(
+                session_dir / "maps.npy", shape=list(maps.shape), dtype="float16"
+            ),
+            "aux": _v3_file_binding(
+                session_dir / "aux.npy", shape=list(aux.shape), dtype="float32"
+            ),
+            "metadata": _v3_file_binding(
+                session_dir / "metadata.csv",
+                shape=list(metadata.shape),
+                dtype="csv",
+            ),
+            "frequencies_hz": _v3_file_binding(
+                session_dir / "frequencies_hz.npy",
+                shape=list(frequency_grid.shape),
+                dtype="float64",
+            ),
+            "radar_timing_valid_mask": _v3_file_binding(
+                session_dir / "radar_timing_valid_mask.npy",
+                shape=list(timing_valid.shape),
+                dtype="bool",
+            ),
+            "radar_timing_invalid_reason_mask": _v3_file_binding(
+                session_dir / "radar_timing_invalid_reason_mask.npy",
+                shape=list(timing_reasons.shape),
+                dtype="uint8",
+            ),
+            "feature_availability_mask": _v3_file_binding(
+                session_dir / "feature_availability_mask.npy",
+                shape=list(feature_availability.shape),
+                dtype="bool",
+            ),
+        }
+        upstream_session, upstream_receipt = upstream_documents[session_id]
+        upstream_content_sha256 = upstream_hashes[session_id]
+        feature_schema = {
+            "schema_version": cache_module.V3_INFERENCE_FEATURE_SCHEMA_VERSION,
+            "maps": {
+                "axes": [
+                    "window",
+                    "radar_view",
+                    "frequency",
+                    "range_feature",
+                ],
+                "radar_names": ["radar_1", "radar_2", "radar_3"],
+                "range_feature_names": list(cache_module.V3_MAP_RANGE_FEATURE_NAMES),
+                "shape": list(maps.shape),
+                "dtype": "float16",
+                "frequency_grid_sha256": (
+                    cache_module.canonical_ndarray_sha256(frequency_grid)
+                ),
+                "source_lineage": cache_module.V3_MAP_SOURCE_LINEAGE,
+                "target_derived_inputs": False,
+            },
+            "aux": {
+                "axes": ["window", "feature"],
+                "feature_names": list(aux_names),
+                "feature_names_sha256": _value_sha256(list(aux_names)),
+                "shape": list(aux.shape),
+                "dtype": "float32",
+                "source_lineage": (
+                    "radar_only_causal_auxiliary_spectra_statistics"
+                ),
+                "target_derived_inputs": False,
+            },
+            "availability": {
+                "schema_version": (
+                    cache_module.V3_FEATURE_AVAILABILITY_SCHEMA_VERSION
+                ),
+                "axes": ["window", "feature"],
+                "feature_names": list(availability_names),
+                "feature_names_sha256": _value_sha256(
+                    list(availability_names)
+                ),
+                "shape": list(feature_availability.shape),
+                "dtype": "bool",
+                "semantics": (
+                    "first three cells authorize complete map radar views; remaining "
+                    "cells explicitly authorize aux columns; numeric zero never implies availability"
+                ),
+            },
+        }
+        forbidden = sorted(
+            cache_module._V3_TARGET_DERIVED_METADATA_COLUMNS
+            | cache_module.V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS
+        )
+        target_firewall = {
+            "schema_version": cache_module.V3_TARGET_FIREWALL_SCHEMA_VERSION,
+            "inference_payloads": [
+                "maps",
+                "aux",
+                "feature_availability_mask",
+                "frequencies_hz",
+            ],
+            "target_derived_metadata_columns": sorted(
+                cache_module._V3_TARGET_DERIVED_METADATA_COLUMNS
+            ),
+            "annotation_only_columns": sorted(
+                cache_module.V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS
+            ),
+            "forbidden_inference_feature_names": forbidden,
+            "radar_observable_role": (
+                "target_derived_metadata_only_forbidden_at_inference"
+            ),
+            "target_values_used_in_inference_features": False,
+        }
+        mapping = upstream_session["synchronization"]["mapping"]
+        protocol = upstream_session["protocol"]
+        metadata_join = {
+            "schema_version": cache_module.V3_METADATA_JOIN_SCHEMA_VERSION,
+            "reference_mapping_available": reference_mapping_available,
+            "mapping": mapping,
+            "mapping_sha256": _value_sha256(mapping),
+            "protocol": protocol,
+            "protocol_sha256": _value_sha256(protocol),
+            "biopac_sample_rate_hz": (
+                250.0 if reference_mapping_available else None
+            ),
+            "model_hz": 10.0,
+            "window_duration_s": 32.0,
+            "window_interval_count": 320,
+            "window_minimum_overlap_fraction": 0.8,
+            "transition_guard_s": 2.0,
+            "sync_authorized": False,
+            "stage_metric_eligible": False,
+            "joined_columns": list(cache_module._V3_METADATA_JOIN_COLUMNS),
+            "joined_rows_sha256": _value_sha256(
+                cache_module._v3_metadata_join_records(metadata)
+            ),
+        }
+        reference_support = cache_module._v3_reference_support_contract(
+            reference_mapping_available
+        )
+        session_manifest: dict[str, object] = {
+            "schema_version": ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3,
+            "session_id": session_id,
+            "content_sha256": "",
+            "config_sha256": config_sha256,
+            "pipeline_sha256": pipeline_sha256,
+            "source_fingerprint": hashlib.sha256(
+                f"source-v3:{session_id}".encode("utf-8")
+            ).hexdigest(),
+            "window_count": 1,
+            "scientific_eligible": False,
+            "raw_consumed_bytes_verified": True,
+            "timing_adjudicated": True,
+            "sync_raw_replay_verified": False,
+            "protocol_raw_replay_verified": False,
+            "sync_authorized": False,
+            "reference_mapping_available": reference_mapping_available,
+            "upstream_session_content_sha256": upstream_content_sha256,
+            "upstream_session_contract": upstream_session,
+            "upstream_sync_receipt": upstream_receipt,
+            "radar_timing_invalid_reason_schema_version": (
+                CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1
+            ),
+            "radar_timing_invalid_reason_semantics_sha256": (
+                CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+            ),
+            "feature_schema": feature_schema,
+            "feature_schema_sha256": _value_sha256(feature_schema),
+            "target_firewall": target_firewall,
+            "target_firewall_sha256": _value_sha256(target_firewall),
+            "metadata_join_contract": metadata_join,
+            "metadata_join_sha256": _value_sha256(metadata_join),
+            "reference_support_contract": reference_support,
+            "reference_support_sha256": _value_sha256(reference_support),
+            "file_inventory": inventory,
+            "inventory_sha256": _value_sha256(inventory),
+        }
+        session_manifest["content_sha256"] = _content_sha256(session_manifest)
+        session_manifest_path = session_dir / "manifest.json"
+        _write_json(session_manifest_path, session_manifest)
+        inventory_bindings[session_id] = str(session_manifest["inventory_sha256"])
+        root_items.append(
+            {
+                "session_id": session_id,
+                "status": "ok",
+                "schema_version": ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3,
+                "manifest_path": f"{session_id}/manifest.json",
+                "manifest_sha256": _file_sha256(session_manifest_path),
+                "manifest_content_sha256": session_manifest["content_sha256"],
+                "inventory_sha256": session_manifest["inventory_sha256"],
+                "upstream_session_content_sha256": upstream_content_sha256,
+                "scientific_eligible": False,
+            }
+        )
+    upstream_entries = [
+        {
+            "session_id": session_id,
+            "usable": session_id != "S24_KHJ",
+            "content_sha256": upstream_hashes[session_id],
+            "scientific_eligible": False,
+            "raw_consumed_bytes_verified": session_id != "S24_KHJ",
+            "timing_adjudicated": session_id != "S24_KHJ",
+            "sync_raw_replay_verified": False,
+            "protocol_raw_replay_verified": False,
+            "sync_authorized": False,
+        }
+        for session_id in all_ids
+    ]
+
+    reconstruction: dict[str, object] = {
+        "schema_version": ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3,
+        "content_sha256": "",
+        "expected_session_ids": all_ids,
+        "expected_session_ids_sha256": _value_sha256(all_ids),
+        "expected_usable_session_ids": expected_ids,
+        "expected_usable_session_ids_sha256": _value_sha256(expected_ids),
+        "selected_session_ids": all_ids,
+        "selected_session_ids_sha256": _value_sha256(all_ids),
+        "execution_complete": True,
+        "complete": True,
+        "full_cohort_complete": True,
+        "scientific_eligible": False,
+        "raw_consumed_bytes_verified": True,
+        "timing_adjudicated": True,
+        "sync_raw_replay_verified": False,
+        "protocol_raw_replay_verified": False,
+        "dataset_session_count": 30,
+        "dataset_usable_session_count": 29,
+        "dataset_physical_identity_count": 18,
+        "selected_session_count": 30,
+        "session_count": 30,
+        "sessions": upstream_entries,
+    }
+    reconstruction["content_sha256"] = _content_sha256(reconstruction)
+    reconstruction_path = cache / "acquisition_reconstruction.json"
+    _write_json(reconstruction_path, reconstruction)
+
+    root_contract: dict[str, object] = {
+        "schema_version": ACQUISITION_CACHE_SCHEMA_VERSION_V3,
+        "upstream_reconstruction_schema_version": (
+            ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3
+        ),
+        "reconstruction_manifest": reconstruction_path.name,
+        "reconstruction_manifest_sha256": _file_sha256(reconstruction_path),
+        "reconstruction_manifest_bytes": reconstruction_path.stat().st_size,
+        "reconstruction_content_sha256": reconstruction["content_sha256"],
+        "cohort_authority_sha256": cohort.file_sha256,
+        "cohort_authority_content_sha256": cohort.content_sha256,
+        "mode": "diagnostic",
+        "scientific_eligible": False,
+        "subjects_filter_applied": False,
+        "selection_scope": "full_cohort",
+        "full_cohort_complete": True,
+        "expected_usable_session_ids": expected_ids,
+        "expected_usable_session_ids_sha256": _value_sha256(expected_ids),
+        "cache_usable_session_ids": cache_ids,
+        "cache_usable_session_ids_sha256": _value_sha256(cache_ids),
+        "cache_inventory_aggregate_sha256": _value_sha256(inventory_bindings),
+        "annotation_only_columns": annotation_columns,
+    }
+    root_manifest: dict[str, object] = {
+        "schema_version": ACQUISITION_CACHE_ROOT_SCHEMA_VERSION_V3,
+        "content_sha256": "",
+        "config_sha256": config_sha256,
+        "pipeline_sha256": pipeline_sha256,
+        "acquisition_contract": root_contract,
+        "sessions": root_items,
+    }
+    root_manifest["content_sha256"] = _content_sha256(root_manifest)
+    _write_json(cache / "manifest.json", root_manifest)
+    return cache
+
+
+def _reseal_v3_session(cache: Path, session_id: str) -> None:
+    session_path = cache / session_id / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    inventory = session["file_inventory"]
+    for binding in inventory.values():
+        payload_path = cache / session_id / binding["path"]
+        binding["sha256"] = _file_sha256(payload_path)
+        binding["bytes"] = payload_path.stat().st_size
+        if binding["dtype"] == "csv":
+            binding["shape"] = list(pd.read_csv(payload_path).shape)
+        else:
+            array = np.load(payload_path, allow_pickle=False)
+            binding["shape"] = list(array.shape)
+            binding["dtype"] = str(array.dtype)
+    session["inventory_sha256"] = _value_sha256(inventory)
+    session["content_sha256"] = _content_sha256(session)
+    _write_json(session_path, session)
+
+    root_path = cache / "manifest.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    item = next(item for item in root["sessions"] if item["session_id"] == session_id)
+    item["manifest_sha256"] = _file_sha256(session_path)
+    item["manifest_content_sha256"] = session["content_sha256"]
+    item["inventory_sha256"] = session["inventory_sha256"]
+    root["acquisition_contract"]["cache_inventory_aggregate_sha256"] = (
+        _value_sha256(
+            {
+                current["session_id"]: current["inventory_sha256"]
+                for current in root["sessions"]
+            }
+        )
+    )
+    root["content_sha256"] = _content_sha256(root)
+    _write_json(root_path, root)
+
+
+def _reseal_v3_reconstruction(cache: Path) -> None:
+    reconstruction_path = cache / "acquisition_reconstruction.json"
+    reconstruction = json.loads(reconstruction_path.read_text(encoding="utf-8"))
+    reconstruction["content_sha256"] = _content_sha256(reconstruction)
+    _write_json(reconstruction_path, reconstruction)
+
+    root_path = cache / "manifest.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    contract = root["acquisition_contract"]
+    contract["reconstruction_manifest_sha256"] = _file_sha256(
+        reconstruction_path
+    )
+    contract["reconstruction_manifest_bytes"] = reconstruction_path.stat().st_size
+    contract["reconstruction_content_sha256"] = reconstruction["content_sha256"]
+    root["content_sha256"] = _content_sha256(root)
+    _write_json(root_path, root)
+
+
 def test_legacy_cache_default_behavior_is_unchanged(tmp_path: Path) -> None:
     cache = tmp_path / "legacy"
     session = cache / "LEGACY"
@@ -988,12 +1535,11 @@ def test_valid_acquisition_contract_and_scientific_gate(tmp_path: Path) -> None:
     loaded = load_feature_cache(
         eligible_cache,
         require_acquisition_contract=True,
-        require_scientific_eligible=True,
     )
     assert loaded.metadata.loc[0, "acquisition_phase"] == "phase1"
     assert loaded.provenance is not None
-    assert loaded.provenance.classification == "acquisition_scientific"
-    assert loaded.provenance.scientific_eligible is True
+    assert loaded.provenance.classification == "acquisition_historical_v2"
+    assert loaded.provenance.scientific_eligible is False
     assert loaded.radar_timing_valid_mask is not None
     assert loaded.radar_timing_valid_mask.shape == (29, 3, 320)
     assert loaded.radar_timing_valid_mask.all()
@@ -1006,8 +1552,11 @@ def test_valid_acquisition_contract_and_scientific_gate(tmp_path: Path) -> None:
     )
     assert diagnostic.provenance is not None
     assert diagnostic.provenance.classification == "acquisition_diagnostic"
-    with pytest.raises(ValueError, match="root is not scientifically eligible"):
+    with pytest.raises(ValueError, match="requires acquisition cache version 3"):
         load_feature_cache(diagnostic_cache, require_scientific_eligible=True)
+
+    with pytest.raises(ValueError, match="requires acquisition cache version 3"):
+        load_feature_cache(eligible_cache, require_scientific_eligible=True)
 
     downgraded_cache, _ = _write_cache(
         tmp_path / "downgraded",
@@ -1025,7 +1574,7 @@ def test_valid_acquisition_contract_and_scientific_gate(tmp_path: Path) -> None:
     historical = load_feature_cache(historical_cache)
     assert historical.provenance is not None
     assert historical.provenance.classification == "acquisition_historical_v1"
-    with pytest.raises(ValueError, match="version-2 full-cohort"):
+    with pytest.raises(ValueError, match="requires acquisition cache version 3"):
         load_feature_cache(
             historical_cache,
             require_scientific_eligible=True,
@@ -1098,7 +1647,7 @@ def test_v2_inventory_generation_change_during_load_fails_closed(
 
     monkeypatch.setattr(cache_module, "_inventory_sha256", changing_inventory)
     with pytest.raises(ValueError, match="inventory changed during load"):
-        load_feature_cache(cache, require_scientific_eligible=True)
+        load_feature_cache(cache, require_acquisition_contract=True)
 
 
 def test_v2_inventory_cannot_redirect_away_from_loader_target(tmp_path: Path) -> None:
@@ -1183,7 +1732,7 @@ def test_v2_diagnostic_subset_is_bound_but_not_promoted(tmp_path: Path) -> None:
     assert loaded.provenance is not None
     assert loaded.provenance.classification == "acquisition_diagnostic"
     assert loaded.provenance.scientific_eligible is False
-    with pytest.raises(ValueError, match="root is not scientifically eligible"):
+    with pytest.raises(ValueError, match="requires acquisition cache version 3"):
         load_feature_cache(cache, require_scientific_eligible=True)
 
 
@@ -1289,10 +1838,13 @@ def test_scientific_session_filter_and_in_memory_subset_are_never_promoted(
 
     selected = load_feature_cache(cache, sessions=[_SESSION_ID])
     assert selected.provenance is not None
-    assert selected.provenance.classification == "acquisition_diagnostic"
+    assert selected.provenance.classification == "acquisition_historical_v2"
     assert not selected.provenance.scientific_eligible
 
-    complete = load_feature_cache(cache, require_scientific_eligible=True)
+    complete = load_feature_cache(cache, require_acquisition_contract=True)
+    assert complete.provenance is not None
+    assert complete.provenance.classification == "acquisition_historical_v2"
+    assert not complete.provenance.scientific_eligible
     subset = complete.subset(np.asarray([0], dtype=np.int64))
     assert subset.provenance is not None
     assert subset.provenance.classification == "acquisition_diagnostic"
@@ -1346,7 +1898,7 @@ def test_affine_drift_preserves_radar_32s_and_scaled_reference_support(
         tmp_path, eligible=True, version=2, mapping_scale=1.0001
     )
 
-    loaded = load_feature_cache(cache, require_scientific_eligible=True)
+    loaded = load_feature_cache(cache, require_acquisition_contract=True)
     frame = loaded.metadata.loc[
         loaded.metadata["session_id"] == _SESSION_ID
     ].iloc[0]
@@ -1455,3 +2007,500 @@ def test_rehashed_cache_timing_summary_cannot_diverge_from_reconstruction(
 
     with pytest.raises(ValueError, match="cache/source radar timing summary mismatch"):
         load_feature_cache(cache)
+
+
+def test_v3_consumed_byte_loader_returns_owned_readonly_arrays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+
+    def forbidden_path_rehash(_path: Path) -> str:
+        raise AssertionError("V3 provenance must not rehash a consumed path")
+
+    monkeypatch.setattr(cache_module, "_sha256_file", forbidden_path_rehash)
+    loaded = load_feature_cache(cache, require_acquisition_contract=True)
+
+    assert loaded.provenance is not None
+    assert loaded.provenance.classification == "acquisition_diagnostic"
+    assert loaded.provenance.acquisition_schema_version == (
+        ACQUISITION_CACHE_SCHEMA_VERSION_V3
+    )
+    assert loaded.provenance.scientific_eligible is False
+    # One reconstruction + 29 * (session manifest + seven payloads).
+    assert loaded.provenance.inventory_file_count == 233
+    assert loaded.radar_timing_invalid_reason_mask is not None
+    assert loaded.radar_timing_valid_mask is not None
+    assert loaded.map_view_availability_mask is not None
+    assert loaded.aux_feature_availability_mask is not None
+    assert loaded.aux_feature_names is not None
+    assert loaded.feature_availability_mask is not None
+    assert loaded.feature_availability_names is not None
+    np.testing.assert_array_equal(
+        loaded.feature_availability_mask,
+        np.concatenate(
+            (
+                loaded.map_view_availability_mask,
+                loaded.aux_feature_availability_mask,
+            ),
+            axis=1,
+        ),
+    )
+    np.testing.assert_array_equal(
+        loaded.radar_timing_invalid_reason_mask != 0,
+        ~loaded.radar_timing_valid_mask,
+    )
+    for array in (
+        loaded.maps,
+        loaded.aux,
+        loaded.frequencies_hz,
+        loaded.radar_timing_valid_mask,
+        loaded.radar_timing_invalid_reason_mask,
+        loaded.feature_availability_mask,
+        loaded.map_view_availability_mask,
+        loaded.aux_feature_availability_mask,
+    ):
+        assert array.flags.owndata
+        assert not array.flags.writeable
+        with pytest.raises(ValueError):
+            array.flat[0] = array.flat[0]
+
+
+def test_v3_realistic_diagnostic_cannot_manufacture_scientific_authority(
+    tmp_path: Path,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+
+    diagnostic = load_feature_cache(cache)
+    assert diagnostic.provenance is not None
+    assert diagnostic.provenance.classification == "acquisition_diagnostic"
+    assert diagnostic.provenance.scientific_eligible is False
+    with pytest.raises(ValueError, match="independently verified upstream"):
+        load_feature_cache(cache, require_scientific_eligible=True)
+
+
+def test_v3_unmapped_session_loads_only_radar_support_and_stays_diagnostic(
+    tmp_path: Path,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+
+    loaded = load_feature_cache(cache, sessions=[_SESSION_ID])
+
+    assert loaded.provenance is not None
+    assert loaded.provenance.classification == "acquisition_diagnostic"
+    assert loaded.provenance.scientific_eligible is False
+    assert loaded.metadata["session_id"].tolist() == [_SESSION_ID]
+    row = loaded.metadata.iloc[0]
+    assert bool(row["reference_mapping_available"]) is False
+    for column in cache_module._V3_REFERENCE_FLOAT_NAN_COLUMNS:
+        assert pd.isna(row[column]), column
+    for column in cache_module._V3_REFERENCE_INTEGER_MINUS_ONE_COLUMNS:
+        assert int(row[column]) == -1, column
+    for column in cache_module._V3_REFERENCE_NULL_STRING_COLUMNS:
+        assert pd.isna(row[column]), column
+    for column in cache_module._V3_REFERENCE_FALSE_BOOLEAN_COLUMNS:
+        assert bool(row[column]) is False, column
+    radar_start = float(row["radar_window_start_relative_s"])
+    radar_end = float(row["radar_window_end_relative_s"])
+    assert np.isfinite(radar_start)
+    assert np.isfinite(radar_end)
+    assert radar_end - radar_start == 32.0
+    assert float(row["classical_rr_bpm"]) == 12.0
+
+    session = json.loads(
+        (cache / _SESSION_ID / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert session["reference_mapping_available"] is False
+    assert session["upstream_session_contract"]["synchronization"]["mapping"] is None
+    assert session["upstream_sync_receipt"]["result"]["mapping"] is None
+    assert session["metadata_join_contract"]["mapping"] is None
+    assert session["metadata_join_contract"]["biopac_sample_rate_hz"] is None
+    assert session["reference_support_contract"] == (
+        cache_module._v3_reference_support_contract(False)
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected"),
+    (
+        ("finite_target", "unmapped reference column rr_bpm must be all NaN"),
+        ("textual_na_token", "unmapped reference column rr_bpm must be all NaN"),
+        ("numeric_boolean_token", "must be an explicit boolean"),
+    ),
+)
+def test_v3_unmapped_sentinels_survive_fully_resealed_metadata_tamper(
+    tmp_path: Path,
+    tamper: str,
+    expected: str,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_dir = cache / _SESSION_ID
+    metadata_path = session_dir / "metadata.csv"
+    metadata = pd.read_csv(metadata_path)
+    if tamper == "finite_target":
+        metadata.loc[0, "rr_bpm"] = 12.0
+    elif tamper == "textual_na_token":
+        # Default pandas NA token handling would silently turn this attacker
+        # controlled text into NaN.  The V3 parser accepts only an empty CSV
+        # field as the unavailable sentinel.
+        metadata["rr_bpm"] = np.asarray(["NA"], dtype=object)
+    else:
+        # A numeric zero must not be interpreted as an explicit false token.
+        metadata["reference_mapping_available"] = np.asarray(
+            [0], dtype=np.int64
+        )
+    metadata.to_csv(metadata_path, index=False)
+
+    session_path = session_dir / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["metadata_join_contract"]["joined_rows_sha256"] = _value_sha256(
+        cache_module._v3_metadata_join_records(metadata)
+    )
+    session["metadata_join_sha256"] = _value_sha256(
+        session["metadata_join_contract"]
+    )
+    _write_json(session_path, session)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    with pytest.raises(ValueError, match=expected):
+        load_feature_cache(cache, sessions=[_SESSION_ID])
+
+
+def test_v3_reference_support_contract_cannot_be_resealed_to_relax_sentinels(
+    tmp_path: Path,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_path = cache / _SESSION_ID / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    support = session["reference_support_contract"]
+    support["unavailable_float_sentinel"] = "pandas_default_na_token"
+    session["reference_support_sha256"] = _value_sha256(support)
+    _write_json(session_path, session)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    with pytest.raises(ValueError, match="reference support contract mismatch"):
+        load_feature_cache(cache, sessions=[_SESSION_ID])
+
+
+def test_v3_upstream_null_cannot_be_resealed_as_cache_mapped(
+    tmp_path: Path,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_dir = cache / _SESSION_ID
+    metadata_path = session_dir / "metadata.csv"
+    original = pd.read_csv(metadata_path)
+    metadata = _metadata(
+        _SESSION_ID,
+        eligible=False,
+        sync_authorized=False,
+    )
+    metadata["reference_mapping_available"] = True
+    for column in original.columns:
+        if column not in metadata:
+            metadata[column] = original[column]
+    metadata.to_csv(metadata_path, index=False)
+
+    session_path = session_dir / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    mapping = TimeMapping(mode="constant", offset_s=2.0).to_dict()
+    session["reference_mapping_available"] = True
+    join = session["metadata_join_contract"]
+    join["reference_mapping_available"] = True
+    join["mapping"] = mapping
+    join["mapping_sha256"] = _value_sha256(mapping)
+    join["biopac_sample_rate_hz"] = 250.0
+    join["joined_rows_sha256"] = _value_sha256(
+        cache_module._v3_metadata_join_records(metadata)
+    )
+    session["metadata_join_sha256"] = _value_sha256(join)
+    support = cache_module._v3_reference_support_contract(True)
+    session["reference_support_contract"] = support
+    session["reference_support_sha256"] = _value_sha256(support)
+    _write_json(session_path, session)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    # Embedded upstream session/receipt and the root-bound reconstruction both
+    # still state mapping=null.  Rehashing every cache-controlled layer cannot
+    # turn that absence into reference authority.
+    with pytest.raises(
+        ValueError,
+        match="cached/upstream mapping availability mismatch",
+    ):
+        load_feature_cache(cache, sessions=[_SESSION_ID])
+
+
+@pytest.mark.parametrize("mutated_layer", ("root", "contract"))
+def test_v3_dispatch_rejects_mixed_root_and_contract_schemas(
+    tmp_path: Path,
+    mutated_layer: str,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    root_path = cache / "manifest.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    if mutated_layer == "root":
+        root["schema_version"] = "snn_rr.feature_cache_root.v2"
+    else:
+        root["acquisition_contract"]["schema_version"] = (
+            ACQUISITION_CACHE_SCHEMA_VERSION_V2
+        )
+    root["content_sha256"] = _content_sha256(root)
+    _write_json(root_path, root)
+
+    with pytest.raises(ValueError, match="mixed version-3 cache schemas"):
+        load_feature_cache(cache)
+
+
+def test_v3_mmap_is_rejected_before_any_secure_payload_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    original = cache_module._snapshot_regular_file_at
+    calls = 0
+
+    def counting_snapshot(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "_snapshot_regular_file_at", counting_snapshot)
+    with pytest.raises(ValueError, match="forbid mmap=True"):
+        load_feature_cache(cache, mmap=True)
+    assert calls == 0
+
+
+def test_v3_rejects_root_manifest_path_traversal(tmp_path: Path) -> None:
+    cache = _write_v3_cache(tmp_path)
+    root_path = cache / "manifest.json"
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    root["sessions"][0]["manifest_path"] = "../manifest.json"
+    root["content_sha256"] = _content_sha256(root)
+    _write_json(root_path, root)
+
+    with pytest.raises(ValueError, match="manifest path is not contained"):
+        load_feature_cache(cache)
+
+
+def test_v3_rejects_symlinked_session_root(tmp_path: Path) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_root = cache / _SESSION_ID
+    relocated = tmp_path / "relocated_session"
+    session_root.rename(relocated)
+    session_root.symlink_to(relocated, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="securely open version-3 session root"):
+        load_feature_cache(cache)
+
+
+def test_v3_rejects_hardlinked_payload_before_parsing(tmp_path: Path) -> None:
+    cache = _write_v3_cache(tmp_path)
+    maps_path = cache / _SESSION_ID / "maps.npy"
+    outside = tmp_path / "outside_maps.npy"
+    outside.write_bytes(maps_path.read_bytes())
+    maps_path.unlink()
+    os.link(outside, maps_path)
+
+    with pytest.raises(ValueError, match="exactly one hard link"):
+        load_feature_cache(cache)
+
+
+def test_v3_payload_tamper_fails_against_consumed_byte_binding(
+    tmp_path: Path,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    maps_path = cache / _SESSION_ID / "maps.npy"
+    maps_path.write_bytes(maps_path.read_bytes() + b"tamper")
+
+    with pytest.raises(ValueError, match="consumed-byte binding mismatch"):
+        load_feature_cache(cache)
+
+
+@pytest.mark.parametrize("tamper", ("missing_reason", "unknown_reason_bit"))
+def test_v3_timing_reason_invariant_tamper_fails_closed(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    reason_path = (
+        cache / _SESSION_ID / "radar_timing_invalid_reason_mask.npy"
+    )
+    reasons = np.load(reason_path, allow_pickle=False)
+    if tamper == "missing_reason":
+        reasons[0, 1, 2] = 0
+    else:
+        reasons[0, 1, 2] = 0x80
+    np.save(reason_path, reasons, allow_pickle=False)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    with pytest.raises(ValueError, match="timing reason union mismatch"):
+        load_feature_cache(cache)
+
+
+def test_v3_frequency_grids_require_exact_equality(tmp_path: Path) -> None:
+    second_session = "S02_RJS"
+    cache = _write_v3_cache(
+        tmp_path,
+        frequency_overrides={
+            _SESSION_ID: np.asarray([0.1, 0.2], dtype=np.float64),
+            second_session: np.asarray(
+                [0.1, np.nextafter(np.float64(0.2), np.float64(np.inf))],
+                dtype=np.float64,
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="frequency grid must be exactly equal"):
+        load_feature_cache(cache)
+
+
+def test_v3_same_inode_consume_aba_is_detected_even_after_byte_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    target = (cache / _SESSION_ID / "maps.npy").resolve()
+    original_read = cache_module.os.read
+    attacked = False
+
+    def adversarial_read(descriptor: int, count: int) -> bytes:
+        nonlocal attacked
+        try:
+            descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve()
+        except OSError:
+            descriptor_path = Path("/")
+        if not attacked and descriptor_path == target:
+            attacked = True
+            original_bytes = target.read_bytes()
+            changed = bytes([original_bytes[0] ^ 0x01]) + original_bytes[1:]
+            with target.open("r+b", buffering=0) as stream:
+                stream.write(changed)
+                os.fsync(stream.fileno())
+            consumed = original_read(descriptor, count)
+            with target.open("r+b", buffering=0) as stream:
+                stream.write(original_bytes)
+                stream.truncate(len(original_bytes))
+                os.fsync(stream.fileno())
+            return consumed
+        return original_read(descriptor, count)
+
+    monkeypatch.setattr(cache_module.os, "read", adversarial_read)
+    with pytest.raises(ValueError, match="changed during descriptor consumption"):
+        load_feature_cache(cache)
+    assert attacked
+
+
+def test_v3_exact_session_schema_rejects_extra_fields(tmp_path: Path) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_path = cache / _SESSION_ID / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["unbound_claim"] = True
+    _write_json(session_path, session)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    with pytest.raises(ValueError, match="session manifest .* keys do not match"):
+        load_feature_cache(cache)
+
+
+def test_v3_requires_exact_full30_to_usable29_projection(tmp_path: Path) -> None:
+    cache = _write_v3_cache(tmp_path)
+    reconstruction_path = cache / "acquisition_reconstruction.json"
+    reconstruction = json.loads(reconstruction_path.read_text(encoding="utf-8"))
+    reconstruction["expected_session_ids"].remove("S24_KHJ")
+    reconstruction["selected_session_ids"].remove("S24_KHJ")
+    reconstruction["sessions"] = [
+        item
+        for item in reconstruction["sessions"]
+        if item["session_id"] != "S24_KHJ"
+    ]
+    reconstruction["expected_session_ids_sha256"] = _value_sha256(
+        reconstruction["expected_session_ids"]
+    )
+    reconstruction["selected_session_ids_sha256"] = _value_sha256(
+        reconstruction["selected_session_ids"]
+    )
+    reconstruction["dataset_session_count"] = 29
+    reconstruction["selected_session_count"] = 29
+    reconstruction["session_count"] = 29
+    _write_json(reconstruction_path, reconstruction)
+    _reseal_v3_reconstruction(cache)
+
+    with pytest.raises(ValueError, match="exact full 30-session cohort"):
+        load_feature_cache(cache, sessions=[_SESSION_ID])
+
+
+@pytest.mark.parametrize("tamper", ("availability", "unavailable_value"))
+def test_v3_explicit_availability_cannot_be_inferred_or_bypassed_by_numeric_zero(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_dir = cache / _SESSION_ID
+    if tamper == "availability":
+        path = session_dir / "feature_availability_mask.npy"
+        availability = np.load(path, allow_pickle=False)
+        # Radar 2 is structurally incomplete.  A numeric-zero payload cannot
+        # launder that view into explicit availability.
+        availability[0, 1] = True
+        np.save(path, availability, allow_pickle=False)
+    else:
+        path = session_dir / "maps.npy"
+        maps = np.load(path, allow_pickle=False)
+        maps[0, 1, 0, 0] = np.float16(1.0)
+        np.save(path, maps, allow_pickle=False)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    expected = (
+        "feature availability contract mismatch"
+        if tamper == "availability"
+        else "unavailable inference cells are not exact"
+    )
+    with pytest.raises(ValueError, match=expected):
+        load_feature_cache(cache, sessions=[_SESSION_ID])
+
+
+def test_v3_target_firewall_semantics_survive_fully_resealed_tamper(
+    tmp_path: Path,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    session_path = cache / _SESSION_ID / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["target_firewall"]["target_values_used_in_inference_features"] = True
+    session["target_firewall_sha256"] = _value_sha256(session["target_firewall"])
+    _write_json(session_path, session)
+    _reseal_v3_session(cache, _SESSION_ID)
+
+    with pytest.raises(ValueError, match="target firewall contract mismatch"):
+        load_feature_cache(cache, sessions=[_SESSION_ID])
+
+
+@pytest.mark.parametrize("tamper", ("sample", "coordinate"))
+def test_v3_metadata_join_replays_mapping_and_sample_support_after_reseal(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    cache = _write_v3_cache(tmp_path)
+    mapped_session_id = "S02_RJS"
+    session_dir = cache / mapped_session_id
+    metadata_path = session_dir / "metadata.csv"
+    metadata = pd.read_csv(metadata_path)
+    if tamper == "sample":
+        metadata.loc[0, "reference_start_sample"] += 1
+    else:
+        # Larger than the exact 1 ns tolerance but small enough that NumPy's
+        # default relative tolerance would incorrectly accept it near 10 s.
+        metadata.loc[0, "window_start_s"] += 5.0e-5
+    metadata.to_csv(metadata_path, index=False)
+
+    session_path = session_dir / "manifest.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["metadata_join_contract"]["joined_rows_sha256"] = _value_sha256(
+        cache_module._v3_metadata_join_records(metadata)
+    )
+    session["metadata_join_sha256"] = _value_sha256(
+        session["metadata_join_contract"]
+    )
+    _write_json(session_path, session)
+    _reseal_v3_session(cache, mapped_session_id)
+
+    with pytest.raises(ValueError, match="mapping/sample support mismatch"):
+        load_feature_cache(cache, sessions=[mapped_session_id])

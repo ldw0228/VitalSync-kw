@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from io import BytesIO
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import stat
 from zipfile import BadZipFile
 from typing import Any, Mapping
 
@@ -25,12 +27,34 @@ from .acquisition_protocol import (
     load_protocol_config,
 )
 from .data import (
+    BIOPAC_PARSER_EVIDENCE_SCHEMA,
     RADAR_BINS,
+    XETHRU_META_CLOSE_TIMESTAMP_POLICY,
+    XETHRU_META_EVIDENCE_SCHEMA,
     XETHRU_RECORD_BYTES,
     XETHRU_RECORD_DTYPE,
+    DataFormatError,
     build_dataset_manifest,
+    validate_biopac_parser_evidence,
+    validate_xethru_meta_evidence,
 )
 from .preprocess import identity_for_session
+from .radar_timing import (
+    CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+    CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1,
+    CausalUniformInvalidReasonV1,
+    CausalUniformRadarResampleV1,
+    RadarTimingError,
+    canonical_ndarray_sha256,
+    causal_uniform_invalid_reason_semantics_v1,
+    validate_causal_uniform_invalid_reason_contract_v1,
+)
+from .raw_snapshot import (
+    RAW_CONSUMPTION_SCHEMA,
+    RAW_CONSUMPTION_PORTABLE_SCHEMA,
+    XETHRU_METADATA_CONTRACT_SCHEMA,
+    RawConsumptionReceipt,
+)
 from .synchronization import (
     SynchronizationConfig,
     TimeMapping,
@@ -42,14 +66,23 @@ from .synchronization import (
 )
 
 
+ACQUISITION_SCHEMA_V3 = "snn_rr.acquisition_reconstruction.v3"
+ACQUISITION_EXECUTION_SOURCE_DIAGNOSTIC_SCHEMA_V1 = (
+    "snn_rr.acquisition_execution_source_diagnostic.v1"
+)
 ACQUISITION_SCHEMA = "snn_rr.acquisition_reconstruction.v2"
 LEGACY_ACQUISITION_SCHEMA = "snn_rr.acquisition_reconstruction.v1"
+RAW_CONSUMPTION_BINDING_SCHEMA = "snn_rr.raw_consumption_binding.v1"
+MEASURED_TIMING_REASON_AUTHORITY_SCHEMA = (
+    "snn_rr.measured_timing_reason_authority.v1"
+)
+V3_SYNC_SIGNALS_ARTIFACT_SCHEMA = "snn_rr.sync_signals_artifact.v1"
 ACQUISITION_COHORT_AUTHORITY_SCHEMA = "snn_rr.acquisition_cohort_authority.v1"
 ACQUISITION_COHORT_V1_CONTENT_SHA256 = (
     "9fe44a6fd0b809dde063f845c3fdfdc60352eda462abc0d0a40e15207d814454"
 )
 SUPPORTED_ACQUISITION_SCHEMAS = frozenset(
-    {ACQUISITION_SCHEMA, LEGACY_ACQUISITION_SCHEMA}
+    {ACQUISITION_SCHEMA_V3, ACQUISITION_SCHEMA, LEGACY_ACQUISITION_SCHEMA}
 )
 ANNOTATION_ONLY_COLUMNS: tuple[str, ...] = (
         "reference_start_sample",
@@ -75,6 +108,36 @@ ANNOTATION_ONLY_COLUMNS: tuple[str, ...] = (
 
 class AcquisitionContractError(ValueError):
     """Raised when acquisition provenance is absent, stale, or inconsistent."""
+
+
+def v3_diagnostic_execution_source_generation(
+    pipeline_path_snapshot_sha256: str,
+) -> dict[str, Any]:
+    """Describe the deliberately limited v3 post-import source-path check.
+
+    This is a negative capability statement, not an execution receipt.  In
+    particular, it prevents ``pipeline_sha256`` from being reinterpreted as a
+    binding to the bytes already compiled by Python before reconstruction
+    starts.
+    """
+
+    if not (
+        isinstance(pipeline_path_snapshot_sha256, str)
+        and len(pipeline_path_snapshot_sha256) == 64
+        and set(pipeline_path_snapshot_sha256) <= set("0123456789abcdef")
+    ):
+        raise AcquisitionContractError(
+            "v3 pipeline path snapshot must be a lowercase SHA-256"
+        )
+    return {
+        "schema": ACQUISITION_EXECUTION_SOURCE_DIAGNOSTIC_SCHEMA_V1,
+        "guard_scope": "post_import_path_snapshot_only",
+        "pipeline_path_snapshot_sha256": pipeline_path_snapshot_sha256,
+        "binds_actual_loader_compiled_bytes": False,
+        "complete_private_import_closure": False,
+        "diagnostic_only": True,
+        "scientific_authority": False,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +495,295 @@ def _resolve_inside(root: Path, relative: Any, label: str) -> Path:
     return candidate
 
 
+_V3_SYNC_SIGNAL_DTYPES: dict[str, np.dtype[Any]] = {
+    "radar_times_s": np.dtype(np.float64),
+    "radar_motion_robust_z": np.dtype(np.float32),
+    "radar_motion_valid_mask": np.dtype(bool),
+    "rsp_marker_times_s": np.dtype(np.float64),
+    "radar_marker_times_s": np.dtype(np.float64),
+    "radar_resample_valid_mask": np.dtype(bool),
+    "radar_invalid_reason_mask": np.dtype(np.uint8),
+}
+
+
+def _decode_v3_sync_signals_payload(payload: bytes) -> dict[str, np.ndarray]:
+    """Decode the exact snapshotted NPZ bytes into owned, validated arrays."""
+
+    try:
+        with np.load(BytesIO(payload), allow_pickle=False) as archive:
+            if tuple(archive.files) != tuple(_V3_SYNC_SIGNAL_DTYPES):
+                raise AcquisitionContractError(
+                    "v3 sync-signals NPZ members do not match the exact schema"
+                )
+            arrays = {
+                name: np.array(archive[name], copy=True)
+                for name in _V3_SYNC_SIGNAL_DTYPES
+            }
+    except AcquisitionContractError:
+        raise
+    except (OSError, ValueError, TypeError, BadZipFile) as exc:
+        raise AcquisitionContractError(
+            f"cannot decode v3 sync-signals NPZ: {exc}"
+        ) from exc
+
+    for name, expected_dtype in _V3_SYNC_SIGNAL_DTYPES.items():
+        array = arrays[name]
+        if array.dtype != expected_dtype or array.dtype.hasobject:
+            raise AcquisitionContractError(
+                f"v3 sync-signals array {name} has an invalid dtype"
+            )
+        array.setflags(write=False)
+
+    radar_times = arrays["radar_times_s"]
+    motion = arrays["radar_motion_robust_z"]
+    motion_valid = arrays["radar_motion_valid_mask"]
+    rsp_markers = arrays["rsp_marker_times_s"]
+    radar_markers = arrays["radar_marker_times_s"]
+    resample_valid = arrays["radar_resample_valid_mask"]
+    invalid_reasons = arrays["radar_invalid_reason_mask"]
+    known_reason_bits = sum(
+        int(reason)
+        for reason in CausalUniformInvalidReasonV1
+    )
+    if (
+        radar_times.ndim != 1
+        or radar_times.size == 0
+        or motion.shape != radar_times.shape
+        or motion_valid.shape != radar_times.shape
+        or rsp_markers.ndim != 1
+        or radar_markers.ndim != 1
+        or resample_valid.ndim != 2
+        or resample_valid.shape != (3, radar_times.size)
+        or invalid_reasons.shape != resample_valid.shape
+        or not np.isfinite(radar_times).all()
+        or (radar_times.size > 1 and np.any(np.diff(radar_times) <= 0.0))
+        or not np.isfinite(motion).all()
+        or not np.isfinite(rsp_markers).all()
+        or not np.isfinite(radar_markers).all()
+        or np.any(
+            np.bitwise_and(
+                invalid_reasons,
+                np.uint8(0xFF ^ known_reason_bits),
+            )
+            != 0
+        )
+        or not np.array_equal(resample_valid, invalid_reasons == 0)
+    ):
+        raise AcquisitionContractError(
+            "v3 sync-signals arrays violate their shape/finite/mask contract"
+        )
+    invalid_motion = motion[~motion_valid]
+    if invalid_motion.size and (
+        np.any(invalid_motion != 0.0) or np.any(np.signbit(invalid_motion))
+    ):
+        raise AcquisitionContractError(
+            "v3 invalid motion cells must contain exact positive zero"
+        )
+    return arrays
+
+
+def _v3_sync_signal_array_evidence(
+    arrays: Mapping[str, np.ndarray],
+) -> dict[str, dict[str, Any]]:
+    return {
+        name: {
+            "dtype": np.asarray(arrays[name]).dtype.name,
+            "shape": list(np.asarray(arrays[name]).shape),
+            "canonical_sha256": canonical_ndarray_sha256(arrays[name]),
+        }
+        for name in _V3_SYNC_SIGNAL_DTYPES
+    }
+
+
+def _strict_v3_artifact_relative_path(value: Any, label: str) -> PurePosixPath:
+    candidate = PurePosixPath(value) if isinstance(value, str) else None
+    if (
+        candidate is None
+        or candidate.is_absolute()
+        or not candidate.parts
+        or value != candidate.as_posix()
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise AcquisitionContractError(f"{label} must be a canonical relative path")
+    return candidate
+
+
+def build_v3_sync_signals_artifact_binding(
+    artifact_path: str | Path,
+    *,
+    artifact_relative_path: str,
+) -> dict[str, Any]:
+    """Bind exactly the diagnostic NPZ bytes and every decoded array."""
+
+    _strict_v3_artifact_relative_path(
+        artifact_relative_path, "v3 sync-signals artifact"
+    )
+    try:
+        payload, digest = _source_snapshot(
+            artifact_path, label="v3 sync-signals artifact"
+        )
+    except (OSError, ValueError) as exc:
+        raise AcquisitionContractError(
+            f"cannot snapshot v3 sync-signals artifact: {exc}"
+        ) from exc
+    arrays = _decode_v3_sync_signals_payload(payload)
+    evidence = _v3_sync_signal_array_evidence(arrays)
+    return {
+        "schema": V3_SYNC_SIGNALS_ARTIFACT_SCHEMA,
+        "artifact": artifact_relative_path,
+        "artifact_bytes": len(payload),
+        "artifact_sha256": digest,
+        "diagnostic_only": True,
+        "scientific_authority": False,
+        "arrays": evidence,
+        "arrays_sha256": hashlib.sha256(canonical_json_bytes(evidence)).hexdigest(),
+    }
+
+
+def validate_v3_sync_signals_artifact(
+    authoritative_session: Mapping[str, Any],
+    *,
+    reconstruction_root: str | Path,
+) -> dict[str, Any]:
+    """Replay a v3 sync-signals binding from one exact consumed byte snapshot."""
+
+    session_id = authoritative_session.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise AcquisitionContractError("v3 sync-signals session ID is invalid")
+    binding = authoritative_session.get("sync_signals_artifact")
+    expected_keys = {
+        "schema",
+        "artifact",
+        "artifact_bytes",
+        "artifact_sha256",
+        "diagnostic_only",
+        "scientific_authority",
+        "arrays",
+        "arrays_sha256",
+    }
+    if not isinstance(binding, Mapping) or set(binding) != expected_keys:
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals binding fields are invalid"
+        )
+    relative = _strict_v3_artifact_relative_path(
+        binding.get("artifact"), f"{session_id} v3 sync-signals artifact"
+    )
+    expected_relative = PurePosixPath("sessions") / session_id / "sync_signals.npz"
+    if (
+        relative != expected_relative
+        or binding.get("schema") != V3_SYNC_SIGNALS_ARTIFACT_SCHEMA
+        or binding.get("diagnostic_only") is not True
+        or binding.get("scientific_authority") is not False
+        or type(binding.get("artifact_bytes")) is not int
+        or binding.get("artifact_bytes", -1) < 0
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals binding claims are invalid"
+        )
+    root = Path(reconstruction_root).resolve()
+    lexical_path = root.joinpath(*relative.parts)
+    try:
+        lexical_path.parent.resolve().relative_to(root)
+    except ValueError as exc:
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals artifact escapes reconstruction root"
+        ) from exc
+    claimed_sha256 = binding.get("artifact_sha256")
+    if (
+        not isinstance(claimed_sha256, str)
+        or len(claimed_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in claimed_sha256)
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals file hash is invalid"
+        )
+    try:
+        payload, observed_sha256 = _source_snapshot(
+            lexical_path,
+            label=f"{session_id} v3 sync-signals artifact",
+            expected_sha256=claimed_sha256,
+        )
+    except (OSError, ValueError) as exc:
+        raise AcquisitionContractError(
+            f"cannot consume {session_id} v3 sync-signals artifact: {exc}"
+        ) from exc
+    arrays = _decode_v3_sync_signals_payload(payload)
+    evidence = _v3_sync_signal_array_evidence(arrays)
+    if (
+        observed_sha256 != claimed_sha256
+        or len(payload) != binding.get("artifact_bytes")
+        or canonical_json_bytes(binding.get("arrays"))
+        != canonical_json_bytes(evidence)
+        or binding.get("arrays_sha256")
+        != hashlib.sha256(canonical_json_bytes(evidence)).hexdigest()
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals bytes/array evidence mismatch"
+        )
+
+    sensor = authoritative_session.get("sensor_summary")
+    radar = sensor.get("radar") if isinstance(sensor, Mapping) else None
+    resampling = radar.get("feature_resampling") if isinstance(radar, Mapping) else None
+    content_hashes = (
+        resampling.get("content_hashes") if isinstance(resampling, Mapping) else None
+    )
+    if not isinstance(content_hashes, Mapping):
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals lack bound resampling hashes"
+        )
+    cross_links = {
+        "radar_times_s": "output_times_sha256",
+        "radar_resample_valid_mask": "valid_mask_sha256",
+        "radar_invalid_reason_mask": "invalid_reason_mask_sha256",
+    }
+    if any(
+        evidence[array_name]["canonical_sha256"]
+        != content_hashes.get(hash_name)
+        for array_name, hash_name in cross_links.items()
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals/resampling cross-link mismatch"
+        )
+    synchronization = authoritative_session.get("synchronization")
+    if (
+        not isinstance(synchronization, Mapping)
+        or synchronization.get("authorized") is not False
+        or authoritative_session.get("sync_raw_replay_verified") is not False
+        or authoritative_session.get("protocol_raw_replay_verified") is not False
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} v3 sync-signals cannot carry replay authority"
+        )
+    for array_name, marker_key in (
+        ("radar_marker_times_s", "radar_markers"),
+        ("rsp_marker_times_s", "rsp_markers"),
+    ):
+        markers = synchronization.get(marker_key)
+        if not isinstance(markers, list) or any(
+            not isinstance(marker, Mapping)
+            or isinstance(marker.get("time_s"), (bool, np.bool_))
+            or not isinstance(
+                marker.get("time_s"),
+                (int, float, np.integer, np.floating),
+            )
+            or not np.isfinite(float(marker["time_s"]))
+            for marker in markers
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} v3 synchronization marker evidence is invalid"
+            )
+        marker_times = np.asarray(
+            [float(marker["time_s"]) for marker in markers], dtype=np.float64
+        )
+        if canonical_ndarray_sha256(marker_times) != evidence[array_name][
+            "canonical_sha256"
+        ]:
+            raise AcquisitionContractError(
+                f"{session_id} v3 sync-signals marker cross-link mismatch"
+            )
+    return dict(binding)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -601,6 +953,901 @@ def build_v2_xethru_record_contract(subject: Any) -> dict[str, Any]:
             f"{session_id} violates the strict XeThru header/bin-count contract"
         )
     return evidence
+
+
+def _validate_xethru_metadata_contract(
+    value: Any,
+    *,
+    session_id: str,
+    radar_graphs: list[Any],
+    bindings: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate metadata internals and their exact consumed-graph join."""
+
+    expected_keys = {
+        "schema",
+        "metadata_evidence_schema",
+        "record_bytes",
+        "close_timestamp_policy",
+        "views",
+        "eligible",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        raise AcquisitionContractError(
+            f"{session_id} portable XeThru metadata contract is invalid"
+        )
+    views = value.get("views")
+    if (
+        value.get("schema") != XETHRU_METADATA_CONTRACT_SCHEMA
+        or value.get("metadata_evidence_schema") != XETHRU_META_EVIDENCE_SCHEMA
+        or value.get("record_bytes") != XETHRU_RECORD_BYTES
+        or value.get("close_timestamp_policy")
+        != XETHRU_META_CLOSE_TIMESTAMP_POLICY
+        or value.get("eligible") is not True
+        or not isinstance(views, list)
+        or len(views) != 3
+        or len(radar_graphs) != 3
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable XeThru metadata contract is ineligible"
+        )
+
+    canonical_views: list[dict[str, Any]] = []
+    for radar_id, (radar_graph, view) in enumerate(
+        zip(radar_graphs, views, strict=True), start=1
+    ):
+        if not isinstance(radar_graph, Mapping):
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} metadata graph is invalid"
+            )
+        if (
+            not isinstance(view, Mapping)
+            or set(view) != {"radar_id", "metadata_evidence", "eligible"}
+            or view.get("radar_id") != radar_id
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} metadata view mismatch"
+            )
+        try:
+            evidence = validate_xethru_meta_evidence(
+                view.get("metadata_evidence")
+            )
+        except DataFormatError as exc:
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} metadata evidence is invalid: {exc}"
+            ) from exc
+        metadata_key = radar_graph.get("metadata_binding")
+        data_keys = radar_graph.get("data_bindings")
+        if (
+            view.get("eligible") is not True
+            or evidence.get("consumption_eligible") is not True
+            or not isinstance(metadata_key, str)
+            or metadata_key not in bindings
+            or not isinstance(data_keys, list)
+            or any(type(key) is not str or key not in bindings for key in data_keys)
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} metadata evidence is ineligible"
+            )
+        expected_names = [
+            PurePosixPath(str(bindings[key]["path"])).name for key in data_keys
+        ]
+        expected_bytes = [int(bindings[key]["bytes"]) for key in data_keys]
+        expected_frames = sum(item // XETHRU_RECORD_BYTES for item in expected_bytes)
+        if (
+            evidence.get("payload_bytes") != bindings[metadata_key].get("bytes")
+            or evidence.get("expected_chunk_filenames") != expected_names
+            or evidence.get("expected_chunk_byte_counts") != expected_bytes
+            or evidence.get("frame_record_count") != expected_frames
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} metadata/raw graph cross-link mismatch"
+            )
+        canonical_views.append(
+            {
+                "radar_id": radar_id,
+                "metadata_evidence": evidence,
+                "eligible": True,
+            }
+        )
+    canonical = {
+        "schema": XETHRU_METADATA_CONTRACT_SCHEMA,
+        "metadata_evidence_schema": XETHRU_META_EVIDENCE_SCHEMA,
+        "record_bytes": XETHRU_RECORD_BYTES,
+        "close_timestamp_policy": XETHRU_META_CLOSE_TIMESTAMP_POLICY,
+        "views": canonical_views,
+        "eligible": True,
+    }
+    if canonical_json_bytes(value) != canonical_json_bytes(canonical):
+        raise AcquisitionContractError(
+            f"{session_id} XeThru metadata contract is not canonical"
+        )
+    return canonical
+
+
+def _validate_serialized_raw_consumption(
+    authoritative_session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the portable v3 projection without opening a pathname."""
+
+    session_id = authoritative_session.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise AcquisitionContractError("raw-consumption session ID is invalid")
+    raw_consumption = authoritative_session.get("raw_consumption")
+    if not isinstance(raw_consumption, Mapping) or set(raw_consumption) != {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "portable_projection",
+        "portable_content_sha256",
+    }:
+        raise AcquisitionContractError(
+            f"{session_id}.raw_consumption fields are invalid"
+        )
+    if (
+        raw_consumption.get("schema") != RAW_CONSUMPTION_BINDING_SCHEMA
+        or raw_consumption.get("diagnostic_only") is not True
+        or raw_consumption.get("scientific_authority") is not False
+    ):
+        raise AcquisitionContractError(
+            f"{session_id}.raw_consumption authority flags are invalid"
+        )
+    portable = raw_consumption.get("portable_projection")
+    expected_portable_keys = {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "session_id",
+        "reader_contract",
+        "raw_input_graph",
+        "input_bindings",
+        "parser_policy",
+        "biopac_parser_evidence",
+        "xethru_metadata_contract",
+        "xethru_record_contract",
+    }
+    if not isinstance(portable, Mapping) or set(portable) != expected_portable_keys:
+        raise AcquisitionContractError(
+            f"{session_id} portable raw-consumption fields are invalid"
+        )
+    portable_hash = raw_consumption.get("portable_content_sha256")
+    if (
+        not isinstance(portable_hash, str)
+        or len(portable_hash) != 64
+        or portable_hash
+        != hashlib.sha256(canonical_json_bytes(portable)).hexdigest()
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable raw-consumption hash mismatch"
+        )
+    expected_reader_contract = {
+        "one_shot": True,
+        "root_descriptor_pinned": True,
+        "all_graph_files_opened_before_consumption": True,
+        "no_follow": True,
+        "regular_file_required": True,
+        "single_link_required": True,
+        "owned_arrays": True,
+        "live_raw_memmap_returned": False,
+    }
+    parser_policy = portable.get("parser_policy")
+    if (
+        portable.get("schema") != RAW_CONSUMPTION_PORTABLE_SCHEMA
+        or portable.get("diagnostic_only") is not True
+        or portable.get("scientific_authority") is not False
+        or portable.get("session_id") != session_id
+        or portable.get("reader_contract") != expected_reader_contract
+        or not isinstance(parser_policy, Mapping)
+        or set(parser_policy)
+        != {
+            "timezone_name",
+            "fallback_rate_hz",
+            "biopac_strict",
+            "xethru_meta_strict",
+            "require_valid_records",
+        }
+        or not isinstance(parser_policy.get("timezone_name"), str)
+        or not parser_policy.get("timezone_name")
+        or type(parser_policy.get("fallback_rate_hz")) not in {int, float}
+        or not np.isfinite(parser_policy.get("fallback_rate_hz"))
+        or float(parser_policy.get("fallback_rate_hz")) != 40.0
+        or parser_policy.get("timezone_name") != "Asia/Seoul"
+        or parser_policy.get("biopac_strict") is not False
+        or parser_policy.get("xethru_meta_strict") is not False
+        or parser_policy.get("require_valid_records") is not True
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable parser/reader policy is invalid"
+        )
+    try:
+        biopac_evidence = validate_biopac_parser_evidence(
+            portable.get("biopac_parser_evidence")
+        )
+    except DataFormatError as exc:
+        raise AcquisitionContractError(
+            f"{session_id} portable BIOPAC parser evidence is invalid: {exc}"
+        ) from exc
+    if (
+        biopac_evidence.get("schema") != BIOPAC_PARSER_EVIDENCE_SCHEMA
+        or biopac_evidence.get("diagnostic_only") is not True
+        or biopac_evidence.get("scientific_authority") is not False
+        or biopac_evidence.get("parser_eligible") is not True
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable BIOPAC parser evidence is ineligible"
+        )
+
+    portable_bindings = portable.get("input_bindings")
+    if not isinstance(portable_bindings, list) or not portable_bindings:
+        raise AcquisitionContractError(
+            f"{session_id} portable raw bindings are missing"
+        )
+    reconstructed_bindings: dict[str, dict[str, Any]] = {}
+    observed_relative_paths: set[str] = set()
+    for index, binding in enumerate(portable_bindings):
+        if not isinstance(binding, Mapping) or set(binding) != {
+            "key",
+            "path",
+            "bytes",
+            "sha256",
+        }:
+            raise AcquisitionContractError(
+                f"{session_id} portable binding {index} fields are invalid"
+            )
+        key = binding.get("key")
+        relative = binding.get("path")
+        byte_count = binding.get("bytes")
+        sha256 = binding.get("sha256")
+        candidate = PurePosixPath(relative) if isinstance(relative, str) else None
+        if (
+            not isinstance(key, str)
+            or not key
+            or key in reconstructed_bindings
+            or candidate is None
+            or candidate.is_absolute()
+            or relative != candidate.as_posix()
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+            or relative in observed_relative_paths
+            or type(byte_count) is not int
+            or byte_count < 0
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or sha256.lower() != sha256
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} portable binding {index} is invalid"
+            )
+        reconstructed_bindings[key] = {
+            "path": relative,
+            "bytes": byte_count,
+            "sha256": sha256,
+        }
+        observed_relative_paths.add(relative)
+    session_bindings = authoritative_session.get("raw_input_bindings")
+    if canonical_json_bytes(reconstructed_bindings) != canonical_json_bytes(
+        session_bindings
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable/session raw bindings mismatch"
+        )
+    if authoritative_session.get("raw_input_bindings_sha256") != hashlib.sha256(
+        canonical_json_bytes(reconstructed_bindings)
+    ).hexdigest():
+        raise AcquisitionContractError(
+            f"{session_id}.raw_input_bindings_sha256 mismatch"
+        )
+    graph = portable.get("raw_input_graph")
+    if not isinstance(graph, Mapping) or set(graph) != {
+        "schema",
+        "session_id",
+        "selected_logical_session_id",
+        "binding_keys",
+        "biopac_binding",
+        "radars",
+    }:
+        raise AcquisitionContractError(f"{session_id} portable raw graph is invalid")
+    binding_keys = graph.get("binding_keys")
+    radars = graph.get("radars")
+    if (
+        graph.get("schema") != "snn_rr.selected_session_raw_input_graph.v1"
+        or graph.get("session_id") != session_id
+        or not isinstance(graph.get("selected_logical_session_id"), str)
+        or not graph.get("selected_logical_session_id")
+        or graph.get("selected_logical_session_id")
+        != graph.get("selected_logical_session_id").strip()
+        or not isinstance(binding_keys, list)
+        or binding_keys != list(reconstructed_bindings)
+        or graph.get("biopac_binding") != "biopac"
+        or not isinstance(radars, list)
+        or len(radars) != 3
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable raw graph ordering/identity mismatch"
+        )
+    expected_covered_keys = ["biopac"]
+    for radar_id, radar_graph in enumerate(radars, start=1):
+        if not isinstance(radar_graph, Mapping) or set(radar_graph) != {
+            "radar_id",
+            "metadata_binding",
+            "data_bindings",
+        }:
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} graph fields are invalid"
+            )
+        metadata_key = f"radar{radar_id}_meta"
+        data_keys = radar_graph.get("data_bindings")
+        if (
+            radar_graph.get("radar_id") != radar_id
+            or radar_graph.get("metadata_binding") != metadata_key
+            or not isinstance(data_keys, list)
+            or not data_keys
+            or data_keys
+            != [
+                f"radar{radar_id}_data_{index:02d}"
+                for index in range(len(data_keys))
+            ]
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} graph order mismatch"
+            )
+        expected_covered_keys.append(metadata_key)
+        expected_covered_keys.extend(data_keys)
+    if binding_keys != expected_covered_keys:
+        raise AcquisitionContractError(
+            f"{session_id} portable raw graph does not exactly cover bindings"
+        )
+    for binding in reconstructed_bindings.values():
+        if PurePosixPath(binding["path"]).parts[0] != session_id:
+            raise AcquisitionContractError(
+                f"{session_id} portable binding leaves its session directory"
+            )
+    if canonical_json_bytes(graph) != canonical_json_bytes(
+        authoritative_session.get("raw_input_graph")
+    ) or authoritative_session.get("raw_input_graph_sha256") != hashlib.sha256(
+        canonical_json_bytes(graph)
+    ).hexdigest():
+        raise AcquisitionContractError(
+            f"{session_id} portable/session raw graph mismatch"
+        )
+    sensor = authoritative_session.get("sensor_summary")
+    radar = sensor.get("radar") if isinstance(sensor, Mapping) else None
+    biopac = sensor.get("biopac") if isinstance(sensor, Mapping) else None
+    if not isinstance(radar, Mapping):
+        raise AcquisitionContractError(f"{session_id}.sensor_summary.radar is missing")
+    if (
+        not isinstance(biopac, Mapping)
+        or canonical_json_bytes(biopac.get("parser_evidence"))
+        != canonical_json_bytes(biopac_evidence)
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable/session BIOPAC parser evidence mismatch"
+        )
+    biopac_cross_links = {
+        "shape": biopac_evidence["effective_data_shape"],
+        "labels": biopac_evidence["channel_labels"],
+        "units": biopac_evidence["channel_units"],
+        "rsp_index": biopac_evidence["rsp_index"],
+        "ecg_index": biopac_evidence["ecg_index"],
+        "isi_ms": biopac_evidence["effective_isi_ms"],
+        "sample_rate_hz": biopac_evidence["effective_sample_rate_hz"],
+        "parser_eligible": biopac_evidence["parser_eligible"],
+    }
+    for key, expected in biopac_cross_links.items():
+        if key in biopac and canonical_json_bytes(biopac.get(key)) != (
+            canonical_json_bytes(expected)
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} BIOPAC parser evidence/{key} mismatch"
+            )
+    metadata_contract = _validate_xethru_metadata_contract(
+        portable.get("xethru_metadata_contract"),
+        session_id=session_id,
+        radar_graphs=radars,
+        bindings=reconstructed_bindings,
+    )
+    metadata_hash = hashlib.sha256(
+        canonical_json_bytes(metadata_contract)
+    ).hexdigest()
+    if (
+        canonical_json_bytes(metadata_contract)
+        != canonical_json_bytes(radar.get("xethru_metadata_contract"))
+        or radar.get("xethru_metadata_contract_evidence_sha256")
+        != metadata_hash
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable/session XeThru metadata evidence mismatch"
+        )
+    record_contract = portable.get("xethru_record_contract")
+    if not isinstance(record_contract, Mapping) or set(record_contract) != {
+        "schema",
+        "record_bytes",
+        "payload_bin_count",
+        "views",
+        "eligible",
+    }:
+        raise AcquisitionContractError(
+            f"{session_id} portable XeThru record contract is invalid"
+        )
+    record_views = record_contract.get("views")
+    if (
+        record_contract.get("schema") != "snn_rr.xethru_record_contract.v1"
+        or record_contract.get("record_bytes") != XETHRU_RECORD_BYTES
+        or record_contract.get("payload_bin_count") != RADAR_BINS
+        or record_contract.get("eligible") is not True
+        or not isinstance(record_views, list)
+        or len(record_views) != 3
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable XeThru record contract is ineligible"
+        )
+    for radar_id, (radar_graph, record_view) in enumerate(
+        zip(radars, record_views, strict=True), start=1
+    ):
+        data_keys = radar_graph["data_bindings"]
+        if (
+            not isinstance(record_view, Mapping)
+            or set(record_view) != {"radar_id", "chunks", "eligible"}
+            or record_view.get("radar_id") != radar_id
+            or record_view.get("eligible") is not True
+            or not isinstance(record_view.get("chunks"), list)
+            or len(record_view["chunks"]) != len(data_keys)
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} radar {radar_id} record view mismatch"
+            )
+        for chunk_index, (binding_key, chunk) in enumerate(
+            zip(data_keys, record_view["chunks"], strict=True)
+        ):
+            binding = reconstructed_bindings[binding_key]
+            if (
+                not isinstance(chunk, Mapping)
+                or set(chunk)
+                != {
+                    "chunk_index",
+                    "filename",
+                    "bytes",
+                    "frame_count",
+                    "record_bytes",
+                    "payload_bin_count",
+                    "record_size_remainder_bytes",
+                    "zero_header_nonzero",
+                    "bin_count_invalid",
+                }
+                or chunk.get("chunk_index") != chunk_index
+                or chunk.get("filename")
+                != PurePosixPath(binding["path"]).name
+                or chunk.get("bytes") != binding["bytes"]
+                or chunk.get("record_bytes") != XETHRU_RECORD_BYTES
+                or chunk.get("payload_bin_count") != RADAR_BINS
+                or chunk.get("record_size_remainder_bytes") != 0
+                or type(chunk.get("chunk_index")) is not int
+                or type(chunk.get("bytes")) is not int
+                or type(chunk.get("frame_count")) is not int
+                or chunk.get("frame_count") <= 0
+                or type(chunk.get("record_bytes")) is not int
+                or type(chunk.get("payload_bin_count")) is not int
+                or type(chunk.get("record_size_remainder_bytes")) is not int
+                or type(chunk.get("zero_header_nonzero")) is not int
+                or type(chunk.get("bin_count_invalid")) is not int
+                or chunk.get("frame_count") * XETHRU_RECORD_BYTES
+                != binding["bytes"]
+                or chunk.get("zero_header_nonzero") != 0
+                or chunk.get("bin_count_invalid") != 0
+            ):
+                raise AcquisitionContractError(
+                    f"{session_id} radar {radar_id} chunk {chunk_index} mismatch"
+                )
+    record_hash = hashlib.sha256(canonical_json_bytes(record_contract)).hexdigest()
+    if (
+        canonical_json_bytes(record_contract)
+        != canonical_json_bytes(radar.get("xethru_record_contract"))
+        or radar.get("xethru_record_contract_evidence_sha256") != record_hash
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} portable/session XeThru record evidence mismatch"
+        )
+    return dict(raw_consumption)
+
+
+def _validate_bound_raw_consumption_receipt(
+    authoritative_session: Mapping[str, Any],
+    *,
+    reconstruction_root: Path,
+) -> None:
+    """Validate the persisted local diagnostic receipt and portable link."""
+
+    session_id = str(authoritative_session.get("session_id"))
+    binding = authoritative_session.get("raw_consumption_receipt")
+    if not isinstance(binding, Mapping) or set(binding) != {
+        "artifact",
+        "artifact_sha256",
+        "content_sha256",
+        "diagnostic_only",
+        "scientific_authority",
+    }:
+        raise AcquisitionContractError(
+            f"{session_id} raw-consumption receipt binding is invalid"
+        )
+    if (
+        binding.get("diagnostic_only") is not True
+        or binding.get("scientific_authority") is not False
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} raw-consumption receipt claims authority"
+        )
+    receipt_path = _resolve_inside(
+        reconstruction_root,
+        binding.get("artifact"),
+        f"{session_id} raw-consumption receipt",
+    )
+    receipt, receipt_file_sha256 = _read_strict_json_snapshot(receipt_path)
+    receipt_content_sha256 = _require_content_hash(
+        receipt, f"{session_id} raw-consumption receipt"
+    )
+    raw_consumption = authoritative_session["raw_consumption"]
+    expected_receipt_keys = {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "session_id",
+        "dataset_root",
+        "root_identity",
+        "reader_contract",
+        "raw_input_graph",
+        "input_bindings",
+        "consumed_files",
+        "biopac_parser_evidence",
+        "xethru_metadata_contract",
+        "xethru_record_contract",
+        "portable_projection",
+        "portable_content_sha256",
+        "content_sha256",
+    }
+    if (
+        set(receipt) != expected_receipt_keys
+        or
+        receipt.get("schema") != RAW_CONSUMPTION_SCHEMA
+        or receipt.get("diagnostic_only") is not True
+        or receipt.get("scientific_authority") is not False
+        or binding.get("artifact_sha256") != receipt_file_sha256
+        or binding.get("content_sha256") != receipt_content_sha256
+        or canonical_json_bytes(receipt.get("portable_projection"))
+        != canonical_json_bytes(raw_consumption.get("portable_projection"))
+        or receipt.get("portable_content_sha256")
+        != raw_consumption.get("portable_content_sha256")
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} raw-consumption receipt/portable binding mismatch"
+        )
+    portable = raw_consumption["portable_projection"]
+    expected_full_reader_contract = {
+        **portable["reader_contract"],
+        "timezone_name": portable["parser_policy"]["timezone_name"],
+        "fallback_rate_hz": portable["parser_policy"]["fallback_rate_hz"],
+        "biopac_strict": portable["parser_policy"]["biopac_strict"],
+        "xethru_meta_strict": portable["parser_policy"][
+            "xethru_meta_strict"
+        ],
+        "require_valid_records": portable["parser_policy"][
+            "require_valid_records"
+        ],
+    }
+    if (
+        receipt.get("session_id") != session_id
+        or not isinstance(receipt.get("dataset_root"), str)
+        or not Path(receipt["dataset_root"]).is_absolute()
+        or canonical_json_bytes(receipt.get("raw_input_graph"))
+        != canonical_json_bytes(authoritative_session.get("raw_input_graph"))
+        or canonical_json_bytes(receipt.get("input_bindings"))
+        != canonical_json_bytes(authoritative_session.get("raw_input_bindings"))
+        or canonical_json_bytes(receipt.get("biopac_parser_evidence"))
+        != canonical_json_bytes(portable.get("biopac_parser_evidence"))
+        or canonical_json_bytes(receipt.get("xethru_metadata_contract"))
+        != canonical_json_bytes(
+            authoritative_session["sensor_summary"]["radar"].get(
+                "xethru_metadata_contract"
+            )
+        )
+        or receipt.get("reader_contract") != expected_full_reader_contract
+        or canonical_json_bytes(receipt.get("xethru_record_contract"))
+        != canonical_json_bytes(
+            authoritative_session["sensor_summary"]["radar"].get(
+                "xethru_record_contract"
+            )
+        )
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} raw-consumption receipt duplicate fields mismatch"
+        )
+    root_identity = receipt.get("root_identity")
+    identity_keys = {
+        "device",
+        "inode",
+        "mode",
+        "link_count",
+        "bytes",
+        "mtime_ns",
+        "ctime_ns",
+    }
+    if (
+        not isinstance(root_identity, Mapping)
+        or set(root_identity) != identity_keys
+        or any(type(root_identity.get(key)) is not int for key in identity_keys)
+        or not stat.S_ISDIR(root_identity["mode"])
+        or root_identity["link_count"] < 1
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} raw-consumption root identity is invalid"
+        )
+    consumed_files = receipt.get("consumed_files")
+    portable_bindings = portable["input_bindings"]
+    if not isinstance(consumed_files, list) or len(consumed_files) != len(
+        portable_bindings
+    ):
+        raise AcquisitionContractError(
+            f"{session_id} raw-consumption file evidence is incomplete"
+        )
+    for consumed, portable_binding in zip(
+        consumed_files, portable_bindings, strict=True
+    ):
+        if not isinstance(consumed, Mapping) or set(consumed) != {
+            "key",
+            "role",
+            "path",
+            "filename",
+            "bytes",
+            "sha256",
+            "descriptor_identity",
+        }:
+            raise AcquisitionContractError(
+                f"{session_id} raw-consumption file evidence is invalid"
+            )
+        descriptor = consumed.get("descriptor_identity")
+        if (
+            consumed.get("key") != portable_binding.get("key")
+            or consumed.get("path") != portable_binding.get("path")
+            or consumed.get("bytes") != portable_binding.get("bytes")
+            or consumed.get("sha256") != portable_binding.get("sha256")
+            or not isinstance(consumed.get("role"), str)
+            or not consumed.get("role")
+            or consumed.get("filename")
+            != PurePosixPath(str(consumed.get("path"))).name
+            or not isinstance(descriptor, Mapping)
+            or set(descriptor) != identity_keys
+            or any(type(descriptor.get(key)) is not int for key in identity_keys)
+            or not stat.S_ISREG(descriptor["mode"])
+            or descriptor["link_count"] != 1
+            or descriptor["bytes"] != consumed.get("bytes")
+        ):
+            raise AcquisitionContractError(
+                f"{session_id} raw-consumption descriptor evidence mismatch"
+            )
+
+
+def validate_consumption_against_contract(
+    receipt: RawConsumptionReceipt,
+    authoritative_session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one live, exact raw consumption to one acquisition session.
+
+    ``receipt`` must be the exact in-process object returned by
+    :class:`RawSessionReader`; a caller-authored mapping is deliberately not
+    accepted.  The authoritative session must bind all content, graph,
+    record-contract, parser-policy, and portable-hash fields.  The returned
+    object is portable diagnostic provenance, never an authorization token.
+    """
+
+    if type(receipt) is not RawConsumptionReceipt:
+        raise AcquisitionContractError(
+            "raw consumption must be an exact RawConsumptionReceipt"
+        )
+    if not isinstance(authoritative_session, Mapping):
+        raise AcquisitionContractError("authoritative acquisition session is invalid")
+    # Recompute the local diagnostic self-hash before trusting any projection.
+    try:
+        receipt.to_dict()
+    except (TypeError, ValueError) as exc:
+        raise AcquisitionContractError("raw-consumption receipt is invalid") from exc
+
+    session_id = authoritative_session.get("session_id")
+    if session_id != receipt.session_id:
+        raise AcquisitionContractError("raw-consumption/session ID mismatch")
+    _validate_serialized_raw_consumption(authoritative_session)
+
+    expected_bindings = authoritative_session.get("raw_input_bindings")
+    if not isinstance(expected_bindings, Mapping) or not expected_bindings:
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.raw_input_bindings must be a non-empty object"
+        )
+    if canonical_json_bytes(expected_bindings) != canonical_json_bytes(
+        receipt.input_bindings
+    ):
+        raise AcquisitionContractError(
+            f"{receipt.session_id} consumed bindings differ from acquisition contract"
+        )
+    expected_binding_hash = hashlib.sha256(
+        canonical_json_bytes(receipt.input_bindings)
+    ).hexdigest()
+    if authoritative_session.get("raw_input_bindings_sha256") != expected_binding_hash:
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.raw_input_bindings_sha256 mismatch"
+        )
+
+    expected_graph = authoritative_session.get("raw_input_graph")
+    if canonical_json_bytes(expected_graph) != canonical_json_bytes(
+        receipt.raw_input_graph
+    ):
+        raise AcquisitionContractError(
+            f"{receipt.session_id} consumed graph differs from acquisition contract"
+        )
+    expected_graph_hash = hashlib.sha256(
+        canonical_json_bytes(receipt.raw_input_graph)
+    ).hexdigest()
+    if authoritative_session.get("raw_input_graph_sha256") != expected_graph_hash:
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.raw_input_graph_sha256 mismatch"
+        )
+
+    sensor = authoritative_session.get("sensor_summary")
+    radar = sensor.get("radar") if isinstance(sensor, Mapping) else None
+    if not isinstance(radar, Mapping):
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.sensor_summary.radar is missing"
+        )
+    expected_record_contract = radar.get("xethru_record_contract")
+    if canonical_json_bytes(expected_record_contract) != canonical_json_bytes(
+        receipt.xethru_record_contract
+    ):
+        raise AcquisitionContractError(
+            f"{receipt.session_id} consumed XeThru evidence differs from contract"
+        )
+    record_hash = hashlib.sha256(
+        canonical_json_bytes(receipt.xethru_record_contract)
+    ).hexdigest()
+    if radar.get("xethru_record_contract_evidence_sha256") != record_hash:
+        raise AcquisitionContractError(
+            f"{receipt.session_id} XeThru record evidence hash mismatch"
+        )
+    expected_metadata_contract = radar.get("xethru_metadata_contract")
+    if canonical_json_bytes(expected_metadata_contract) != canonical_json_bytes(
+        receipt.xethru_metadata_contract
+    ):
+        raise AcquisitionContractError(
+            f"{receipt.session_id} consumed XeThru metadata evidence differs from contract"
+        )
+    metadata_hash = hashlib.sha256(
+        canonical_json_bytes(receipt.xethru_metadata_contract)
+    ).hexdigest()
+    if radar.get("xethru_metadata_contract_evidence_sha256") != metadata_hash:
+        raise AcquisitionContractError(
+            f"{receipt.session_id} XeThru metadata evidence hash mismatch"
+        )
+
+    portable = receipt.portable_projection
+    portable_hash = receipt.portable_content_sha256
+    raw_consumption = authoritative_session.get("raw_consumption")
+    if not isinstance(raw_consumption, Mapping):
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.raw_consumption binding is missing"
+        )
+    if set(raw_consumption) != {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "portable_projection",
+        "portable_content_sha256",
+    }:
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.raw_consumption fields are invalid"
+        )
+    stored_portable = raw_consumption.get("portable_projection")
+    if not isinstance(stored_portable, Mapping) or set(stored_portable) != {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "session_id",
+        "reader_contract",
+        "raw_input_graph",
+        "input_bindings",
+        "parser_policy",
+        "biopac_parser_evidence",
+        "xethru_metadata_contract",
+        "xethru_record_contract",
+    }:
+        raise AcquisitionContractError(
+            f"{receipt.session_id} portable raw-consumption fields are invalid"
+        )
+    if (
+        raw_consumption.get("schema") != RAW_CONSUMPTION_BINDING_SCHEMA
+        or raw_consumption.get("diagnostic_only") is not True
+        or raw_consumption.get("scientific_authority") is not False
+    ):
+        raise AcquisitionContractError(
+            f"{receipt.session_id}.raw_consumption authority flags are invalid"
+        )
+    if canonical_json_bytes(stored_portable) != (
+        canonical_json_bytes(portable)
+    ):
+        raise AcquisitionContractError(
+            f"{receipt.session_id} portable raw-consumption projection mismatch"
+        )
+    if raw_consumption.get("portable_content_sha256") != portable_hash:
+        raise AcquisitionContractError(
+            f"{receipt.session_id} portable raw-consumption hash mismatch"
+        )
+    return {
+        "schema": RAW_CONSUMPTION_BINDING_SCHEMA,
+        "diagnostic_only": True,
+        "scientific_authority": False,
+        "portable_projection": portable,
+        "portable_content_sha256": portable_hash,
+    }
+
+
+def validate_timing_reason_authority(
+    result: CausalUniformRadarResampleV1,
+) -> dict[str, Any]:
+    """Validate exact structural-mask/reason authority for one resample.
+
+    Fully explained invalid cells remain invalid and exact positive zero.  A
+    successful result only permits the *measured timing* diagnostic gate; it
+    does not authorize synchronization, labels, training, or stage metrics.
+    """
+
+    if type(result) is not CausalUniformRadarResampleV1:
+        raise AcquisitionContractError(
+            "timing reason authority requires an exact resample result"
+        )
+    try:
+        evidence = validate_causal_uniform_invalid_reason_contract_v1(result)
+    except RadarTimingError as exc:
+        raise AcquisitionContractError(f"timing reason authority failed: {exc}") from exc
+    if result.invalid_reason_mask is None:
+        raise AcquisitionContractError("timing reason mask is absent")
+    valid_mask = np.asarray(result.valid_mask)
+    reason_mask = np.asarray(result.invalid_reason_mask)
+    exact_mask_equivalence = bool(np.array_equal(valid_mask, reason_mask == 0))
+    invalid_values = np.asarray(result.values)[~valid_mask]
+    valid_values = np.asarray(result.values)[valid_mask]
+    invalid_exact_positive_zero = bool(
+        np.all(invalid_values == 0)
+        and not np.any(np.signbit(invalid_values))
+    )
+    valid_outputs_finite = bool(np.isfinite(valid_values).all())
+    if (
+        not exact_mask_equivalence
+        or not invalid_exact_positive_zero
+        or not valid_outputs_finite
+        or evidence.get("all_invalid_explained") is not True
+        or evidence.get("invalid_outputs_exact_positive_zero") is not True
+    ):
+        raise AcquisitionContractError(
+            "timing invalid reasons/mask/zero semantics are inconsistent"
+        )
+    content_hashes = result.summary.get("content_hashes")
+    if not isinstance(content_hashes, Mapping):
+        raise AcquisitionContractError("timing resample content hashes are missing")
+    return {
+        "schema": MEASURED_TIMING_REASON_AUTHORITY_SCHEMA,
+        "diagnostic_only": True,
+        "scientific_authority": False,
+        "validator": "validate_causal_uniform_invalid_reason_contract_v1",
+        "reason_schema": CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+        "resampling_transform_evidence_sha256": result.summary.get(
+            "transform_evidence_sha256"
+        ),
+        "valid_mask_sha256": canonical_ndarray_sha256(valid_mask),
+        "invalid_reason_mask_sha256": canonical_ndarray_sha256(reason_mask),
+        "output_values_sha256": canonical_ndarray_sha256(result.values),
+        "exact_mask_equivalence": True,
+        "invalid_outputs_exact_positive_zero": True,
+        "valid_outputs_finite": True,
+        "all_invalid_explained": True,
+        "invalid_interval_count": int(evidence["invalid_interval_count"]),
+        "valid_interval_count": int(evidence["valid_interval_count"]),
+        "reason_evidence": dict(evidence),
+    }
 
 
 def _validate_v2_raw_input_graph(
@@ -882,6 +2129,7 @@ def _validate_v2_resampling_summary(
     session_id: str,
     label: str,
     timestamp_sources: tuple[str, ...],
+    include_reason_contract: bool = False,
 ) -> tuple[float, bool, int, int]:
     location = f"{session_id}.radar.{label}"
     if not isinstance(summary, Mapping):
@@ -998,6 +2246,13 @@ def _validate_v2_resampling_summary(
         "valid_mask_sha256",
         "sample_counts_sha256",
     }
+    if include_reason_contract:
+        expected_content_hash_keys.update(
+            {
+                "invalid_reason_mask_sha256",
+                "invalid_reason_semantics_sha256",
+            }
+        )
     if not isinstance(content_hashes, Mapping) or set(content_hashes) != expected_content_hash_keys:
         raise AcquisitionContractError(
             f"{location}.content_hashes fields do not match the transform schema"
@@ -1495,6 +2750,7 @@ def _v2_measured_timing_is_eligible(
     session_id: str,
     *,
     sync_config: Mapping[str, Any],
+    allow_explained_invalid: bool = False,
 ) -> bool:
     sensor = session.get("sensor_summary")
     radar = sensor.get("radar") if isinstance(sensor, Mapping) else None
@@ -1531,6 +2787,7 @@ def _v2_measured_timing_is_eligible(
         session_id=session_id,
         label="sync_marker_resampling",
         timestamp_sources=sources,
+        include_reason_contract=allow_explained_invalid,
     )
     (
         feature_correction,
@@ -1542,6 +2799,7 @@ def _v2_measured_timing_is_eligible(
         session_id=session_id,
         label="feature_resampling",
         timestamp_sources=sources,
+        include_reason_contract=allow_explained_invalid,
     )
     correction_value = _require_finite_float(
         radar,
@@ -1588,9 +2846,236 @@ def _v2_measured_timing_is_eligible(
         raise AcquisitionContractError(
             f"{session_id}.radar.timestamp_plateau_interval_count aggregate mismatch"
         )
+    if allow_explained_invalid:
+        timing_reason = radar.get("timing_reason_authority")
+        if not isinstance(timing_reason, Mapping):
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason authority is missing"
+            )
+        expected_reason_hashes = {
+            "valid_mask_sha256": feature_resampling["content_hashes"].get(
+                "valid_mask_sha256"
+            ),
+            "invalid_reason_mask_sha256": feature_resampling["content_hashes"].get(
+                "invalid_reason_mask_sha256"
+            ),
+            "output_values_sha256": feature_resampling["content_hashes"].get(
+                "output_values_sha256"
+            ),
+        }
+        if (
+            timing_reason.get("schema")
+            != MEASURED_TIMING_REASON_AUTHORITY_SCHEMA
+            or timing_reason.get("diagnostic_only") is not True
+            or timing_reason.get("scientific_authority") is not False
+            or timing_reason.get("validator")
+            != "validate_causal_uniform_invalid_reason_contract_v1"
+            or timing_reason.get("reason_schema")
+            != CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1
+            or timing_reason.get("resampling_transform_evidence_sha256")
+            != feature_resampling.get("transform_evidence_sha256")
+            or any(
+                timing_reason.get(key) != value
+                for key, value in expected_reason_hashes.items()
+            )
+            or timing_reason.get("exact_mask_equivalence") is not True
+            or timing_reason.get("invalid_outputs_exact_positive_zero") is not True
+            or timing_reason.get("valid_outputs_finite") is not True
+            or timing_reason.get("all_invalid_explained") is not True
+        ):
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason authority mismatch"
+            )
+        reason_evidence = timing_reason.get("reason_evidence")
+        invalid_reason_contract = feature_resampling.get("invalid_reason_contract")
+        if not isinstance(reason_evidence, Mapping) or not isinstance(
+            invalid_reason_contract, Mapping
+        ):
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason evidence is missing"
+            )
+        invalid_count = _require_nonnegative_int(
+            timing_reason,
+            "invalid_interval_count",
+            f"{session_id}.radar.timing_reason_authority",
+        )
+        valid_count = _require_nonnegative_int(
+            timing_reason,
+            "valid_interval_count",
+            f"{session_id}.radar.timing_reason_authority",
+        )
+        reason_evidence_keys = {
+            "schema_version",
+            "semantics_sha256",
+            "invalid_reason_mask_sha256",
+            "invalid_interval_count",
+            "valid_interval_count",
+            "per_reason_interval_counts",
+            "overlap_interval_count",
+            "maximum_reason_multiplicity",
+            "all_invalid_explained",
+            "invalid_outputs_exact_positive_zero",
+        }
+        reason_contract_keys = (
+            reason_evidence_keys
+            - {"schema_version", "semantics_sha256"}
+        ) | {"semantics", "semantics_sha256"}
+        evidence_fields = reason_evidence_keys - {
+            "schema_version",
+            "semantics_sha256",
+        }
+        if (
+            set(reason_evidence) != reason_evidence_keys
+            or set(invalid_reason_contract) != reason_contract_keys
+            or
+            reason_evidence.get("schema_version")
+            != CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1
+            or feature_resampling["content_hashes"].get(
+                "invalid_reason_semantics_sha256"
+            )
+            != CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+            or reason_evidence.get("semantics_sha256")
+            != CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+            or invalid_reason_contract.get("semantics_sha256")
+            != CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+            or invalid_reason_contract.get("semantics")
+            != causal_uniform_invalid_reason_semantics_v1()
+            or reason_evidence.get("all_invalid_explained") is not True
+            or reason_evidence.get("invalid_outputs_exact_positive_zero") is not True
+            or reason_evidence.get("invalid_reason_mask_sha256")
+            != expected_reason_hashes["invalid_reason_mask_sha256"]
+            or reason_evidence.get("invalid_interval_count") != invalid_count
+            or reason_evidence.get("valid_interval_count") != valid_count
+            or invalid_reason_contract.get("all_invalid_explained") is not True
+            or invalid_reason_contract.get("invalid_outputs_exact_positive_zero")
+            is not True
+            or invalid_reason_contract.get("invalid_reason_mask_sha256")
+            != expected_reason_hashes["invalid_reason_mask_sha256"]
+            or invalid_reason_contract.get("invalid_interval_count") != invalid_count
+            or invalid_reason_contract.get("valid_interval_count") != valid_count
+            or any(
+                reason_evidence.get(key) != invalid_reason_contract.get(key)
+                for key in evidence_fields
+            )
+        ):
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason counts/hashes mismatch"
+            )
+        per_view = feature_resampling.get("per_view")
+        if not isinstance(per_view, list) or len(per_view) != 3:
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason per-view evidence is invalid"
+            )
+        if any(not isinstance(view, Mapping) for view in per_view):
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason per-view evidence is invalid"
+            )
+        if sum(
+            _require_nonnegative_int(
+                view,
+                "invalid_output_count",
+                f"{session_id}.radar.feature_resampling.per_view",
+            )
+            for view in per_view
+        ) != invalid_count or sum(
+            _require_nonnegative_int(
+                view,
+                "valid_output_count",
+                f"{session_id}.radar.feature_resampling.per_view",
+            )
+            for view in per_view
+        ) != valid_count:
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason aggregate mismatch"
+            )
+        expected_reason_names = {
+            "empty_interval",
+            "temporal_gap",
+            "frame_sequence_gap",
+            "timestamp_plateau",
+            "nonfinite_payload",
+        }
+        overall_reason_counts = reason_evidence.get("per_reason_interval_counts")
+        if not isinstance(overall_reason_counts, Mapping) or set(
+            overall_reason_counts
+        ) != expected_reason_names:
+            raise AcquisitionContractError(
+                f"{session_id}.radar timing reason aggregate names are invalid"
+            )
+        per_view_reason_sums = {name: 0 for name in expected_reason_names}
+        legacy_reason_keys = {
+            "empty_interval": "empty_interval_count",
+            "temporal_gap": "temporal_gap_interval_count",
+            "frame_sequence_gap": "sequence_gap_interval_count",
+            "timestamp_plateau": "timestamp_plateau_interval_count",
+            "nonfinite_payload": "nonfinite_interval_count",
+        }
+        for view in per_view:
+            view_counts = view.get("invalid_reason_interval_counts")
+            if not isinstance(view_counts, Mapping) or set(
+                view_counts
+            ) != expected_reason_names:
+                raise AcquisitionContractError(
+                    f"{session_id}.radar per-view reason counts are invalid"
+                )
+            for name, legacy_key in legacy_reason_keys.items():
+                count = _require_nonnegative_int(
+                    view_counts,
+                    name,
+                    f"{session_id}.radar.per_view.invalid_reason_interval_counts",
+                )
+                if count != _require_nonnegative_int(
+                    view,
+                    legacy_key,
+                    f"{session_id}.radar.per_view",
+                ):
+                    raise AcquisitionContractError(
+                        f"{session_id}.radar per-view reason count mismatch"
+                    )
+                per_view_reason_sums[name] += count
+        if any(
+            _require_nonnegative_int(
+                overall_reason_counts,
+                name,
+                f"{session_id}.radar.reason_evidence",
+            )
+            != per_view_reason_sums[name]
+            for name in expected_reason_names
+        ):
+            raise AcquisitionContractError(
+                f"{session_id}.radar reason count aggregate mismatch"
+            )
+        overlap_count = _require_nonnegative_int(
+            reason_evidence,
+            "overlap_interval_count",
+            f"{session_id}.radar.reason_evidence",
+        )
+        maximum_multiplicity = _require_nonnegative_int(
+            reason_evidence,
+            "maximum_reason_multiplicity",
+            f"{session_id}.radar.reason_evidence",
+        )
+        reason_presence_sum = sum(per_view_reason_sums.values())
+        if (
+            overlap_count > invalid_count
+            or maximum_multiplicity > 5
+            or (invalid_count == 0 and maximum_multiplicity != 0)
+            or (invalid_count > 0 and not 1 <= maximum_multiplicity <= 5)
+            or reason_presence_sum < invalid_count
+            or reason_presence_sum > maximum_multiplicity * invalid_count
+        ):
+            raise AcquisitionContractError(
+                f"{session_id}.radar reason overlap/multiplicity is impossible"
+            )
+        timing_cells_eligible = True
+    else:
+        timing_cells_eligible = (
+            sync_resampling["any_view_invalid_interval_count"] == 0
+        )
+
     expected = bool(
         all(source == "meta_v13" for source in sources)
-        and sync_resampling["any_view_invalid_interval_count"] == 0
+        and timing_cells_eligible
         and sync_half_open_exact
         and feature_half_open_exact
         and correction_value <= 0.050
@@ -1619,7 +3104,11 @@ def load_acquisition_reconstruction(
     schema = document.get("schema_version")
     if schema not in SUPPORTED_ACQUISITION_SCHEMAS:
         raise AcquisitionContractError("unexpected acquisition reconstruction schema")
-    is_v2 = schema == ACQUISITION_SCHEMA
+    is_v3 = schema == ACQUISITION_SCHEMA_V3
+    # V3 deliberately retains the complete v2 structural/cohort contract and
+    # adds stronger raw-consumption and timing-reason requirements.  V1 alone
+    # remains the legacy unverified branch.
+    is_v2 = schema in {ACQUISITION_SCHEMA_V3, ACQUISITION_SCHEMA}
     _require_content_hash(document, "acquisition root manifest")
     entries = document.get("sessions")
     if not isinstance(entries, list):
@@ -1773,6 +3262,24 @@ def load_acquisition_reconstruction(
             "spreadsheet_sha256",
         ):
             _require_sha256(document, key, "acquisition root")
+        root_execution_source_generation: Mapping[str, Any] | None = None
+        if is_v3:
+            root_execution_source_generation = document.get(
+                "execution_source_generation"
+            )
+            expected_execution_source_generation = (
+                v3_diagnostic_execution_source_generation(
+                    str(document["pipeline_sha256"])
+                )
+            )
+            if not (
+                isinstance(root_execution_source_generation, Mapping)
+                and canonical_json_bytes(root_execution_source_generation)
+                == canonical_json_bytes(expected_execution_source_generation)
+            ):
+                raise AcquisitionContractError(
+                    "acquisition v3 execution-source diagnostic contract drifted"
+                )
         sync_config_value = document.get("sync_config")
         if not isinstance(sync_config_value, str) or not sync_config_value:
             raise AcquisitionContractError(
@@ -1998,6 +3505,12 @@ def load_acquisition_reconstruction(
                     raise AcquisitionContractError(
                         f"{session_id} reconstruction context {key} mismatch"
                     )
+            if is_v3 and canonical_json_bytes(
+                context.get("execution_source_generation")
+            ) != canonical_json_bytes(root_execution_source_generation):
+                raise AcquisitionContractError(
+                    f"{session_id} execution-source diagnostic contract mismatch"
+                )
             if _require_bool(
                 context,
                 "subjects_filter_applied",
@@ -2029,6 +3542,34 @@ def load_acquisition_reconstruction(
             if entry.get("physical_identity") != expected_identity:
                 raise AcquisitionContractError(
                     f"{session_id} root/session physical identity mismatch"
+                )
+        if is_v3:
+            v3_claims = {
+                key: _require_bool(session, key, session_id)
+                for key in (
+                    "raw_consumed_bytes_verified",
+                    "timing_adjudicated",
+                    "sync_raw_replay_verified",
+                    "protocol_raw_replay_verified",
+                )
+            }
+            for key, value in v3_claims.items():
+                if entry.get(key) is not value:
+                    raise AcquisitionContractError(
+                        f"{session_id} root/session {key} mismatch"
+                    )
+            if (
+                v3_claims["sync_raw_replay_verified"]
+                or v3_claims["protocol_raw_replay_verified"]
+                or v3_claims["raw_consumed_bytes_verified"] is not usable
+                or v3_claims["timing_adjudicated"] is not usable
+            ):
+                raise AcquisitionContractError(
+                    f"{session_id} v3 diagnostic verification claims are invalid"
+                )
+            if entry.get("sync_authorized") is not False:
+                raise AcquisitionContractError(
+                    f"{session_id} v3 root entry cannot authorize synchronization"
                 )
         if not usable:
             if is_v2:
@@ -2107,13 +3648,22 @@ def load_acquisition_reconstruction(
                 raise AcquisitionContractError(
                     f"{session_id} raw input/synchronization receipt bindings mismatch"
                 )
-            _validate_v2_raw_input_graph(
-                session,
-                receipt,
-                subject=discovered_subjects_by_id[session_id],
-                dataset_root=dataset_root,
-                session_id=session_id,
-            )
+            if is_v3:
+                _validate_serialized_raw_consumption(session)
+                _validate_bound_raw_consumption_receipt(
+                    session, reconstruction_root=root
+                )
+                validate_v3_sync_signals_artifact(
+                    session, reconstruction_root=root
+                )
+            else:
+                _validate_v2_raw_input_graph(
+                    session,
+                    receipt,
+                    subject=discovered_subjects_by_id[session_id],
+                    dataset_root=dataset_root,
+                    session_id=session_id,
+                )
         receipt_mapping = receipt.get("result", {}).get("mapping")
         if not _mapping_equal(sync.get("mapping"), receipt_mapping):
             raise AcquisitionContractError(f"{session_id} duplicated sync mapping mismatch")
@@ -2185,6 +3735,10 @@ def load_acquisition_reconstruction(
         declared_authorized = _require_bool(
             sync, "authorized", f"{session_id}.synchronization"
         )
+        if is_v3 and declared_authorized:
+            raise AcquisitionContractError(
+                f"{session_id} v3 diagnostic receipt cannot authorize synchronization"
+            )
         receipt_result = receipt.get("result")
         assert isinstance(receipt_result, Mapping)
         receipt_decision = receipt_result.get("decision")
@@ -2208,6 +3762,8 @@ def load_acquisition_reconstruction(
         # raw-derived verifier represented by synchronization_is_authorized;
         # current v1 receipts deliberately return False there.
         authorized = bool(
+            not is_v3
+            and
             declared_authorized
             and synchronization_is_authorized(
                 receipt, manual_approval=approval
@@ -2415,12 +3971,19 @@ def load_acquisition_reconstruction(
                 raise AcquisitionContractError(
                     f"{session_id}.sensor_summary.biopac.warnings must be a string array"
                 )
-            biopac_warning_free = not warnings
+            biopac_warning_free = bool(
+                not warnings
+                and (
+                    not is_v3
+                    or biopac_summary.get("parser_eligible") is True
+                )
+            )
         measured_timing_expected = (
             _v2_measured_timing_is_eligible(
                 session,
                 session_id,
                 sync_config=root_sync_config_document,
+                allow_explained_invalid=is_v3,
             )
             if is_v2
             else len(sources) == 3
@@ -2441,6 +4004,7 @@ def load_acquisition_reconstruction(
             protocol_status == "auto"
             and alignment_expected
             and is_v2
+            and not is_v3
             and _protocol_decode_has_independent_verification(
                 session, receipt, root_protocol_config
             )
@@ -2618,6 +4182,42 @@ def load_acquisition_reconstruction(
             raise AcquisitionContractError(
                 "acquisition root scientific eligibility does not match its children"
             )
+        if is_v3:
+            expected_raw_verified = bool(
+                sessions
+                and all(
+                    contract.manifest.get("raw_consumed_bytes_verified") is True
+                    for contract in sessions.values()
+                )
+            )
+            expected_timing_adjudicated = bool(
+                sessions
+                and all(
+                    contract.manifest.get("timing_adjudicated") is True
+                    for contract in sessions.values()
+                )
+            )
+            if (
+                _require_bool(
+                    document, "raw_consumed_bytes_verified", "acquisition root"
+                )
+                is not expected_raw_verified
+                or _require_bool(
+                    document, "timing_adjudicated", "acquisition root"
+                )
+                is not expected_timing_adjudicated
+                or _require_bool(
+                    document, "sync_raw_replay_verified", "acquisition root"
+                )
+                is not False
+                or _require_bool(
+                    document, "protocol_raw_replay_verified", "acquisition root"
+                )
+                is not False
+            ):
+                raise AcquisitionContractError(
+                    "acquisition v3 aggregate verification claims mismatch"
+                )
         # Historical claims remain available in ``manifest`` above.  The
         # effective property exposed to cache consumers is gated by the
         # independent raw-derived authorization boundary.
@@ -2780,8 +4380,13 @@ def assign_stage_window(
 
 
 __all__ = [
+    "ACQUISITION_SCHEMA_V3",
+    "ACQUISITION_EXECUTION_SOURCE_DIAGNOSTIC_SCHEMA_V1",
     "ACQUISITION_SCHEMA",
     "LEGACY_ACQUISITION_SCHEMA",
+    "RAW_CONSUMPTION_BINDING_SCHEMA",
+    "MEASURED_TIMING_REASON_AUTHORITY_SCHEMA",
+    "V3_SYNC_SIGNALS_ARTIFACT_SCHEMA",
     "ACQUISITION_COHORT_AUTHORITY_SCHEMA",
     "ACQUISITION_COHORT_V1_CONTENT_SHA256",
     "SUPPORTED_ACQUISITION_SCHEMAS",
@@ -2795,6 +4400,11 @@ __all__ = [
     "load_acquisition_cohort_authority",
     "build_v2_raw_input_binding_state",
     "build_v2_xethru_record_contract",
+    "validate_consumption_against_contract",
+    "v3_diagnostic_execution_source_generation",
+    "validate_timing_reason_authority",
+    "build_v3_sync_signals_artifact_binding",
+    "validate_v3_sync_signals_artifact",
     "validate_raw_input_bindings",
     "assign_stage_window",
 ]

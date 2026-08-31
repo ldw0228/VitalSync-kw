@@ -9,7 +9,8 @@ virtual environment, general deterministic caches, and redundant intermediate
 experiments.
 
 Read `AGENTS.md` before modifying the restored repository. For current work,
-`artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md` and
+`artifacts/COMMERCIAL_SNN_GOAL_V4_CONTINUATION_2026-08-31.md`,
+`artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md`, and
 `artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md` have authority over
 Goal v2, older execution plans/progress reports, preserved release manifests,
 and `artifacts/commercial_goal_report.json`. Those older objects are historical
@@ -153,9 +154,9 @@ sed -n '1,220p' artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md
 
 The commands in this section reconstruct the historical cache lineage for
 inspection and legacy-result reproduction. They do not convert the current
-acquisition-v2 state (`synchronization authorized: 0/29`) into new scientific
-authority. Use new versioned output roots for experiments and obey the current
-strict acquisition guards.
+acquisition-v3 diagnostic state (`synchronization authorized: 0/29`) into new
+scientific authority. Use new versioned output roots for experiments and obey
+the current strict acquisition guards.
 
 ### 6.1 Dataset audit and canonical RF cache
 
@@ -221,6 +222,36 @@ assignments must be the exact authorized nested artifacts:
 
 Never replace `PATH_TO_AUTHORIZED_PROPOSER` with a model fitted on the outer
 identity being predicted.
+
+### 6.4 Rebuild the current V3 diagnostic lineage
+
+Use fresh, absent output names. These commands reconstruct byte/timing evidence
+and label-free RF/SVD inputs; they do not authorize training.
+
+```bash
+.venv/bin/python scripts/reconstruct_acquisition.py \
+  --schema-version v3 \
+  --output-dir artifacts/acquisition/RESTORED_V3_DIAGNOSTIC \
+  --skip-range-tracks --skip-review-plots
+
+.venv/bin/python scripts/build_features.py \
+  --config configs/default.yaml --dataset-root HAI_EXPERIMENT \
+  --cache-dir artifacts/cache/RESTORED_RF_V3_DIAGNOSTIC \
+  --acquisition-manifest \
+    artifacts/acquisition/RESTORED_V3_DIAGNOSTIC/manifest.json \
+  --acquisition-mode diagnostic
+
+.venv/bin/python scripts/build_svd_features.py \
+  --dataset-root HAI_EXPERIMENT \
+  --canonical-cache artifacts/cache/RESTORED_RF_V3_DIAGNOSTIC \
+  --output-dir artifacts/cache/RESTORED_SVD_V3_DIAGNOSTIC \
+  --all-windows --components 12 --nfft 4096 --n-iter 2 --workers 4
+```
+
+Expected current diagnostic shape: 30 source sessions, 29 usable sessions, 18
+physical identities, 9,575 RF/SVD rows, 18 mapping-bearing sessions, 11
+radar-only unmapped sessions, and zero reference-valid rows. Any mismatch is a
+new source/config/parser event; preserve the failed attempt and investigate it.
 
 ## 7. Reproduce the established structured-SNN leader
 

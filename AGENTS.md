@@ -32,18 +32,21 @@ also pass.
 
 Current authority order:
 
+- `artifacts/COMMERCIAL_SNN_GOAL_V4_CONTINUATION_2026-08-31.md`
 - `artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md`
 - `artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md`
 - `artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md`
 - `README.md`
 - `REPORT.md`
 
-Goal v3 and the 2026-08-31 progress report govern the current source
-generation. Goal v2, earlier execution plans/progress reports, existing release
+Goal v4 is the current raw-authority continuation and inherits every accuracy,
+evaluation, and prospective gate from Goal v3. Goal v4, Goal v3, and the
+2026-08-31 progress report govern the current source generation. Goal v2,
+earlier execution plans/progress reports, existing release
 manifests, and `artifacts/commercial_goal_report.json` are immutable historical
 evidence only. They do not authorize current training, evaluation, or release.
-If an older document conflicts with Goal v3 or the current progress report,
-follow the two current documents and preserve the conflict for audit.
+If an older document conflicts with Goal v4, Goal v3, or the current progress
+report, follow the three current documents and preserve the conflict for audit.
 
 ## 2. Non-negotiable scientific invariants
 
@@ -96,20 +99,22 @@ Known data facts that affect code:
 
 Do not rename or rewrite raw files. Parsers must treat raw input as read-only.
 
-Current acquisition-v2 evidence:
+Current acquisition-v3 diagnostic evidence:
 
 - frozen authority: 30 sessions, 29 usable, 18 usable physical identities
-- full causal-bound reconstruction: complete but diagnostic
-- synchronization authorized: 0/29
-- measured-timing eligible: 19/29
-- stage-metric eligible: 0/29
-- strict-cache/scientific eligible: 0/29
-- diagnostic RF cache: 5,826 windows from 18 mapping-bearing sessions,
-  `reference_valid=0` for every row
+- exact consumed-byte and XeThru/BIOPAC parser evidence: 29/29 usable sessions
+- measured-timing adjudicated: 29/29; 31 source-grid invalid cells remain masked
+- synchronization: manual review 13, rejected 16, authorized 0/29
+- protocol: review 26, uncertain 3; stage-metric eligible 0/29
+- strict-cache/scientific/training eligible: 0/29
+- diagnostic RF cache: 29 sessions, 9,575 windows, 18 mapping-bearing and 11
+  radar-only unmapped sessions, `reference_valid=0` for every row
+- diagnostic SVD cache: 29 sessions, 9,575 rows, 12 components, NFFT 4096;
+  unavailable radar-view features remain structurally masked and exact zero
 
 The authoritative paths and content hashes are recorded in
 `artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md`. Do not train from
-that diagnostic cache or convert its proposed mappings into approvals.
+these diagnostic caches or convert proposed mappings into approvals.
 
 ## 4. First actions after restoration
 
@@ -265,9 +270,12 @@ Torch thread mutations and uses fixed-order accumulation for the affected SVD
 projection. An earlier intermediate 2026-08-31 generation collected 1,545
 tests, passed 1,541 twice, skipped four real-bubblewrap tests in the managed
 namespace, and then passed those four tests in a capable host context. The
-final 2026-08-31 source generation collects 1,766 tests and passed two
+later 2026-08-31 source generation collected 1,766 tests and passed two
 consecutive full-suite runs with 1,762 passed and the same four managed-host
-bubblewrap skips; those four tests then passed 4/4 in a capable host context.
+bubblewrap skips. The current Goal v4 generation collects 1,945 tests and
+passed two consecutive full-suite runs with 1,941 passed and the same four
+managed-host skips. The four bubblewrap tests previously passed 4/4 in a
+capable host context; they were not rerun outside this managed host for Goal v4.
 The active V8R4 fixed collection is exactly 739 node IDs with semantic SHA-256
 `b9b192c084d3f6d69094657bceb9047e368c12cac4e4420c2f75ef3c7fc39df4`.
 Do not rewrite the backup snapshot. A passing unit suite still does not

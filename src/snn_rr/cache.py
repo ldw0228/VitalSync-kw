@@ -6,27 +6,60 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
-from typing import Any
+import stat
+import tempfile
+from typing import Any, BinaryIO
 
 import numpy as np
 import pandas as pd
 
 from .acquisition_contract import (
+    ACQUISITION_COHORT_V1_CONTENT_SHA256,
     AcquisitionSessionContract,
     assign_stage_window,
     load_acquisition_reconstruction,
 )
-from .preprocess import identity_for_session
+from .preprocess import SESSION_IDENTITY, identity_for_session
+from .radar_timing import (
+    CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+    CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1,
+    canonical_ndarray_sha256,
+)
+from .synchronization import TimeMapping
 
 
 DEFAULT_HISTORY_LAGS = (1, 2, 4, 8)
 DEFAULT_HISTORY_ROLLING_WINDOWS = (4, 8)
 ACQUISITION_CACHE_SCHEMA_VERSION = "snn_rr.feature_cache_acquisition.v1"
 ACQUISITION_CACHE_SCHEMA_VERSION_V2 = "snn_rr.feature_cache_acquisition.v2"
+ACQUISITION_CACHE_SCHEMA_VERSION_V3 = "snn_rr.feature_cache_acquisition.v3"
+ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3 = "snn_rr.feature_cache_session.v3"
+ACQUISITION_CACHE_ROOT_SCHEMA_VERSION_V3 = "snn_rr.feature_cache_root.v3"
 ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V2 = "snn_rr.acquisition_reconstruction.v2"
+ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3 = "snn_rr.acquisition_reconstruction.v3"
+V3_INFERENCE_FEATURE_SCHEMA_VERSION = "snn_rr.feature_cache_inference_features.v1"
+V3_FEATURE_AVAILABILITY_SCHEMA_VERSION = (
+    "snn_rr.feature_cache_inference_availability.v1"
+)
+V3_TARGET_FIREWALL_SCHEMA_VERSION = "snn_rr.feature_cache_target_firewall.v1"
+V3_METADATA_JOIN_SCHEMA_VERSION = "snn_rr.feature_cache_metadata_join.v1"
+V3_REFERENCE_SUPPORT_SCHEMA_VERSION = "snn_rr.feature_cache_reference_support.v1"
+V3_MAP_RANGE_FEATURE_NAMES = tuple(
+    [f"raw_power_pooled_range_{index:03d}" for index in range(91)]
+    + [f"candidate_iq_phase_power_range_{index:03d}" for index in range(91)]
+)
+V3_MAP_SOURCE_LINEAGE = (
+    "radar_only_causal_frequency_power_features_raw_and_candidate_iq_phase_"
+    "concatenated_on_range_axis"
+)
 SUPPORTED_ACQUISITION_CACHE_SCHEMA_VERSIONS = frozenset(
-    {ACQUISITION_CACHE_SCHEMA_VERSION, ACQUISITION_CACHE_SCHEMA_VERSION_V2}
+    {
+        ACQUISITION_CACHE_SCHEMA_VERSION,
+        ACQUISITION_CACHE_SCHEMA_VERSION_V2,
+        ACQUISITION_CACHE_SCHEMA_VERSION_V3,
+    }
 )
 
 # These fields are deliberately metadata-only.  In particular, the acquisition
@@ -54,6 +87,9 @@ REQUIRED_ACQUISITION_ANNOTATION_COLUMNS = frozenset(
         "acquisition_batch",
     }
 )
+V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS = frozenset(
+    {*REQUIRED_ACQUISITION_ANNOTATION_COLUMNS, "reference_mapping_available"}
+)
 
 _ACQUISITION_INDICATOR_KEYS = frozenset(
     {
@@ -71,11 +107,12 @@ _ACQUISITION_INDICATOR_KEYS = frozenset(
 class CacheProvenance:
     """Content binding and claim boundary for one loaded feature cache.
 
-    Version-1 acquisition caches remain readable for historical diagnostics,
-    but only a fully verified version-2 cache can be classified as
+    Version-1/2 acquisition caches remain readable for historical diagnostics,
+    but only a fully verified version-3 cache can be classified as
     ``acquisition_scientific``.  ``inventory_sha256`` binds the exact files
-    loaded for ``selected_sessions`` even when an older manifest did not carry
-    its own per-file inventory.
+    consumed for ``selected_sessions``.  Version-3 derives that identity from
+    the descriptor-pinned byte snapshots actually parsed, never a later path
+    rehash.  Older versions retain diagnostic compatibility only.
     """
 
     classification: str
@@ -122,6 +159,12 @@ class FeatureCache:
     frequencies_hz: np.ndarray
     provenance: CacheProvenance | None = None
     radar_timing_valid_mask: np.ndarray | None = None
+    radar_timing_invalid_reason_mask: np.ndarray | None = None
+    feature_availability_mask: np.ndarray | None = None
+    feature_availability_names: tuple[str, ...] | None = None
+    map_view_availability_mask: np.ndarray | None = None
+    aux_feature_availability_mask: np.ndarray | None = None
+    aux_feature_names: tuple[str, ...] | None = None
 
     def subset(self, indices: np.ndarray) -> "FeatureCache":
         indices = np.asarray(indices)
@@ -152,6 +195,28 @@ class FeatureCache:
                 if self.radar_timing_valid_mask is None
                 else self.radar_timing_valid_mask[indices]
             ),
+            radar_timing_invalid_reason_mask=(
+                None
+                if self.radar_timing_invalid_reason_mask is None
+                else self.radar_timing_invalid_reason_mask[indices]
+            ),
+            feature_availability_mask=(
+                None
+                if self.feature_availability_mask is None
+                else self.feature_availability_mask[indices]
+            ),
+            feature_availability_names=self.feature_availability_names,
+            map_view_availability_mask=(
+                None
+                if self.map_view_availability_mask is None
+                else self.map_view_availability_mask[indices]
+            ),
+            aux_feature_availability_mask=(
+                None
+                if self.aux_feature_availability_mask is None
+                else self.aux_feature_availability_mask[indices]
+            ),
+            aux_feature_names=self.aux_feature_names,
         )
 
 
@@ -187,6 +252,28 @@ def load_feature_cache(
     if not root_manifest_path.is_file():
         raise FileNotFoundError(f"feature cache manifest missing: {root_manifest_path}")
     root_manifest = _read_strict_json(root_manifest_path, "feature cache root manifest")
+    indicated_contract = root_manifest.get("acquisition_contract")
+    root_schema_is_v3 = bool(
+        root_manifest.get("schema_version")
+        == ACQUISITION_CACHE_ROOT_SCHEMA_VERSION_V3
+    )
+    contract_schema_is_v3 = bool(
+        isinstance(indicated_contract, dict)
+        and indicated_contract.get("schema_version")
+        == ACQUISITION_CACHE_SCHEMA_VERSION_V3
+    )
+    if root_schema_is_v3 != contract_schema_is_v3:
+        raise ValueError(
+            "mixed version-3 cache schemas are forbidden; the root and "
+            "acquisition contract schemas must agree exactly"
+        )
+    if root_schema_is_v3 and contract_schema_is_v3:
+        return _load_feature_cache_v3(
+            root,
+            sessions=sessions,
+            mmap=mmap,
+            require_scientific_eligible=require_scientific_eligible,
+        )
     declared_root_content = root_manifest.get("content_sha256")
     root_manifest_content_sha256 = _canonical_content_sha256(root_manifest)
     indicated_root_contract = root_manifest.get("acquisition_contract")
@@ -254,8 +341,15 @@ def load_feature_cache(
             root,
             root_manifest,
             available_items,
-            require_scientific_eligible=require_scientific_eligible,
+            # V1/V2 are validated fully for historical reproduction, but no
+            # legacy claim may satisfy the current scientific gate.
+            require_scientific_eligible=False,
         )
+        if require_scientific_eligible:
+            raise ValueError(
+                "scientific cache loading requires acquisition cache version 3; "
+                "versions 1 and 2 are historical/diagnostic only"
+            )
 
     inventory_files: list[Path] = []
     for session_id in selected:
@@ -353,20 +447,18 @@ def load_feature_cache(
         acquisition_contract is not None
         and acquisition_contract.get("scientific_eligible") is True
     )
-    # V1 remains a historical/diagnostic compatibility surface.  It lacks the
-    # full-cohort and exact file-inventory guarantees required for a new
-    # scientific run, even when its historical flag said eligible.
-    effective_eligible = bool(
-        schema_version == ACQUISITION_CACHE_SCHEMA_VERSION_V2
-        and declared_eligible
-        and sessions is None
-    )
+    # V1/V2 remain historical/diagnostic compatibility surfaces.  Only the
+    # descriptor-pinned V3 dispatch above may issue scientific provenance.
+    effective_eligible = False
     if acquisition_contract is None:
         classification = "legacy"
-    elif effective_eligible:
-        classification = "acquisition_scientific"
     elif schema_version == ACQUISITION_CACHE_SCHEMA_VERSION:
         classification = "acquisition_historical_v1"
+    elif (
+        schema_version == ACQUISITION_CACHE_SCHEMA_VERSION_V2
+        and declared_eligible
+    ):
+        classification = "acquisition_historical_v2"
     else:
         classification = "acquisition_diagnostic"
     provenance = CacheProvenance(
@@ -408,7 +500,7 @@ def load_feature_cache(
     )
 
 
-def _read_strict_json(path: Path, label: str) -> dict[str, Any]:
+def _strict_json_from_bytes(payload: bytes, label: str) -> dict[str, Any]:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -422,15 +514,235 @@ def _read_strict_json(path: Path, label: str) -> dict[str, Any]:
 
     try:
         document = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload.decode("utf-8"),
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_nonfinite,
         )
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"cannot read {label}: {path} ({error})") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot parse {label} ({error})") from error
     if not isinstance(document, dict):
         raise ValueError(f"{label} must be a JSON object")
     return document
+
+
+def _read_strict_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read {label}: {path} ({error})") from error
+    return _strict_json_from_bytes(payload, label)
+
+
+@dataclass(slots=True)
+class _ConsumedFileSnapshot:
+    """Unlinked private snapshot of one exact descriptor-consumed generation."""
+
+    stream: BinaryIO
+    byte_count: int
+    sha256: str
+    source_stat: tuple[int, ...]
+
+    def close(self) -> None:
+        self.stream.close()
+
+
+def _safe_leaf_name(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        raise ValueError(f"{label} must be a non-empty path leaf")
+    if "\x00" in value or "/" in value or "\\" in value:
+        raise ValueError(f"{label} contains path traversal")
+    return value
+
+
+def _directory_open_flags() -> int:
+    required = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, name) for name in required):
+        raise RuntimeError("version-3 cache loading requires secure Linux open flags")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_directory_path_nofollow(path: Path, *, label: str) -> tuple[int, str]:
+    """Open every absolute path component without following symlinks."""
+
+    absolute = os.path.abspath(os.fspath(path))
+    components = Path(absolute).parts
+    flags = _directory_open_flags()
+    descriptor = os.open(os.path.sep, flags)
+    try:
+        for component in components[1:]:
+            leaf = _safe_leaf_name(component, label=f"{label} component")
+            next_descriptor = os.open(leaf, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ValueError(f"{label} is not a directory")
+        return descriptor, absolute
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_child_directory_nofollow(
+    parent_fd: int,
+    name: Any,
+    *,
+    label: str,
+) -> tuple[int, tuple[int, ...]]:
+    leaf = _safe_leaf_name(name, label=label)
+    try:
+        descriptor = os.open(leaf, _directory_open_flags(), dir_fd=parent_fd)
+    except OSError as error:
+        raise ValueError(f"cannot securely open {label}: {leaf} ({error})") from error
+    observed = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"{label} is not a directory")
+    return descriptor, _stable_stat_fingerprint(observed)
+
+
+def _stable_stat_fingerprint(observed: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_mode),
+        int(observed.st_nlink),
+        int(observed.st_uid),
+        int(observed.st_gid),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+
+
+def _assert_child_directory_still_bound(
+    parent_fd: int,
+    name: str,
+    expected: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"{label} changed during cache load ({error})") from error
+    if not stat.S_ISDIR(observed.st_mode) or _stable_stat_fingerprint(observed) != expected:
+        raise ValueError(f"{label} changed during cache load")
+
+
+def _assert_regular_entry_still_bound(
+    directory_fd: int,
+    name: str,
+    expected: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"{label} changed during cache load ({error})") from error
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or _stable_stat_fingerprint(observed) != expected
+    ):
+        raise ValueError(f"{label} changed during cache load")
+
+
+def _snapshot_regular_file_at(
+    directory_fd: int,
+    name: Any,
+    *,
+    label: str,
+) -> _ConsumedFileSnapshot:
+    """Copy/hash one pinned regular nlink-1 file in the same single pass."""
+
+    leaf = _safe_leaf_name(name, label=label)
+    required = ("O_NOFOLLOW", "O_CLOEXEC")
+    if any(not hasattr(os, item) for item in required):
+        raise RuntimeError("version-3 cache loading requires secure Linux open flags")
+    try:
+        source_fd = os.open(
+            leaf,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise ValueError(f"cannot securely open {label}: {leaf} ({error})") from error
+    snapshot: BinaryIO | None = None
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        if before.st_nlink != 1:
+            raise ValueError(f"{label} must have exactly one hard link")
+        before_fingerprint = _stable_stat_fingerprint(before)
+        snapshot = tempfile.TemporaryFile(mode="w+b")
+        digest = hashlib.sha256()
+        consumed = 0
+        while True:
+            chunk = os.read(source_fd, 4 * 1024 * 1024)
+            if not chunk:
+                break
+            written = snapshot.write(chunk)
+            if written != len(chunk):
+                raise ValueError(f"private snapshot short write for {label}")
+            digest.update(chunk)
+            consumed += len(chunk)
+        after = os.fstat(source_fd)
+        if _stable_stat_fingerprint(after) != before_fingerprint:
+            raise ValueError(f"{label} changed during descriptor consumption")
+        if consumed != before.st_size:
+            raise ValueError(f"{label} byte count changed during consumption")
+        try:
+            rebound = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError(f"{label} directory entry changed during load") from error
+        if _stable_stat_fingerprint(rebound) != before_fingerprint:
+            raise ValueError(f"{label} directory entry changed during load")
+        snapshot.flush()
+        os.fsync(snapshot.fileno())
+        snapshot.seek(0)
+        result = _ConsumedFileSnapshot(
+            stream=snapshot,
+            byte_count=consumed,
+            sha256=digest.hexdigest(),
+            source_stat=before_fingerprint,
+        )
+        snapshot = None
+        return result
+    finally:
+        os.close(source_fd)
+        if snapshot is not None:
+            snapshot.close()
+
+
+def _snapshot_json_at(
+    directory_fd: int,
+    name: str,
+    *,
+    label: str,
+) -> tuple[dict[str, Any], _ConsumedFileSnapshot]:
+    snapshot = _snapshot_regular_file_at(directory_fd, name, label=label)
+    try:
+        payload = snapshot.stream.read()
+        snapshot.stream.seek(0)
+        document = _strict_json_from_bytes(payload, label)
+    except BaseException:
+        snapshot.close()
+        raise
+    return document, snapshot
+
+
+def _consumed_inventory_record(
+    relative_path: str,
+    snapshot: _ConsumedFileSnapshot,
+) -> dict[str, Any]:
+    return {
+        "path": relative_path,
+        "bytes": snapshot.byte_count,
+        "sha256": snapshot.sha256,
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -506,15 +818,20 @@ def _validate_sha256(value: Any, *, location: str, nullable: bool = False) -> st
     return digest
 
 
-def _annotation_columns(value: Any, *, location: str) -> tuple[str, ...]:
+def _annotation_columns(
+    value: Any,
+    *,
+    location: str,
+    expected_columns: frozenset[str] = REQUIRED_ACQUISITION_ANNOTATION_COLUMNS,
+) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{location} must be a non-empty list")
     columns = tuple(str(column) for column in value)
     if len(set(columns)) != len(columns):
         raise ValueError(f"{location} must not contain duplicates")
-    if set(columns) != set(REQUIRED_ACQUISITION_ANNOTATION_COLUMNS):
-        missing = sorted(REQUIRED_ACQUISITION_ANNOTATION_COLUMNS - set(columns))
-        extra = sorted(set(columns) - REQUIRED_ACQUISITION_ANNOTATION_COLUMNS)
+    if set(columns) != set(expected_columns):
+        missing = sorted(expected_columns - set(columns))
+        extra = sorted(set(columns) - expected_columns)
         raise ValueError(
             f"{location} does not match the acquisition metadata schema; "
             f"missing={missing}, extra={extra}"
@@ -546,6 +863,2064 @@ def _unique_string_list(value: Any, *, location: str) -> list[str]:
     if len(set(value)) != len(value):
         raise ValueError(f"{location} must not contain duplicates")
     return list(value)
+
+
+_V3_ROOT_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "content_sha256",
+        "config_sha256",
+        "pipeline_sha256",
+        "acquisition_contract",
+        "sessions",
+    }
+)
+_V3_ROOT_CONTRACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "upstream_reconstruction_schema_version",
+        "reconstruction_manifest",
+        "reconstruction_manifest_sha256",
+        "reconstruction_manifest_bytes",
+        "reconstruction_content_sha256",
+        "cohort_authority_sha256",
+        "cohort_authority_content_sha256",
+        "mode",
+        "scientific_eligible",
+        "subjects_filter_applied",
+        "selection_scope",
+        "full_cohort_complete",
+        "expected_usable_session_ids",
+        "expected_usable_session_ids_sha256",
+        "cache_usable_session_ids",
+        "cache_usable_session_ids_sha256",
+        "cache_inventory_aggregate_sha256",
+        "annotation_only_columns",
+    }
+)
+_V3_ROOT_SESSION_ITEM_KEYS = frozenset(
+    {
+        "session_id",
+        "status",
+        "schema_version",
+        "manifest_path",
+        "manifest_sha256",
+        "manifest_content_sha256",
+        "inventory_sha256",
+        "upstream_session_content_sha256",
+        "scientific_eligible",
+    }
+)
+_V3_SESSION_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "session_id",
+        "content_sha256",
+        "config_sha256",
+        "pipeline_sha256",
+        "window_count",
+        "scientific_eligible",
+        "raw_consumed_bytes_verified",
+        "timing_adjudicated",
+        "sync_raw_replay_verified",
+        "protocol_raw_replay_verified",
+        "sync_authorized",
+        "reference_mapping_available",
+        "upstream_session_content_sha256",
+        "upstream_session_contract",
+        "upstream_sync_receipt",
+        "radar_timing_invalid_reason_schema_version",
+        "radar_timing_invalid_reason_semantics_sha256",
+        "source_fingerprint",
+        "feature_schema",
+        "feature_schema_sha256",
+        "target_firewall",
+        "target_firewall_sha256",
+        "metadata_join_contract",
+        "metadata_join_sha256",
+        "reference_support_contract",
+        "reference_support_sha256",
+        "file_inventory",
+        "inventory_sha256",
+    }
+)
+_V3_FILE_BINDING_KEYS = frozenset(
+    {"path", "sha256", "bytes", "shape", "dtype"}
+)
+_V3_REQUIRED_FILES = {
+    "maps": ("maps.npy", "float16"),
+    "aux": ("aux.npy", "float32"),
+    "metadata": ("metadata.csv", "csv"),
+    "frequencies_hz": ("frequencies_hz.npy", "float64"),
+    "radar_timing_valid_mask": ("radar_timing_valid_mask.npy", "bool"),
+    "radar_timing_invalid_reason_mask": (
+        "radar_timing_invalid_reason_mask.npy",
+        "uint8",
+    ),
+    "feature_availability_mask": ("feature_availability_mask.npy", "bool"),
+}
+
+_V3_FEATURE_SCHEMA_KEYS = frozenset(
+    {"schema_version", "maps", "aux", "availability"}
+)
+_V3_MAP_SCHEMA_KEYS = frozenset(
+    {
+        "axes",
+        "radar_names",
+        "range_feature_names",
+        "shape",
+        "dtype",
+        "frequency_grid_sha256",
+        "source_lineage",
+        "target_derived_inputs",
+    }
+)
+_V3_AUX_SCHEMA_KEYS = frozenset(
+    {
+        "axes",
+        "feature_names",
+        "feature_names_sha256",
+        "shape",
+        "dtype",
+        "source_lineage",
+        "target_derived_inputs",
+    }
+)
+_V3_AVAILABILITY_SCHEMA_KEYS = frozenset(
+    {
+        "schema_version",
+        "axes",
+        "feature_names",
+        "feature_names_sha256",
+        "shape",
+        "dtype",
+        "semantics",
+    }
+)
+_V3_TARGET_FIREWALL_KEYS = frozenset(
+    {
+        "schema_version",
+        "inference_payloads",
+        "target_derived_metadata_columns",
+        "annotation_only_columns",
+        "forbidden_inference_feature_names",
+        "radar_observable_role",
+        "target_values_used_in_inference_features",
+    }
+)
+_V3_METADATA_JOIN_KEYS = frozenset(
+    {
+        "schema_version",
+        "reference_mapping_available",
+        "mapping",
+        "mapping_sha256",
+        "protocol",
+        "protocol_sha256",
+        "biopac_sample_rate_hz",
+        "model_hz",
+        "window_duration_s",
+        "window_interval_count",
+        "window_minimum_overlap_fraction",
+        "transition_guard_s",
+        "sync_authorized",
+        "stage_metric_eligible",
+        "joined_columns",
+        "joined_rows_sha256",
+    }
+)
+_V3_TARGET_DERIVED_METADATA_COLUMNS = frozenset(
+    {
+        "rr_bpm",
+        "rr_spectral_bpm",
+        "rr_phase_bpm",
+        "rr_events_bpm",
+        "reference_valid",
+        "reference_quality",
+        "reference_sigma_bpm",
+        "spectral_concentration",
+        "periodicity",
+        "interval_cv",
+        "estimator_disagreement_bpm",
+        "phase_residual_rad",
+        "clip_fraction",
+        "guard_clip_fraction",
+        "plateau_fraction",
+        "breath_count",
+        "classical_error_bpm",
+        "radar_observable",
+        "classical_acceptable_within_2bpm",
+    }
+)
+_V3_METADATA_JOIN_COLUMNS = (
+    "session_id",
+    "identity",
+    "window_number",
+    "window_start_s",
+    "window_end_s",
+    "reference_start_sample",
+    "reference_end_sample",
+    "reference_window_start_biopac_s",
+    "reference_window_end_biopac_s",
+    "radar_window_start_relative_s",
+    "radar_window_end_relative_s",
+    "reference_mapping_available",
+    "sync_authorized",
+    "alignment_scientific_eligible",
+    "acquisition_phase",
+    "acquisition_phase_name",
+    "acquisition_phase_status",
+    "acquisition_phase_confidence",
+    "phase_overlap_fraction",
+    "transition_window",
+    "eligible_for_stage_metrics",
+    "phase7_assignment",
+    "acquisition_batch",
+)
+_V3_REFERENCE_FLOAT_NAN_COLUMNS = tuple(
+    sorted(
+        (_V3_TARGET_DERIVED_METADATA_COLUMNS - {
+            "reference_valid",
+            "radar_observable",
+            "classical_acceptable_within_2bpm",
+        })
+        | {
+            "window_start_s",
+            "window_end_s",
+            "reference_window_start_biopac_s",
+            "reference_window_end_biopac_s",
+            "sync_confidence",
+            "acquisition_phase_confidence",
+            "phase_overlap_fraction",
+        }
+    )
+)
+_V3_REFERENCE_INTEGER_MINUS_ONE_COLUMNS = (
+    "reference_start_sample",
+    "reference_end_sample",
+)
+_V3_REFERENCE_NULL_STRING_COLUMNS = (
+    "acquisition_phase",
+    "acquisition_phase_name",
+    "acquisition_phase_status",
+    "phase7_assignment",
+)
+_V3_REFERENCE_FALSE_BOOLEAN_COLUMNS = (
+    "reference_mapping_available",
+    "reference_valid",
+    "radar_observable",
+    "classical_acceptable_within_2bpm",
+    "sync_authorized",
+    "alignment_scientific_eligible",
+    "transition_window",
+    "eligible_for_stage_metrics",
+)
+
+
+@dataclass(slots=True)
+class _LoadedV3Session:
+    maps: np.ndarray
+    aux: np.ndarray
+    metadata: pd.DataFrame
+    frequencies_hz: np.ndarray
+    timing_valid_mask: np.ndarray
+    timing_reason_mask: np.ndarray
+    map_view_availability_mask: np.ndarray
+    aux_feature_availability_mask: np.ndarray
+    aux_feature_names: tuple[str, ...]
+    consumed_inventory: list[dict[str, Any]]
+    inventory_sha256: str
+    upstream_session_content_sha256: str
+    scientific_eligible: bool
+    authority_claims_complete: bool
+
+
+def _require_exact_keys(
+    document: Any,
+    expected: frozenset[str],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    observed = set(document)
+    if observed != set(expected):
+        raise ValueError(
+            f"{label} keys do not match its schema; "
+            f"missing={sorted(set(expected) - observed)}, "
+            f"extra={sorted(observed - set(expected))}"
+        )
+    return document
+
+
+def _strict_nonnegative_int(value: Any, *, location: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise ValueError(f"{location} must be an exact non-negative integer")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{location} must be an exact non-negative integer")
+    return result
+
+
+def _validate_v3_file_binding(
+    raw_binding: Any,
+    snapshot: _ConsumedFileSnapshot,
+    *,
+    logical_name: str,
+    expected_filename: str,
+    expected_dtype: str,
+    session_id: str,
+) -> tuple[tuple[int, ...], str]:
+    binding = _require_exact_keys(
+        raw_binding,
+        _V3_FILE_BINDING_KEYS,
+        label=f"version-3 file binding {session_id}/{logical_name}",
+    )
+    if binding.get("path") != expected_filename:
+        raise ValueError(
+            f"version-3 file binding path does not bind loader target: "
+            f"{session_id}/{logical_name}"
+        )
+    declared_sha = _validate_sha256(
+        binding.get("sha256"),
+        location=f"version-3 file binding {session_id}/{logical_name} SHA-256",
+    )
+    declared_bytes = _strict_nonnegative_int(
+        binding.get("bytes"),
+        location=f"version-3 file binding {session_id}/{logical_name} bytes",
+    )
+    if declared_sha != snapshot.sha256 or declared_bytes != snapshot.byte_count:
+        raise ValueError(
+            f"version-3 consumed-byte binding mismatch: {session_id}/{logical_name}"
+        )
+    shape_value = binding.get("shape")
+    if not isinstance(shape_value, list):
+        raise ValueError(f"version-3 file shape is invalid: {session_id}/{logical_name}")
+    shape = tuple(
+        _strict_nonnegative_int(
+            dimension,
+            location=f"version-3 {session_id}/{logical_name} shape dimension",
+        )
+        for dimension in shape_value
+    )
+    dtype = binding.get("dtype")
+    if dtype != expected_dtype:
+        raise ValueError(f"version-3 file dtype is invalid: {session_id}/{logical_name}")
+    return shape, str(dtype)
+
+
+def _load_owned_npy_snapshot(
+    snapshot: _ConsumedFileSnapshot,
+    *,
+    label: str,
+) -> np.ndarray:
+    snapshot.stream.seek(0)
+    try:
+        loaded = np.load(snapshot.stream, allow_pickle=False)
+    except (OSError, ValueError, EOFError) as error:
+        raise ValueError(f"cannot parse {label} from consumed bytes") from error
+    if not isinstance(loaded, np.ndarray) or loaded.dtype.hasobject:
+        raise ValueError(f"{label} must contain one non-object NPY array")
+    return np.array(loaded, copy=True, order="C", subok=False)
+
+
+def _readonly_owned(array: np.ndarray) -> np.ndarray:
+    owned = np.array(array, copy=True, order="C", subok=False)
+    owned.setflags(write=False)
+    return owned
+
+
+_V3_AUX_SCALAR_NAMES = (
+    "log_low_power",
+    "log_delta_power",
+    "log_delta_to_low_ratio",
+    "log_median_range_variance",
+    "log_q90_range_variance",
+    "range_entropy",
+    "q90_peak_probability",
+    "q98_peak_probability",
+)
+_V3_AUX_CONSENSUS_NAMES = (
+    "radar_peak_std_bpm",
+    "radar_peak_range_bpm",
+    "q90_correlation_radar_1_radar_2",
+    "q90_correlation_radar_1_radar_3",
+    "q90_correlation_radar_2_radar_3",
+)
+
+
+def _v3_aux_feature_names(frequency_bins: int) -> tuple[str, ...]:
+    if isinstance(frequency_bins, bool) or not isinstance(
+        frequency_bins, (int, np.integer)
+    ) or int(frequency_bins) < 1:
+        raise ValueError("version-3 auxiliary frequency count must be positive")
+    count = int(frequency_bins)
+    names: list[str] = []
+    for radar_id in (1, 2, 3):
+        for quantile in ("q90", "q98"):
+            names.extend(
+                f"radar_{radar_id}_{quantile}_frequency_{index:04d}"
+                for index in range(count)
+            )
+    for radar_id in (1, 2, 3):
+        names.extend(
+            f"radar_{radar_id}_{name}" for name in _V3_AUX_SCALAR_NAMES
+        )
+    names.extend(f"fused_median_frequency_{index:04d}" for index in range(count))
+    names.extend(f"fused_max_frequency_{index:04d}" for index in range(count))
+    names.extend(_V3_AUX_CONSENSUS_NAMES)
+    if len(names) != 8 * count + 29 or len(set(names)) != len(names):
+        raise RuntimeError("version-3 auxiliary feature-name derivation failed")
+    return tuple(names)
+
+
+def _v3_expected_feature_availability(
+    timing_valid: np.ndarray,
+    *,
+    auxiliary_frequency_bins: int,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], tuple[str, ...]]:
+    timing = np.asarray(timing_valid)
+    if timing.dtype != np.bool_ or timing.ndim != 3 or timing.shape[1:] != (3, 320):
+        raise ValueError("version-3 timing mask must have exact [window,3,320] support")
+    map_available = np.all(timing, axis=2)
+    frequency_bins = int(auxiliary_frequency_bins)
+    aux_names = _v3_aux_feature_names(frequency_bins)
+    aux_available = np.zeros((len(timing), len(aux_names)), dtype=np.bool_)
+    cursor = 0
+    for radar_index in range(3):
+        width = 2 * frequency_bins
+        aux_available[:, cursor : cursor + width] = map_available[
+            :, radar_index, None
+        ]
+        cursor += width
+    for radar_index in range(3):
+        width = len(_V3_AUX_SCALAR_NAMES)
+        aux_available[:, cursor : cursor + width] = map_available[
+            :, radar_index, None
+        ]
+        cursor += width
+    joint = np.all(map_available, axis=1)
+    joint_width = 2 * frequency_bins + len(_V3_AUX_CONSENSUS_NAMES)
+    aux_available[:, cursor : cursor + joint_width] = joint[:, None]
+    cursor += joint_width
+    if cursor != len(aux_names):
+        raise RuntimeError("version-3 auxiliary availability layout drifted")
+    availability_names = tuple(
+        [f"map_radar_{radar_id}" for radar_id in (1, 2, 3)]
+        + [f"aux:{name}" for name in aux_names]
+    )
+    return map_available, aux_available, aux_names, availability_names
+
+
+def _v3_metadata_scalar(value: Any, *, label: str) -> Any:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        result = float(value)
+        if not np.isfinite(result):
+            raise ValueError(f"{label} contains a non-finite value")
+        return result
+    if isinstance(value, str):
+        return value
+    raise ValueError(f"{label} contains a non-canonical scalar")
+
+
+def _v3_metadata_join_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    missing = sorted(set(_V3_METADATA_JOIN_COLUMNS) - set(frame.columns))
+    if missing:
+        raise ValueError(f"version-3 metadata join columns are missing: {missing}")
+    records: list[dict[str, Any]] = []
+    for row_index, row in frame.loc[:, _V3_METADATA_JOIN_COLUMNS].iterrows():
+        records.append(
+            {
+                column: _v3_metadata_scalar(
+                    row[column], label=f"version-3 metadata row {row_index}/{column}"
+                )
+                for column in _V3_METADATA_JOIN_COLUMNS
+            }
+        )
+    return records
+
+
+def _v3_reference_support_contract(reference_mapping_available: bool) -> dict[str, Any]:
+    if type(reference_mapping_available) is not bool:
+        raise ValueError("version-3 reference mapping availability must be boolean")
+    return {
+        "schema_version": V3_REFERENCE_SUPPORT_SCHEMA_VERSION,
+        "reference_mapping_available": reference_mapping_available,
+        "radar_support_columns": [
+            "radar_window_start_relative_s",
+            "radar_window_end_relative_s",
+        ],
+        "unavailable_float_sentinel": "nan",
+        "unavailable_float_columns": list(_V3_REFERENCE_FLOAT_NAN_COLUMNS),
+        "unavailable_integer_sentinel": -1,
+        "unavailable_integer_columns": list(
+            _V3_REFERENCE_INTEGER_MINUS_ONE_COLUMNS
+        ),
+        "unavailable_string_sentinel": None,
+        "unavailable_string_columns": list(_V3_REFERENCE_NULL_STRING_COLUMNS),
+        "unavailable_boolean_sentinel": False,
+        "unavailable_boolean_columns": list(_V3_REFERENCE_FALSE_BOOLEAN_COLUMNS),
+        "numeric_zero_never_implies_reference_availability": True,
+    }
+
+
+def _validate_v3_unmapped_reference_rows(frame: pd.DataFrame, *, session_id: str) -> None:
+    missing = sorted(
+        set(
+            _V3_REFERENCE_FLOAT_NAN_COLUMNS
+            + _V3_REFERENCE_INTEGER_MINUS_ONE_COLUMNS
+            + _V3_REFERENCE_NULL_STRING_COLUMNS
+            + _V3_REFERENCE_FALSE_BOOLEAN_COLUMNS
+            + (
+                "radar_window_start_relative_s",
+                "radar_window_end_relative_s",
+            )
+        )
+        - set(frame.columns)
+    )
+    if missing:
+        raise ValueError(
+            f"{session_id} unmapped reference sentinel columns are missing: {missing}"
+        )
+    for column in _V3_REFERENCE_FLOAT_NAN_COLUMNS:
+        values = frame[column]
+        if not pd.api.types.is_float_dtype(values.dtype) or not values.isna().all():
+            raise ValueError(
+                f"{session_id} unmapped reference column {column} must be all NaN"
+            )
+    for column in _V3_REFERENCE_INTEGER_MINUS_ONE_COLUMNS:
+        values = frame[column]
+        if (
+            not pd.api.types.is_integer_dtype(values.dtype)
+            or not np.array_equal(values.to_numpy(), np.full(len(frame), -1))
+        ):
+            raise ValueError(
+                f"{session_id} unmapped reference column {column} must be exact -1"
+            )
+    for column in _V3_REFERENCE_NULL_STRING_COLUMNS:
+        values = frame[column]
+        if not values.isna().all():
+            raise ValueError(
+                f"{session_id} unmapped reference column {column} must be null"
+            )
+    for column in _V3_REFERENCE_FALSE_BOOLEAN_COLUMNS:
+        values = {
+            _explicit_boolean(
+                value,
+                location=f"{session_id} unmapped reference column {column}",
+            )
+            for value in frame[column].unique()
+        }
+        if values != {False}:
+            raise ValueError(
+                f"{session_id} unmapped reference column {column} must be false"
+            )
+    try:
+        radar_start = pd.to_numeric(
+            frame["radar_window_start_relative_s"], errors="raise"
+        ).to_numpy(dtype=float)
+        radar_end = pd.to_numeric(
+            frame["radar_window_end_relative_s"], errors="raise"
+        ).to_numpy(dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{session_id} unmapped measured radar support is invalid"
+        ) from error
+    if not (
+        np.isfinite(radar_start).all()
+        and np.isfinite(radar_end).all()
+        and np.allclose(radar_end - radar_start, 32.0, rtol=0.0, atol=1e-12)
+        and (len(frame) < 2 or np.all(np.diff(radar_start) > 0))
+        and (len(frame) < 2 or np.all(np.diff(radar_end) > 0))
+        and len(np.unique(np.column_stack((radar_start, radar_end)), axis=0))
+        == len(frame)
+    ):
+        raise ValueError(f"{session_id} unmapped measured radar support is invalid")
+
+
+def _validate_v3_upstream_reference_evidence(
+    session_manifest: dict[str, Any],
+    *,
+    session_id: str,
+) -> tuple[bool, dict[str, Any] | None, dict[str, Any]]:
+    upstream_session = session_manifest.get("upstream_session_contract")
+    upstream_receipt = session_manifest.get("upstream_sync_receipt")
+    if not isinstance(upstream_session, dict) or not isinstance(upstream_receipt, dict):
+        raise ValueError(f"version-3 upstream reference evidence is absent: {session_id}")
+    upstream_content = str(
+        _validate_sha256(
+            upstream_session.get("content_sha256"),
+            location=f"version-3 upstream session content SHA-256 {session_id}",
+        )
+    )
+    declared_upstream_content = str(
+        _validate_sha256(
+            session_manifest.get("upstream_session_content_sha256"),
+            location=f"version-3 session upstream content SHA-256 {session_id}",
+        )
+    )
+    synchronization = upstream_session.get("synchronization")
+    receipt_result = upstream_receipt.get("result")
+    if not isinstance(synchronization, dict) or not isinstance(receipt_result, dict):
+        raise ValueError(f"version-3 upstream synchronization evidence is malformed: {session_id}")
+    receipt_content = str(
+        _validate_sha256(
+            upstream_receipt.get("content_sha256"),
+            location=f"version-3 upstream sync receipt content SHA-256 {session_id}",
+        )
+    )
+    mapping = synchronization.get("mapping")
+    if mapping is not None and not isinstance(mapping, dict):
+        raise ValueError(f"version-3 upstream mapping is malformed: {session_id}")
+    if (
+        upstream_session.get("session_id") != session_id
+        or upstream_receipt.get("session_id") != session_id
+        or upstream_content != declared_upstream_content
+        or _canonical_content_sha256(upstream_session) != upstream_content
+        or _canonical_content_sha256(upstream_receipt) != receipt_content
+        or synchronization.get("receipt_content_sha256") != receipt_content
+        or receipt_result.get("mapping") != mapping
+    ):
+        raise ValueError(f"version-3 upstream reference evidence mismatch: {session_id}")
+    available = isinstance(mapping, dict)
+    if _explicit_boolean(
+        session_manifest.get("reference_mapping_available"),
+        location=f"version-3 reference mapping availability {session_id}",
+    ) != available:
+        raise ValueError(f"version-3 cached/upstream mapping availability mismatch: {session_id}")
+    protocol = upstream_session.get("protocol")
+    if not isinstance(protocol, dict):
+        raise ValueError(f"version-3 upstream protocol is malformed: {session_id}")
+    return available, mapping, protocol
+
+
+@dataclass(frozen=True, slots=True)
+class _V3StageJoinAuthority:
+    session_id: str
+    protocol: dict[str, Any]
+    stage_metric_eligible: bool
+    window_minimum_overlap_fraction: float
+    transition_guard_s: float
+
+
+def _optional_metadata_string(value: Any) -> str | None:
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return None
+    return str(value)
+
+
+def _validate_v3_metadata_join_contract(
+    frame: pd.DataFrame,
+    *,
+    session_id: str,
+    raw_contract: Any,
+    declared_sha256: Any,
+    expected_reference_mapping_available: bool,
+    expected_mapping: dict[str, Any] | None,
+    expected_protocol: dict[str, Any],
+) -> None:
+    contract = _require_exact_keys(
+        raw_contract,
+        _V3_METADATA_JOIN_KEYS,
+        label=f"version-3 metadata join contract {session_id}",
+    )
+    declared_hash = _validate_sha256(
+        declared_sha256,
+        location=f"version-3 metadata join SHA-256 {session_id}",
+    )
+    if _canonical_sha256(contract) != declared_hash:
+        raise ValueError(f"version-3 metadata join content mismatch: {session_id}")
+    if contract.get("schema_version") != V3_METADATA_JOIN_SCHEMA_VERSION:
+        raise ValueError(f"version-3 metadata join schema mismatch: {session_id}")
+    mapping_document = contract.get("mapping")
+    protocol = contract.get("protocol")
+    reference_mapping_available = _explicit_boolean(
+        contract.get("reference_mapping_available"),
+        location=f"version-3 metadata mapping availability {session_id}",
+    )
+    if (
+        reference_mapping_available != expected_reference_mapping_available
+        or mapping_document != expected_mapping
+        or protocol != expected_protocol
+        or (mapping_document is not None and not isinstance(mapping_document, dict))
+        or not isinstance(protocol, dict)
+    ):
+        raise ValueError(f"version-3 metadata join authority is malformed: {session_id}")
+    if _canonical_sha256(mapping_document) != _validate_sha256(
+        contract.get("mapping_sha256"),
+        location=f"version-3 metadata mapping SHA-256 {session_id}",
+    ) or _canonical_sha256(protocol) != _validate_sha256(
+        contract.get("protocol_sha256"),
+        location=f"version-3 metadata protocol SHA-256 {session_id}",
+    ):
+        raise ValueError(f"version-3 metadata upstream authority hash mismatch: {session_id}")
+    mapping: TimeMapping | None = None
+    if reference_mapping_available:
+        assert isinstance(mapping_document, dict)
+        try:
+            mapping = TimeMapping.from_dict(mapping_document)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"version-3 metadata mapping is invalid: {session_id}") from error
+    if (
+        contract.get("biopac_sample_rate_hz")
+        != (250.0 if reference_mapping_available else None)
+        or contract.get("model_hz") != 10.0
+        or contract.get("window_duration_s") != 32.0
+        or contract.get("window_interval_count") != 320
+        or contract.get("sync_authorized") is not False
+        or contract.get("stage_metric_eligible") is not False
+        or contract.get("joined_columns") != list(_V3_METADATA_JOIN_COLUMNS)
+    ):
+        raise ValueError(f"version-3 metadata support contract mismatch: {session_id}")
+    minimum_overlap = contract.get("window_minimum_overlap_fraction")
+    transition_guard = contract.get("transition_guard_s")
+    if (
+        isinstance(minimum_overlap, bool)
+        or not isinstance(minimum_overlap, (int, float))
+        or not np.isfinite(float(minimum_overlap))
+        or not 0.0 <= float(minimum_overlap) <= 1.0
+        or isinstance(transition_guard, bool)
+        or not isinstance(transition_guard, (int, float))
+        or not np.isfinite(float(transition_guard))
+        or float(transition_guard) < 0.0
+    ):
+        raise ValueError(f"version-3 metadata stage policy is invalid: {session_id}")
+    records = _v3_metadata_join_records(frame)
+    if _canonical_sha256(records) != _validate_sha256(
+        contract.get("joined_rows_sha256"),
+        location=f"version-3 metadata joined rows SHA-256 {session_id}",
+    ):
+        raise ValueError(f"version-3 metadata joined-row hash mismatch: {session_id}")
+    row_mapping_values = {
+        _explicit_boolean(
+            value,
+            location=f"version-3 row mapping availability {session_id}",
+        )
+        for value in frame["reference_mapping_available"].unique()
+    }
+    if row_mapping_values != {reference_mapping_available}:
+        raise ValueError(f"version-3 row/contract mapping availability mismatch: {session_id}")
+    if not reference_mapping_available:
+        _validate_v3_unmapped_reference_rows(frame, session_id=session_id)
+        return
+
+    authority = _V3StageJoinAuthority(
+        session_id=session_id,
+        protocol=protocol,
+        stage_metric_eligible=False,
+        window_minimum_overlap_fraction=float(minimum_overlap),
+        transition_guard_s=float(transition_guard),
+    )
+    for row_index, row in frame.iterrows():
+        assert mapping is not None
+        radar_start = float(row["radar_window_start_relative_s"])
+        radar_end = float(row["radar_window_end_relative_s"])
+        reference_start = float(row["reference_window_start_biopac_s"])
+        reference_end = float(row["reference_window_end_biopac_s"])
+        if not (
+            np.isclose(radar_end - radar_start, 32.0, rtol=0.0, atol=1e-12)
+            and np.isclose(
+                float(mapping.radar_to_rsp(radar_start)),
+                reference_start,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and np.isclose(
+                float(mapping.radar_to_rsp(radar_end)),
+                reference_end,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and np.isclose(
+                float(row["window_start_s"]),
+                reference_start,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and np.isclose(
+                float(row["window_end_s"]),
+                reference_end,
+                rtol=0.0,
+                atol=1e-9,
+            )
+            and int(row["reference_start_sample"])
+            == _half_open_sample_index(reference_start, 250.0)
+            and int(row["reference_end_sample"])
+            == _half_open_sample_index(reference_end, 250.0)
+        ):
+            raise ValueError(
+                f"version-3 metadata mapping/sample support mismatch: {session_id}/{row_index}"
+            )
+        assignment = assign_stage_window(authority, reference_start, reference_end)  # type: ignore[arg-type]
+        if (
+            _optional_metadata_string(row["acquisition_phase"]) != assignment.stage_id
+            or _optional_metadata_string(row["acquisition_phase_name"])
+            != assignment.stage_name
+            or _optional_metadata_string(row["acquisition_phase_status"])
+            != assignment.stage_status
+            or _optional_metadata_string(row["phase7_assignment"])
+            != assignment.phase7_assignment
+            or _explicit_boolean(
+                row["transition_window"],
+                location=f"version-3 transition_window {session_id}/{row_index}",
+            )
+            != assignment.transition_window
+            or _explicit_boolean(
+                row["eligible_for_stage_metrics"],
+                location=f"version-3 stage eligibility {session_id}/{row_index}",
+            )
+            is not False
+            or not np.isclose(
+                float(row["phase_overlap_fraction"]),
+                assignment.overlap_fraction,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"version-3 metadata stage annotation mismatch: {session_id}/{row_index}"
+            )
+        observed_confidence = row["acquisition_phase_confidence"]
+        if assignment.stage_confidence is None:
+            confidence_matches = pd.isna(observed_confidence)
+        else:
+            confidence_matches = bool(
+                np.isclose(
+                    float(observed_confidence),
+                    assignment.stage_confidence,
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+            )
+        if not confidence_matches:
+            raise ValueError(
+                f"version-3 metadata stage confidence mismatch: {session_id}/{row_index}"
+            )
+
+
+def _validate_v3_feature_and_firewall_contracts(
+    *,
+    session_id: str,
+    session_manifest: dict[str, Any],
+    maps: np.ndarray,
+    aux: np.ndarray,
+    frequencies: np.ndarray,
+    timing_valid: np.ndarray,
+    feature_availability: np.ndarray,
+    metadata: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    feature_schema = _require_exact_keys(
+        session_manifest.get("feature_schema"),
+        _V3_FEATURE_SCHEMA_KEYS,
+        label=f"version-3 feature schema {session_id}",
+    )
+    if feature_schema.get("schema_version") != V3_INFERENCE_FEATURE_SCHEMA_VERSION:
+        raise ValueError(f"version-3 inference feature schema mismatch: {session_id}")
+    if _canonical_sha256(feature_schema) != _validate_sha256(
+        session_manifest.get("feature_schema_sha256"),
+        location=f"version-3 feature schema SHA-256 {session_id}",
+    ):
+        raise ValueError(f"version-3 inference feature schema hash mismatch: {session_id}")
+    maps_schema = _require_exact_keys(
+        feature_schema.get("maps"),
+        _V3_MAP_SCHEMA_KEYS,
+        label=f"version-3 maps schema {session_id}",
+    )
+    aux_schema = _require_exact_keys(
+        feature_schema.get("aux"),
+        _V3_AUX_SCHEMA_KEYS,
+        label=f"version-3 aux schema {session_id}",
+    )
+    availability_schema = _require_exact_keys(
+        feature_schema.get("availability"),
+        _V3_AVAILABILITY_SCHEMA_KEYS,
+        label=f"version-3 availability schema {session_id}",
+    )
+    if (
+        maps.ndim != 4
+        or maps.shape[1] != 3
+        or maps.shape[3] != 182
+        or maps_schema.get("axes")
+        != ["window", "radar_view", "frequency", "range_feature"]
+        or maps_schema.get("radar_names") != ["radar_1", "radar_2", "radar_3"]
+        or maps_schema.get("range_feature_names")
+        != list(V3_MAP_RANGE_FEATURE_NAMES)
+        or maps_schema.get("shape") != list(maps.shape)
+        or maps_schema.get("dtype") != "float16"
+        or maps_schema.get("source_lineage")
+        != V3_MAP_SOURCE_LINEAGE
+        or maps_schema.get("target_derived_inputs") is not False
+        or maps_schema.get("frequency_grid_sha256")
+        != canonical_ndarray_sha256(frequencies)
+    ):
+        raise ValueError(f"version-3 maps feature schema mismatch: {session_id}")
+    if aux.ndim != 2 or aux.shape[1] < 37 or (aux.shape[1] - 29) % 8:
+        raise ValueError(f"version-3 auxiliary layout is invalid: {session_id}")
+    auxiliary_frequency_bins = (aux.shape[1] - 29) // 8
+    if auxiliary_frequency_bins not in {
+        2 * maps.shape[2],
+        2 * maps.shape[2] + 1,
+    }:
+        raise ValueError(f"version-3 map/aux frequency geometry mismatch: {session_id}")
+    (
+        expected_map_available,
+        expected_aux_available,
+        expected_aux_names,
+        expected_availability_names,
+    ) = _v3_expected_feature_availability(
+        timing_valid,
+        auxiliary_frequency_bins=auxiliary_frequency_bins,
+    )
+    if (
+        aux_schema.get("axes") != ["window", "feature"]
+        or aux_schema.get("feature_names") != list(expected_aux_names)
+        or aux_schema.get("feature_names_sha256")
+        != _canonical_sha256(list(expected_aux_names))
+        or aux_schema.get("shape") != list(aux.shape)
+        or aux_schema.get("dtype") != "float32"
+        or aux_schema.get("source_lineage")
+        != "radar_only_causal_auxiliary_spectra_statistics"
+        or aux_schema.get("target_derived_inputs") is not False
+    ):
+        raise ValueError(f"version-3 auxiliary feature schema mismatch: {session_id}")
+    expected_availability = np.concatenate(
+        (expected_map_available, expected_aux_available), axis=1
+    )
+    if (
+        feature_availability.dtype != np.bool_
+        or not np.array_equal(feature_availability, expected_availability)
+        or availability_schema.get("schema_version")
+        != V3_FEATURE_AVAILABILITY_SCHEMA_VERSION
+        or availability_schema.get("axes") != ["window", "feature"]
+        or availability_schema.get("feature_names")
+        != list(expected_availability_names)
+        or availability_schema.get("feature_names_sha256")
+        != _canonical_sha256(list(expected_availability_names))
+        or availability_schema.get("shape") != list(feature_availability.shape)
+        or availability_schema.get("dtype") != "bool"
+        or availability_schema.get("semantics")
+        != (
+            "first three cells authorize complete map radar views; remaining "
+            "cells explicitly authorize aux columns; numeric zero never implies availability"
+        )
+    ):
+        raise ValueError(f"version-3 feature availability contract mismatch: {session_id}")
+
+    unavailable_maps = maps[~expected_map_available]
+    unavailable_aux = aux[~expected_aux_available]
+    if (
+        np.any(unavailable_maps != 0)
+        or np.any(np.signbit(unavailable_maps))
+        or np.any(unavailable_aux != 0)
+        or np.any(np.signbit(unavailable_aux))
+    ):
+        raise ValueError(f"version-3 unavailable inference cells are not exact +0.0: {session_id}")
+    if not np.isfinite(maps).all() or not np.isfinite(aux).all():
+        raise ValueError(f"version-3 inference features contain non-finite values: {session_id}")
+
+    firewall = _require_exact_keys(
+        session_manifest.get("target_firewall"),
+        _V3_TARGET_FIREWALL_KEYS,
+        label=f"version-3 target firewall {session_id}",
+    )
+    if _canonical_sha256(firewall) != _validate_sha256(
+        session_manifest.get("target_firewall_sha256"),
+        location=f"version-3 target firewall SHA-256 {session_id}",
+    ):
+        raise ValueError(f"version-3 target firewall hash mismatch: {session_id}")
+    forbidden = sorted(
+        _V3_TARGET_DERIVED_METADATA_COLUMNS
+        | V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS
+    )
+    inference_names = set(expected_aux_names) | set(expected_availability_names)
+    if (
+        firewall.get("schema_version") != V3_TARGET_FIREWALL_SCHEMA_VERSION
+        or firewall.get("inference_payloads")
+        != ["maps", "aux", "feature_availability_mask", "frequencies_hz"]
+        or firewall.get("target_derived_metadata_columns")
+        != sorted(_V3_TARGET_DERIVED_METADATA_COLUMNS)
+        or firewall.get("annotation_only_columns")
+        != sorted(V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS)
+        or firewall.get("forbidden_inference_feature_names") != forbidden
+        or firewall.get("radar_observable_role")
+        != "target_derived_metadata_only_forbidden_at_inference"
+        or firewall.get("target_values_used_in_inference_features") is not False
+        or inference_names.intersection(forbidden)
+        or not _V3_TARGET_DERIVED_METADATA_COLUMNS <= set(metadata.columns)
+    ):
+        raise ValueError(f"version-3 target firewall contract mismatch: {session_id}")
+    reference_valid = np.asarray(
+        [
+            _explicit_boolean(
+                value,
+                location=f"version-3 reference_valid {session_id}",
+            )
+            for value in metadata["reference_valid"].to_numpy()
+        ],
+        dtype=np.bool_,
+    )
+    observable = np.asarray(
+        [
+            _explicit_boolean(
+                value,
+                location=f"version-3 radar_observable {session_id}",
+            )
+            for value in metadata["radar_observable"].to_numpy()
+        ],
+        dtype=np.bool_,
+    )
+    classical_acceptable = np.asarray(
+        [
+            _explicit_boolean(
+                value,
+                location=f"version-3 classical acceptable {session_id}",
+            )
+            for value in metadata["classical_acceptable_within_2bpm"].to_numpy()
+        ],
+        dtype=np.bool_,
+    )
+    rr = pd.to_numeric(metadata["rr_bpm"], errors="coerce").to_numpy(dtype=float)
+    classical = pd.to_numeric(
+        metadata["classical_rr_bpm"], errors="coerce"
+    ).to_numpy(dtype=float)
+    expected_observable = reference_valid & np.isfinite(rr) & np.isfinite(classical) & (
+        np.abs(classical - rr) <= 2.0
+    )
+    if (
+        reference_valid.any()
+        or not np.array_equal(observable, expected_observable)
+        or not np.array_equal(classical_acceptable, expected_observable)
+    ):
+        raise ValueError(f"version-3 diagnostic target firewall row mismatch: {session_id}")
+    return expected_map_available, expected_aux_available, expected_aux_names
+
+
+def _validate_v3_metadata_frame(
+    frame: pd.DataFrame,
+    *,
+    session_id: str,
+    session_manifest: dict[str, Any],
+    session_scientific_eligible: bool,
+    sync_authorized: bool,
+) -> None:
+    reference_mapping_available = _explicit_boolean(
+        session_manifest.get("reference_mapping_available"),
+        location=f"version-3 reference mapping availability {session_id}",
+    )
+    if reference_mapping_available:
+        _validate_acquisition_metadata(
+            frame,
+            session_id=session_id,
+            session_scientific_eligible=session_scientific_eligible,
+            synchronization_authorized=sync_authorized,
+        )
+    else:
+        missing_annotations = sorted(
+            V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS - set(frame.columns)
+        )
+        if missing_annotations:
+            raise ValueError(
+                f"acquisition metadata columns missing in {session_id}: "
+                f"{missing_annotations}"
+            )
+        if frame.empty or set(frame["session_id"].dropna().astype(str)) != {session_id}:
+            raise ValueError(f"version-3 unmapped metadata/session mismatch: {session_id}")
+        if session_scientific_eligible or sync_authorized:
+            raise ValueError(
+                f"version-3 unmapped session cannot claim scientific/sync authority: {session_id}"
+            )
+        _validate_v3_unmapped_reference_rows(frame, session_id=session_id)
+        batch = frame["acquisition_batch"]
+        if batch.isna().any() or not batch.astype(str).str.strip().ne("").all():
+            raise ValueError(
+                f"version-3 unmapped acquisition_batch is blank: {session_id}"
+            )
+    required = {"identity", "window_number"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"version-3 metadata bound columns missing in {session_id}: {missing}")
+    try:
+        expected_identity = identity_for_session(session_id)
+    except ValueError as error:
+        raise ValueError(f"unknown canonical session identity: {session_id}") from error
+    identities = frame["identity"]
+    if identities.isna().any() or set(identities.astype(str)) != {expected_identity}:
+        raise ValueError(f"canonical physical identity mismatch in {session_id}")
+    raw_windows = pd.to_numeric(frame["window_number"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    if not (
+        np.isfinite(raw_windows).all()
+        and np.equal(raw_windows, np.rint(raw_windows)).all()
+        and np.array_equal(
+            raw_windows.astype(np.int64), np.arange(len(frame), dtype=np.int64)
+        )
+    ):
+        raise ValueError(
+            f"window_number must be unique, ordered, and consecutive in {session_id}"
+        )
+    window_count = _strict_nonnegative_int(
+        session_manifest.get("window_count"),
+        location=f"version-3 session {session_id} window_count",
+    )
+    if window_count != len(frame):
+        raise ValueError(f"version-3 session window_count mismatch: {session_id}")
+
+
+def _v3_upstream_reconstruction_is_independently_verified(
+    *,
+    reconstruction: dict[str, Any],
+    reconstruction_manifest_sha256: str,
+    reconstruction_content_sha256: str,
+    session_content_bindings: dict[str, str],
+) -> bool:
+    """Terminal integration hook for a separately governed V3 verifier.
+
+    Local flags and self-hashes cannot establish raw replay authority.  A
+    future externally governed source generation must replace this terminal
+    false hook with signature/trust-root verification over these exact
+    consumed bindings.  Tests may monkeypatch it only to exercise containment
+    after all structural and byte-level gates pass.
+    """
+
+    del (
+        reconstruction,
+        reconstruction_manifest_sha256,
+        reconstruction_content_sha256,
+        session_content_bindings,
+    )
+    return False
+
+
+def _load_v3_session_from_pinned_directory(
+    root_fd: int,
+    root_item: dict[str, Any],
+    *,
+    root_config_sha256: str,
+    root_pipeline_sha256: str,
+) -> _LoadedV3Session:
+    session_id = _safe_leaf_name(
+        root_item.get("session_id"), label="version-3 session_id"
+    )
+    session_fd, directory_fingerprint = _open_child_directory_nofollow(
+        root_fd,
+        session_id,
+        label=f"version-3 session root {session_id}",
+    )
+    entry_fingerprints: dict[str, tuple[int, ...]] = {}
+    consumed_inventory: list[dict[str, Any]] = []
+    try:
+        session_manifest, manifest_snapshot = _snapshot_json_at(
+            session_fd,
+            "manifest.json",
+            label=f"version-3 session manifest {session_id}",
+        )
+        try:
+            entry_fingerprints["manifest.json"] = manifest_snapshot.source_stat
+            consumed_inventory.append(
+                _consumed_inventory_record(
+                    f"{session_id}/manifest.json", manifest_snapshot
+                )
+            )
+            declared_manifest_sha = _validate_sha256(
+                root_item.get("manifest_sha256"),
+                location=f"version-3 root item {session_id} manifest_sha256",
+            )
+            if declared_manifest_sha != manifest_snapshot.sha256:
+                raise ValueError(
+                    f"version-3 consumed session manifest SHA-256 mismatch: {session_id}"
+                )
+        finally:
+            manifest_snapshot.close()
+
+        _require_exact_keys(
+            session_manifest,
+            _V3_SESSION_MANIFEST_KEYS,
+            label=f"version-3 session manifest {session_id}",
+        )
+        if session_manifest.get("schema_version") != (
+            ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3
+        ) or root_item.get("schema_version") != (
+            ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3
+        ):
+            raise ValueError(f"version-3 session schema mismatch: {session_id}")
+        if session_manifest.get("session_id") != session_id:
+            raise ValueError(f"version-3 session ID mismatch: {session_id}")
+        if root_item.get("manifest_path") != f"{session_id}/manifest.json":
+            raise ValueError(f"version-3 session manifest path is not contained: {session_id}")
+        declared_content = _validate_sha256(
+            session_manifest.get("content_sha256"),
+            location=f"version-3 session {session_id} content_sha256",
+        )
+        root_content = _validate_sha256(
+            root_item.get("manifest_content_sha256"),
+            location=f"version-3 root item {session_id} manifest content SHA-256",
+        )
+        if (
+            declared_content != root_content
+            or _canonical_content_sha256(session_manifest) != declared_content
+        ):
+            raise ValueError(f"version-3 session canonical content mismatch: {session_id}")
+        if session_manifest.get("config_sha256") != root_config_sha256:
+            raise ValueError(f"version-3 root/session config SHA-256 mismatch: {session_id}")
+        if session_manifest.get("pipeline_sha256") != root_pipeline_sha256:
+            raise ValueError(f"version-3 root/session pipeline SHA-256 mismatch: {session_id}")
+
+        session_eligible = _explicit_boolean(
+            session_manifest.get("scientific_eligible"),
+            location=f"version-3 session {session_id} scientific_eligible",
+        )
+        if _explicit_boolean(
+            root_item.get("scientific_eligible"),
+            location=f"version-3 root item {session_id} scientific_eligible",
+        ) != session_eligible:
+            raise ValueError(f"version-3 root/session eligibility mismatch: {session_id}")
+        claim_names = (
+            "raw_consumed_bytes_verified",
+            "timing_adjudicated",
+            "sync_raw_replay_verified",
+            "protocol_raw_replay_verified",
+            "sync_authorized",
+        )
+        authority_claims = {
+            name: _explicit_boolean(
+                session_manifest.get(name),
+                location=f"version-3 session {session_id} {name}",
+            )
+            for name in claim_names
+        }
+        authority_claims_complete = all(authority_claims.values())
+        if session_eligible and not authority_claims_complete:
+            raise ValueError(
+                f"version-3 eligible session lacks upstream authority: {session_id}"
+            )
+        upstream_session_hash = str(
+            _validate_sha256(
+                session_manifest.get("upstream_session_content_sha256"),
+                location=f"version-3 session {session_id} upstream content SHA-256",
+            )
+        )
+        if root_item.get("upstream_session_content_sha256") != upstream_session_hash:
+            raise ValueError(
+                f"version-3 root/session upstream hash mismatch: {session_id}"
+            )
+        (
+            reference_mapping_available,
+            upstream_mapping,
+            upstream_protocol,
+        ) = _validate_v3_upstream_reference_evidence(
+            session_manifest,
+            session_id=session_id,
+        )
+        reference_support_contract = session_manifest.get(
+            "reference_support_contract"
+        )
+        expected_reference_support = _v3_reference_support_contract(
+            reference_mapping_available
+        )
+        if (
+            reference_support_contract != expected_reference_support
+            or _canonical_sha256(reference_support_contract)
+            != _validate_sha256(
+                session_manifest.get("reference_support_sha256"),
+                location=(
+                    f"version-3 reference support SHA-256 {session_id}"
+                ),
+            )
+        ):
+            raise ValueError(
+                f"version-3 reference support contract mismatch: {session_id}"
+            )
+        if session_manifest.get("radar_timing_invalid_reason_schema_version") != (
+            CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1
+        ):
+            raise ValueError(f"version-3 timing reason schema mismatch: {session_id}")
+        if session_manifest.get(
+            "radar_timing_invalid_reason_semantics_sha256"
+        ) != CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1:
+            raise ValueError(f"version-3 timing reason semantics mismatch: {session_id}")
+
+        inventory = session_manifest.get("file_inventory")
+        if not isinstance(inventory, dict) or set(inventory) != set(_V3_REQUIRED_FILES):
+            raise ValueError(f"version-3 file inventory is incomplete: {session_id}")
+        inventory_sha = str(
+            _validate_sha256(
+                session_manifest.get("inventory_sha256"),
+                location=f"version-3 session {session_id} inventory_sha256",
+            )
+        )
+        if _canonical_sha256(inventory) != inventory_sha:
+            raise ValueError(f"version-3 inventory canonical hash mismatch: {session_id}")
+        if root_item.get("inventory_sha256") != inventory_sha:
+            raise ValueError(f"version-3 root/session inventory hash mismatch: {session_id}")
+
+        arrays: dict[str, np.ndarray] = {}
+        frame: pd.DataFrame | None = None
+        for logical_name, (filename, expected_dtype) in _V3_REQUIRED_FILES.items():
+            snapshot = _snapshot_regular_file_at(
+                session_fd,
+                filename,
+                label=f"version-3 payload {session_id}/{logical_name}",
+            )
+            try:
+                entry_fingerprints[filename] = snapshot.source_stat
+                consumed_inventory.append(
+                    _consumed_inventory_record(f"{session_id}/{filename}", snapshot)
+                )
+                declared_shape, _ = _validate_v3_file_binding(
+                    inventory.get(logical_name),
+                    snapshot,
+                    logical_name=logical_name,
+                    expected_filename=filename,
+                    expected_dtype=expected_dtype,
+                    session_id=session_id,
+                )
+                if logical_name == "metadata":
+                    snapshot.stream.seek(0)
+                    try:
+                        observed_frame = pd.read_csv(
+                            snapshot.stream,
+                            keep_default_na=False,
+                            na_values=[""],
+                        )
+                    except (OSError, ValueError, UnicodeDecodeError) as error:
+                        raise ValueError(
+                            f"cannot parse version-3 metadata from consumed bytes: {session_id}"
+                        ) from error
+                    if tuple(observed_frame.shape) != declared_shape:
+                        raise ValueError(
+                            f"version-3 consumed metadata shape mismatch: {session_id}"
+                        )
+                    frame = observed_frame.copy(deep=True)
+                else:
+                    observed_array = _load_owned_npy_snapshot(
+                        snapshot,
+                        label=f"version-3 payload {session_id}/{logical_name}",
+                    )
+                    if tuple(observed_array.shape) != declared_shape:
+                        raise ValueError(
+                            f"version-3 consumed array shape mismatch: "
+                            f"{session_id}/{logical_name}"
+                        )
+                    if str(observed_array.dtype) != expected_dtype:
+                        raise ValueError(
+                            f"version-3 consumed array dtype mismatch: "
+                            f"{session_id}/{logical_name}"
+                        )
+                    arrays[logical_name] = observed_array
+            finally:
+                snapshot.close()
+
+        if frame is None or set(arrays) != set(_V3_REQUIRED_FILES) - {"metadata"}:
+            raise ValueError(f"version-3 session payload set is incomplete: {session_id}")
+        maps = arrays["maps"]
+        aux = arrays["aux"]
+        frequencies = arrays["frequencies_hz"]
+        timing_valid = arrays["radar_timing_valid_mask"]
+        timing_reasons = arrays["radar_timing_invalid_reason_mask"]
+        feature_availability = arrays["feature_availability_mask"]
+        if (
+            maps.ndim != 4
+            or maps.shape[1] != 3
+            or aux.ndim != 2
+            or frequencies.ndim != 1
+            or timing_valid.ndim != 3
+            or timing_valid.shape[1:] != (3, 320)
+            or timing_reasons.shape != timing_valid.shape
+            or feature_availability.ndim != 2
+            or len(maps) != len(aux)
+            or len(maps) != len(frame)
+            or len(maps) != len(timing_valid)
+            or len(maps) != len(feature_availability)
+            or maps.shape[2] != len(frequencies)
+        ):
+            raise ValueError(f"version-3 cache payload shape relation failed: {session_id}")
+        if not (
+            np.isfinite(maps).all()
+            and np.isfinite(aux).all()
+            and np.isfinite(frequencies).all()
+            and (np.diff(frequencies) > 0).all()
+        ):
+            raise ValueError(f"version-3 cache payload contains invalid numeric data: {session_id}")
+        unknown_reason_bits = np.bitwise_and(timing_reasons, np.uint8(0xE0))
+        if np.any(unknown_reason_bits != 0) or not np.array_equal(
+            timing_reasons != 0, ~timing_valid
+        ):
+            raise ValueError(f"version-3 timing reason union mismatch: {session_id}")
+        _validate_v3_metadata_frame(
+            frame,
+            session_id=session_id,
+            session_manifest=session_manifest,
+            session_scientific_eligible=session_eligible,
+            sync_authorized=authority_claims["sync_authorized"],
+        )
+        _validate_sha256(
+            session_manifest.get("source_fingerprint"),
+            location=f"version-3 source fingerprint {session_id}",
+        )
+        _validate_v3_metadata_join_contract(
+            frame,
+            session_id=session_id,
+            raw_contract=session_manifest.get("metadata_join_contract"),
+            declared_sha256=session_manifest.get("metadata_join_sha256"),
+            expected_reference_mapping_available=reference_mapping_available,
+            expected_mapping=upstream_mapping,
+            expected_protocol=upstream_protocol,
+        )
+        (
+            map_view_available,
+            aux_feature_available,
+            aux_feature_names,
+        ) = _validate_v3_feature_and_firewall_contracts(
+            session_id=session_id,
+            session_manifest=session_manifest,
+            maps=maps,
+            aux=aux,
+            frequencies=frequencies,
+            timing_valid=timing_valid,
+            feature_availability=feature_availability,
+            metadata=frame,
+        )
+
+        for filename, fingerprint in entry_fingerprints.items():
+            _assert_regular_entry_still_bound(
+                session_fd,
+                filename,
+                fingerprint,
+                label=f"version-3 session entry {session_id}/{filename}",
+            )
+        _assert_child_directory_still_bound(
+            root_fd,
+            session_id,
+            directory_fingerprint,
+            label=f"version-3 session root {session_id}",
+        )
+        return _LoadedV3Session(
+            maps=_readonly_owned(maps),
+            aux=_readonly_owned(aux),
+            metadata=frame,
+            frequencies_hz=_readonly_owned(frequencies),
+            timing_valid_mask=_readonly_owned(timing_valid),
+            timing_reason_mask=_readonly_owned(timing_reasons),
+            map_view_availability_mask=_readonly_owned(map_view_available),
+            aux_feature_availability_mask=_readonly_owned(aux_feature_available),
+            aux_feature_names=aux_feature_names,
+            consumed_inventory=consumed_inventory,
+            inventory_sha256=inventory_sha,
+            upstream_session_content_sha256=upstream_session_hash,
+            scientific_eligible=session_eligible,
+            authority_claims_complete=authority_claims_complete,
+        )
+    finally:
+        os.close(session_fd)
+
+
+def _load_feature_cache_v3(
+    root: Path,
+    *,
+    sessions: list[str] | None,
+    mmap: bool,
+    require_scientific_eligible: bool,
+) -> FeatureCache:
+    """Load V3 only from descriptor-pinned, exact consumed-byte snapshots."""
+
+    # Reject before opening any session/payload descriptor.  V3 scientific
+    # authority requires owned arrays detached from mutable cache inodes.
+    if mmap:
+        raise ValueError("version-3 acquisition caches forbid mmap=True")
+    if sessions is not None and require_scientific_eligible:
+        raise ValueError(
+            "scientific cache loading forbids any sessions filter; load the "
+            "verified full-cohort catalogue"
+        )
+
+    root_fd, root_absolute = _open_directory_path_nofollow(
+        root, label="version-3 cache root"
+    )
+    root_directory_fingerprint = _stable_stat_fingerprint(os.fstat(root_fd))
+    try:
+        root_manifest, root_snapshot = _snapshot_json_at(
+            root_fd,
+            "manifest.json",
+            label="version-3 feature cache root manifest",
+        )
+        try:
+            root_manifest_sha256 = root_snapshot.sha256
+            root_manifest_fingerprint = root_snapshot.source_stat
+        finally:
+            root_snapshot.close()
+        _require_exact_keys(
+            root_manifest,
+            _V3_ROOT_MANIFEST_KEYS,
+            label="version-3 feature cache root manifest",
+        )
+        if root_manifest.get("schema_version") != (
+            ACQUISITION_CACHE_ROOT_SCHEMA_VERSION_V3
+        ):
+            raise ValueError("version-3 feature cache root schema mismatch")
+        root_content_sha256 = str(
+            _validate_sha256(
+                root_manifest.get("content_sha256"),
+                location="version-3 feature cache root content_sha256",
+            )
+        )
+        if _canonical_content_sha256(root_manifest) != root_content_sha256:
+            raise ValueError("version-3 feature cache root canonical content mismatch")
+        root_config_sha256 = str(
+            _validate_sha256(
+                root_manifest.get("config_sha256"),
+                location="version-3 feature cache config_sha256",
+            )
+        )
+        root_pipeline_sha256 = str(
+            _validate_sha256(
+                root_manifest.get("pipeline_sha256"),
+                location="version-3 feature cache pipeline_sha256",
+            )
+        )
+        root_contract = _require_exact_keys(
+            root_manifest.get("acquisition_contract"),
+            _V3_ROOT_CONTRACT_KEYS,
+            label="version-3 root acquisition contract",
+        )
+        if root_contract.get("schema_version") != ACQUISITION_CACHE_SCHEMA_VERSION_V3:
+            raise ValueError("version-3 root acquisition schema mismatch")
+        if root_contract.get("upstream_reconstruction_schema_version") != (
+            ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3
+        ):
+            raise ValueError("version-3 upstream reconstruction schema binding mismatch")
+        for key in (
+            "reconstruction_content_sha256",
+            "cohort_authority_sha256",
+            "cohort_authority_content_sha256",
+            "expected_usable_session_ids_sha256",
+            "cache_usable_session_ids_sha256",
+        ):
+            _validate_sha256(
+                root_contract.get(key),
+                location=f"version-3 root acquisition contract {key}",
+            )
+        _annotation_columns(
+            root_contract.get("annotation_only_columns"),
+            location="version-3 root annotation_only_columns",
+            expected_columns=V3_REQUIRED_ACQUISITION_ANNOTATION_COLUMNS,
+        )
+        mode = root_contract.get("mode")
+        if mode not in {"strict", "diagnostic"}:
+            raise ValueError("version-3 cache mode must be strict or diagnostic")
+        root_eligible = _explicit_boolean(
+            root_contract.get("scientific_eligible"),
+            location="version-3 root scientific_eligible",
+        )
+        subjects_filter_applied = _explicit_boolean(
+            root_contract.get("subjects_filter_applied"),
+            location="version-3 root subjects_filter_applied",
+        )
+        full_cohort_complete = _explicit_boolean(
+            root_contract.get("full_cohort_complete"),
+            location="version-3 root full_cohort_complete",
+        )
+        selection_scope = root_contract.get("selection_scope")
+        if selection_scope not in {"full_cohort", "diagnostic_subset"}:
+            raise ValueError("version-3 cache selection_scope is invalid")
+        if root_eligible and (
+            mode != "strict"
+            or subjects_filter_applied
+            or not full_cohort_complete
+            or selection_scope != "full_cohort"
+        ):
+            raise ValueError("version-3 scientific root has incomplete cohort claims")
+
+        raw_items = root_manifest.get("sessions")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("version-3 root sessions must be a non-empty list")
+        root_items: list[dict[str, Any]] = []
+        for raw_item in raw_items:
+            item = _require_exact_keys(
+                raw_item,
+                _V3_ROOT_SESSION_ITEM_KEYS,
+                label="version-3 root session item",
+            )
+            session_id = _safe_leaf_name(
+                item.get("session_id"), label="version-3 root session_id"
+            )
+            if item.get("status") != "ok":
+                raise ValueError(f"version-3 cache session is not usable: {session_id}")
+            if item.get("schema_version") != ACQUISITION_CACHE_SESSION_SCHEMA_VERSION_V3:
+                raise ValueError(f"version-3 root session schema mismatch: {session_id}")
+            for key in (
+                "manifest_sha256",
+                "manifest_content_sha256",
+                "inventory_sha256",
+                "upstream_session_content_sha256",
+            ):
+                _validate_sha256(
+                    item.get(key),
+                    location=f"version-3 root item {session_id} {key}",
+                )
+            if item.get("manifest_path") != f"{session_id}/manifest.json":
+                raise ValueError(
+                    f"version-3 root session manifest path is not contained: {session_id}"
+                )
+            item_eligible = _explicit_boolean(
+                item.get("scientific_eligible"),
+                location=f"version-3 root item {session_id} scientific_eligible",
+            )
+            if item_eligible != root_eligible:
+                raise ValueError(f"version-3 root/session claim mismatch: {session_id}")
+            root_items.append(item)
+        available = [str(item["session_id"]) for item in root_items]
+        if len(set(available)) != len(available):
+            raise ValueError("version-3 root contains duplicate session IDs")
+
+        expected_ids = _unique_string_list(
+            root_contract.get("expected_usable_session_ids"),
+            location="version-3 expected usable session IDs",
+        )
+        cache_ids = _unique_string_list(
+            root_contract.get("cache_usable_session_ids"),
+            location="version-3 cache usable session IDs",
+        )
+        for session_id in (*expected_ids, *cache_ids):
+            _safe_leaf_name(session_id, label="version-3 declared session ID")
+        if _session_ids_sha256(expected_ids) != root_contract.get(
+            "expected_usable_session_ids_sha256"
+        ):
+            raise ValueError("version-3 expected usable session ID hash mismatch")
+        if _session_ids_sha256(cache_ids) != root_contract.get(
+            "cache_usable_session_ids_sha256"
+        ):
+            raise ValueError("version-3 cache usable session ID hash mismatch")
+        if cache_ids != available:
+            raise ValueError("version-3 cache catalogue/session ID mismatch")
+        inventory_bindings = {
+            str(item["session_id"]): str(item["inventory_sha256"])
+            for item in root_items
+        }
+        declared_inventory_aggregate = _validate_sha256(
+            root_contract.get("cache_inventory_aggregate_sha256"),
+            location="version-3 cache inventory aggregate SHA-256",
+        )
+        if _canonical_sha256(inventory_bindings) != declared_inventory_aggregate:
+            raise ValueError("version-3 cache inventory aggregate mismatch")
+
+        selected = available if sessions is None else list(sessions)
+        if not selected:
+            raise ValueError("version-3 cache contains no selected sessions")
+        if any(not isinstance(item, str) for item in selected):
+            raise ValueError("requested sessions must be strings")
+        if len(set(selected)) != len(selected):
+            raise ValueError("requested sessions must not contain duplicates")
+        missing = sorted(set(selected) - set(available))
+        if missing:
+            raise KeyError(f"sessions not present in cache: {missing}")
+
+        reconstruction_leaf = _safe_leaf_name(
+            root_contract.get("reconstruction_manifest"),
+            label="version-3 reconstruction manifest",
+        )
+        reconstruction, reconstruction_snapshot = _snapshot_json_at(
+            root_fd,
+            reconstruction_leaf,
+            label="version-3 upstream reconstruction manifest",
+        )
+        consumed_inventory = [
+            _consumed_inventory_record(reconstruction_leaf, reconstruction_snapshot)
+        ]
+        reconstruction_fingerprint = reconstruction_snapshot.source_stat
+        try:
+            declared_reconstruction_file_sha = _validate_sha256(
+                root_contract.get("reconstruction_manifest_sha256"),
+                location="version-3 reconstruction manifest SHA-256",
+            )
+            declared_reconstruction_bytes = _strict_nonnegative_int(
+                root_contract.get("reconstruction_manifest_bytes"),
+                location="version-3 reconstruction manifest bytes",
+            )
+            if (
+                reconstruction_snapshot.sha256 != declared_reconstruction_file_sha
+                or reconstruction_snapshot.byte_count != declared_reconstruction_bytes
+            ):
+                raise ValueError("version-3 reconstruction consumed-byte mismatch")
+        finally:
+            reconstruction_snapshot.close()
+        if reconstruction.get("schema_version") != (
+            ACQUISITION_RECONSTRUCTION_SCHEMA_VERSION_V3
+        ):
+            raise ValueError("version-3 reconstruction schema mismatch")
+        reconstruction_content_sha256 = str(
+            _validate_sha256(
+                reconstruction.get("content_sha256"),
+                location="version-3 reconstruction content_sha256",
+            )
+        )
+        if (
+            reconstruction_content_sha256
+            != root_contract.get("reconstruction_content_sha256")
+            or _canonical_content_sha256(reconstruction)
+            != reconstruction_content_sha256
+        ):
+            raise ValueError("version-3 reconstruction canonical content mismatch")
+
+        reconstruction_expected_usable = _unique_string_list(
+            reconstruction.get("expected_usable_session_ids"),
+            location="version-3 reconstruction expected usable session IDs",
+        )
+        reconstruction_expected_all = _unique_string_list(
+            reconstruction.get("expected_session_ids"),
+            location="version-3 reconstruction expected session IDs",
+        )
+        reconstruction_selected = _unique_string_list(
+            reconstruction.get("selected_session_ids"),
+            location="version-3 reconstruction selected session IDs",
+        )
+        canonical_all_session_ids = list(SESSION_IDENTITY)
+        canonical_usable_session_ids = [
+            session_id
+            for session_id in canonical_all_session_ids
+            if session_id != "S24_KHJ"
+        ]
+        if (
+            reconstruction_expected_usable != expected_ids
+            or reconstruction_expected_all != canonical_all_session_ids
+            or reconstruction_expected_usable != canonical_usable_session_ids
+            or reconstruction_selected != reconstruction_expected_all
+            or root_contract.get("cohort_authority_content_sha256")
+            != ACQUISITION_COHORT_V1_CONTENT_SHA256
+            or reconstruction.get("expected_usable_session_ids_sha256")
+            != _session_ids_sha256(reconstruction_expected_usable)
+            or reconstruction.get("expected_session_ids_sha256")
+            != _session_ids_sha256(reconstruction_expected_all)
+            or reconstruction.get("selected_session_ids_sha256")
+            != _session_ids_sha256(reconstruction_selected)
+        ):
+            raise ValueError(
+                "version-3 reconstruction must bind the exact full 30-session cohort"
+            )
+        reconstruction_claim_names = (
+            "execution_complete",
+            "complete",
+            "full_cohort_complete",
+            "scientific_eligible",
+            "raw_consumed_bytes_verified",
+            "timing_adjudicated",
+            "sync_raw_replay_verified",
+            "protocol_raw_replay_verified",
+        )
+        reconstruction_claims = {
+            name: _explicit_boolean(
+                reconstruction.get(name),
+                location=f"version-3 reconstruction {name}",
+            )
+            for name in reconstruction_claim_names
+        }
+        usable_count = _strict_nonnegative_int(
+            reconstruction.get("dataset_usable_session_count"),
+            location="version-3 reconstruction dataset usable session count",
+        )
+        identity_count = _strict_nonnegative_int(
+            reconstruction.get("dataset_physical_identity_count"),
+            location="version-3 reconstruction physical identity count",
+        )
+        dataset_session_count = _strict_nonnegative_int(
+            reconstruction.get("dataset_session_count"),
+            location="version-3 reconstruction dataset session count",
+        )
+        selected_session_count = _strict_nonnegative_int(
+            reconstruction.get("selected_session_count"),
+            location="version-3 reconstruction selected session count",
+        )
+        session_count = _strict_nonnegative_int(
+            reconstruction.get("session_count"),
+            location="version-3 reconstruction session count",
+        )
+        raw_reconstruction_sessions = reconstruction.get("sessions")
+        if not isinstance(raw_reconstruction_sessions, list):
+            raise ValueError("version-3 reconstruction sessions must be a list")
+        reconstruction_sessions: dict[str, dict[str, Any]] = {}
+        upstream_required = {
+            "session_id",
+            "usable",
+            "content_sha256",
+            "scientific_eligible",
+            "raw_consumed_bytes_verified",
+            "timing_adjudicated",
+            "sync_raw_replay_verified",
+            "protocol_raw_replay_verified",
+            "sync_authorized",
+        }
+        for raw_entry in raw_reconstruction_sessions:
+            if not isinstance(raw_entry, dict) or not upstream_required <= set(raw_entry):
+                raise ValueError("version-3 reconstruction session claim is incomplete")
+            session_id = _safe_leaf_name(
+                raw_entry.get("session_id"),
+                label="version-3 reconstruction session_id",
+            )
+            if session_id in reconstruction_sessions:
+                raise ValueError("version-3 reconstruction repeats a session ID")
+            _validate_sha256(
+                raw_entry.get("content_sha256"),
+                location=f"version-3 reconstruction session {session_id} content SHA-256",
+            )
+            for name in upstream_required - {"session_id", "content_sha256"}:
+                _explicit_boolean(
+                    raw_entry.get(name),
+                    location=f"version-3 reconstruction session {session_id} {name}",
+                )
+            reconstruction_sessions[session_id] = raw_entry
+        if (
+            list(reconstruction_sessions) != reconstruction_expected_all
+            or dataset_session_count != 30
+            or selected_session_count != 30
+            or session_count != 30
+        ):
+            raise ValueError("version-3 reconstruction session catalogue mismatch")
+        reconstruction_usable_ids = [
+            session_id
+            for session_id, entry in reconstruction_sessions.items()
+            if _explicit_boolean(
+                entry["usable"],
+                location=f"version-3 reconstruction session {session_id} usable",
+            )
+        ]
+        excluded_ids = [
+            session_id
+            for session_id in reconstruction_expected_all
+            if session_id not in reconstruction_usable_ids
+        ]
+        if (
+            reconstruction_usable_ids != reconstruction_expected_usable
+            or reconstruction_usable_ids != cache_ids
+            or excluded_ids != ["S24_KHJ"]
+            or usable_count != 29
+        ):
+            raise ValueError(
+                "version-3 cache must be the exact 29-session usable projection "
+                "of the full reconstruction"
+            )
+        session_content_bindings = {
+            session_id: str(reconstruction_sessions[session_id]["content_sha256"])
+            for session_id in reconstruction_usable_ids
+        }
+        for item in root_items:
+            session_id = str(item["session_id"])
+            if item.get("upstream_session_content_sha256") != session_content_bindings.get(
+                session_id
+            ):
+                raise ValueError(
+                    f"version-3 cache/reconstruction session hash mismatch: {session_id}"
+                )
+
+        root_items_by_id = {str(item["session_id"]): item for item in root_items}
+        loaded_sessions: list[_LoadedV3Session] = []
+        for session_id in selected:
+            loaded_session = _load_v3_session_from_pinned_directory(
+                root_fd,
+                root_items_by_id[session_id],
+                root_config_sha256=root_config_sha256,
+                root_pipeline_sha256=root_pipeline_sha256,
+            )
+            if loaded_session.upstream_session_content_sha256 != session_content_bindings[
+                session_id
+            ]:
+                raise ValueError(
+                    f"version-3 consumed cache/upstream session mismatch: {session_id}"
+                )
+            upstream_entry = reconstruction_sessions[session_id]
+            upstream_claims_complete = all(
+                _explicit_boolean(
+                    upstream_entry[name],
+                    location=f"version-3 reconstruction session {session_id} {name}",
+                )
+                for name in upstream_required
+                - {"session_id", "content_sha256", "usable"}
+            ) and _explicit_boolean(
+                upstream_entry["usable"],
+                location=f"version-3 reconstruction session {session_id} usable",
+            )
+            if loaded_session.scientific_eligible and not upstream_claims_complete:
+                raise ValueError(
+                    f"version-3 eligible cache session lacks upstream claims: {session_id}"
+                )
+            consumed_inventory.extend(loaded_session.consumed_inventory)
+            loaded_sessions.append(loaded_session)
+
+        if not loaded_sessions:
+            raise ValueError("version-3 cache contains no selected sessions")
+        frequency_grid = loaded_sessions[0].frequencies_hz
+        aux_feature_names = loaded_sessions[0].aux_feature_names
+        for loaded_session in loaded_sessions[1:]:
+            if not np.array_equal(frequency_grid, loaded_session.frequencies_hz):
+                raise ValueError("version-3 frequency grid must be exactly equal")
+            if loaded_session.aux_feature_names != aux_feature_names:
+                raise ValueError("version-3 auxiliary feature names must be exactly equal")
+
+        scientific_cohort_shape = bool(
+            len(expected_ids) == 29
+            and len(cache_ids) == 29
+            and len(reconstruction_expected_all) == 30
+            and reconstruction_selected == reconstruction_expected_all
+            and usable_count == 29
+            and dataset_session_count == 30
+            and identity_count == 18
+            and len({identity_for_session(item) for item in cache_ids}) == 18
+        )
+        root_claims_complete = bool(
+            root_eligible
+            and mode == "strict"
+            and not subjects_filter_applied
+            and full_cohort_complete
+            and selection_scope == "full_cohort"
+            and expected_ids == cache_ids
+            and reconstruction_claims["execution_complete"]
+            and reconstruction_claims["complete"]
+            and reconstruction_claims["full_cohort_complete"]
+            and reconstruction_claims["scientific_eligible"]
+            and reconstruction_claims["raw_consumed_bytes_verified"]
+            and reconstruction_claims["timing_adjudicated"]
+            and reconstruction_claims["sync_raw_replay_verified"]
+            and reconstruction_claims["protocol_raw_replay_verified"]
+            and scientific_cohort_shape
+            and all(item.scientific_eligible for item in loaded_sessions)
+            and all(item.authority_claims_complete for item in loaded_sessions)
+            and sessions is None
+        )
+        independent_upstream_verified = bool(
+            root_claims_complete
+            and (
+                _v3_upstream_reconstruction_is_independently_verified(
+                    reconstruction=reconstruction,
+                    reconstruction_manifest_sha256=str(
+                        root_contract["reconstruction_manifest_sha256"]
+                    ),
+                    reconstruction_content_sha256=reconstruction_content_sha256,
+                    session_content_bindings=session_content_bindings,
+                )
+                is True
+            )
+        )
+        effective_eligible = bool(root_claims_complete and independent_upstream_verified)
+        if require_scientific_eligible and not effective_eligible:
+            raise ValueError(
+                "version-3 cache lacks independently verified upstream scientific authority"
+            )
+
+        paths = [str(item["path"]) for item in consumed_inventory]
+        if len(set(paths)) != len(paths):
+            raise ValueError("version-3 consumed inventory repeats a path")
+        canonical_consumed_inventory = sorted(
+            consumed_inventory, key=lambda item: str(item["path"])
+        )
+        inventory_sha256 = _canonical_sha256(canonical_consumed_inventory)
+
+        def concatenate_readonly(
+            values: list[np.ndarray],
+        ) -> np.ndarray:
+            combined = (
+                np.array(values[0], copy=True, order="C")
+                if len(values) == 1
+                else np.concatenate(values, axis=0)
+            )
+            combined.setflags(write=False)
+            return combined
+
+        maps = concatenate_readonly([item.maps for item in loaded_sessions])
+        aux = concatenate_readonly([item.aux for item in loaded_sessions])
+        timing_valid = concatenate_readonly(
+            [item.timing_valid_mask for item in loaded_sessions]
+        )
+        timing_reasons = concatenate_readonly(
+            [item.timing_reason_mask for item in loaded_sessions]
+        )
+        map_view_available = concatenate_readonly(
+            [item.map_view_availability_mask for item in loaded_sessions]
+        )
+        aux_feature_available = concatenate_readonly(
+            [item.aux_feature_availability_mask for item in loaded_sessions]
+        )
+        feature_available = concatenate_readonly(
+            [
+                np.concatenate(
+                    (
+                        item.map_view_availability_mask,
+                        item.aux_feature_availability_mask,
+                    ),
+                    axis=1,
+                )
+                for item in loaded_sessions
+            ]
+        )
+        feature_availability_names = tuple(
+            [f"map_radar_{radar_id}" for radar_id in (1, 2, 3)]
+            + [f"aux:{name}" for name in aux_feature_names]
+        )
+        frequencies = _readonly_owned(frequency_grid)
+        metadata = pd.concat(
+            [item.metadata for item in loaded_sessions], ignore_index=True
+        ).copy(deep=True)
+
+        _assert_regular_entry_still_bound(
+            root_fd,
+            "manifest.json",
+            root_manifest_fingerprint,
+            label="version-3 root manifest",
+        )
+        _assert_regular_entry_still_bound(
+            root_fd,
+            reconstruction_leaf,
+            reconstruction_fingerprint,
+            label="version-3 reconstruction manifest",
+        )
+        observed_root = os.stat(root_absolute, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(observed_root.st_mode)
+            or _stable_stat_fingerprint(observed_root)
+            != root_directory_fingerprint
+        ):
+            raise ValueError("version-3 cache root changed during load")
+
+        provenance = CacheProvenance(
+            classification=(
+                "acquisition_scientific"
+                if effective_eligible
+                else "acquisition_diagnostic"
+            ),
+            root_manifest_path=os.path.join(root_absolute, "manifest.json"),
+            root_manifest_sha256=root_manifest_sha256,
+            root_manifest_content_sha256=root_content_sha256,
+            acquisition_schema_version=ACQUISITION_CACHE_SCHEMA_VERSION_V3,
+            acquisition_mode=str(mode),
+            scientific_eligible=effective_eligible,
+            config_sha256=root_config_sha256,
+            pipeline_sha256=root_pipeline_sha256,
+            reconstruction_content_sha256=reconstruction_content_sha256,
+            inventory_sha256=inventory_sha256,
+            inventory_file_count=len(canonical_consumed_inventory),
+            selected_sessions=tuple(selected),
+        )
+        return FeatureCache(
+            maps=maps,
+            aux=aux,
+            metadata=metadata,
+            frequencies_hz=frequencies,
+            provenance=provenance,
+            radar_timing_valid_mask=timing_valid,
+            radar_timing_invalid_reason_mask=timing_reasons,
+            feature_availability_mask=feature_available,
+            feature_availability_names=feature_availability_names,
+            map_view_availability_mask=map_view_available,
+            aux_feature_availability_mask=aux_feature_available,
+            aux_feature_names=aux_feature_names,
+        )
+    finally:
+        os.close(root_fd)
 
 
 def _validate_v2_session_inventory(
@@ -1154,6 +3529,8 @@ def _validate_acquisition_cache_contract(
     schema_version = root_contract.get("schema_version")
     if schema_version not in SUPPORTED_ACQUISITION_CACHE_SCHEMA_VERSIONS:
         raise ValueError("feature cache root acquisition schema_version is unsupported")
+    if schema_version == ACQUISITION_CACHE_SCHEMA_VERSION_V3:
+        raise ValueError("version-3 acquisition caches require the pinned-byte loader")
     is_v2 = schema_version == ACQUISITION_CACHE_SCHEMA_VERSION_V2
     mode = root_contract.get("mode")
     if mode not in {"strict", "diagnostic"}:
@@ -1168,13 +3545,11 @@ def _validate_acquisition_cache_contract(
     )
     if root_eligible and mode != "strict":
         raise ValueError("a scientifically eligible acquisition cache must use strict mode")
-    if require_scientific_eligible and not is_v2:
+    if require_scientific_eligible:
         raise ValueError(
-            "scientific training requires a version-2 full-cohort acquisition cache; "
-            "version 1 is historical/diagnostic only"
+            "scientific cache loading requires acquisition cache version 3; "
+            "versions 1 and 2 are historical/diagnostic only"
         )
-    if require_scientific_eligible and not root_eligible:
-        raise ValueError("feature cache root is not scientifically eligible")
 
     root_config_sha256: str | None = None
     root_pipeline_sha256: str | None = None

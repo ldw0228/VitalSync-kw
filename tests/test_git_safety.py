@@ -14,6 +14,7 @@ def test_git_safety_allows_reviewed_core_files() -> None:
         "artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-30.md",
         "artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md",
         "artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md",
+        "artifacts/COMMERCIAL_SNN_GOAL_V4_CONTINUATION_2026-08-31.md",
     )
 
     for path in safe_paths:

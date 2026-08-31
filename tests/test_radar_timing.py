@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import hashlib
+import json
+
 import numpy as np
 import pytest
 
 from snn_rr.radar_timing import (
+    CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+    CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1,
     CAUSAL_UNIFORM_RESAMPLE_SCHEMA_V1,
+    CausalUniformInvalidReasonV1,
+    CausalUniformRadarResampleV1,
     RadarTimingError,
     canonical_ndarray_sha256,
+    causal_uniform_invalid_reason_semantics_v1,
     causal_uniform_resample_radar_views_v1,
+    validate_causal_uniform_invalid_reason_contract_v1,
 )
 
 
@@ -53,8 +63,95 @@ def test_regular_40hz_is_legacy_four_frame_mean_with_right_edge_times() -> None:
     np.testing.assert_allclose(result.times_s, [0.1, 0.2, 0.3], atol=1e-12)
     np.testing.assert_array_equal(result.sample_counts, np.full((3, 3), 4))
     assert result.valid_mask.all()
+    np.testing.assert_array_equal(
+        result.invalid_reason_mask,
+        np.zeros(result.valid_mask.shape, dtype=np.uint8),
+    )
     assert result.summary["schema_version"] == CAUSAL_UNIFORM_RESAMPLE_SCHEMA_V1
     assert result.summary["timestamp_semantics"] == "right_edge_exclusive"
+    contract = result.summary["invalid_reason_contract"]
+    assert contract["semantics"]["schema_version"] == (
+        CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1
+    )
+    assert contract["semantics_sha256"] == (
+        CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+    )
+    assert contract["all_invalid_explained"]
+    assert validate_causal_uniform_invalid_reason_contract_v1(result)[
+        "all_invalid_explained"
+    ]
+
+
+def test_finite_float32_mean_cannot_overflow_a_valid_output() -> None:
+    maximum = np.finfo(np.float32).max
+    values = np.full((8, 2), maximum, dtype=np.float32)
+    values[:, 1] *= np.asarray(
+        [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+        dtype=np.float32,
+    )
+    times = np.arange(8, dtype=np.float64) / 40.0
+
+    with np.errstate(over="raise", invalid="raise"):
+        result = _resample([values], [times], max_gap_s=0.030)
+
+    assert result.valid_mask.all()
+    assert np.isfinite(result.values[result.valid_mask]).all()
+    np.testing.assert_array_equal(result.values[0, :, 0], maximum)
+    np.testing.assert_array_equal(result.values[0, :, 1], 0.0)
+    assert result.invalid_reason_mask[0].tolist() == [0, 0]
+    validate_causal_uniform_invalid_reason_contract_v1(result)
+
+
+def test_finite_but_float32_unrepresentable_mean_is_structurally_masked() -> None:
+    beyond_float32 = np.float64(np.finfo(np.float32).max) * 2.0
+    values = np.full((8, 1), beyond_float32, dtype=np.float64)
+    times = np.arange(8, dtype=np.float64) / 40.0
+
+    result = _resample([values], [times], max_gap_s=0.030)
+
+    expected_reason = int(CausalUniformInvalidReasonV1.NONFINITE_PAYLOAD)
+    assert result.invalid_reason_mask[0].tolist() == [expected_reason, expected_reason]
+    assert not result.valid_mask.any()
+    np.testing.assert_array_equal(result.values, np.zeros_like(result.values))
+    assert not np.signbit(result.values).any()
+    semantics = causal_uniform_invalid_reason_semantics_v1()
+    nonfinite = next(
+        item for item in semantics["flags"] if item["name"] == "nonfinite_payload"
+    )
+    assert "represented as finite float32" in nonfinite["condition"]
+    validate_causal_uniform_invalid_reason_contract_v1(result)
+
+
+def test_invalid_reason_validator_rejects_nonfinite_valid_output_even_if_resealed() -> None:
+    times = np.arange(8, dtype=np.float64) / 40.0
+    result = _resample(
+        [np.arange(8, dtype=np.float32)[:, None]],
+        [times],
+        max_gap_s=0.030,
+    )
+    tampered_values = result.values.copy()
+    tampered_values[0, 0, 0] = np.inf
+    content_hashes = {
+        **result.summary["content_hashes"],
+        "output_values_sha256": canonical_ndarray_sha256(tampered_values),
+    }
+    tampered_summary = {
+        **result.summary,
+        "content_hashes": content_hashes,
+        "transform_evidence_sha256": hashlib.sha256(
+            json.dumps(
+                content_hashes,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+    with pytest.raises(RadarTimingError, match="valid resampling cells.*finite"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, values=tampered_values, summary=tampered_summary)
+        )
 
 
 def test_future_values_and_boundary_impulse_cannot_change_earlier_outputs() -> None:
@@ -125,6 +222,9 @@ def test_timestamp_gap_is_exact_zero_mask_or_fail_closed() -> None:
     )
     assert not masked.valid_mask[0, 0]
     assert np.count_nonzero(masked.values[0, 0]) == 0
+    assert masked.invalid_reason_mask[0, 0] == int(
+        CausalUniformInvalidReasonV1.TEMPORAL_GAP
+    )
     assert masked.summary["per_view"][0]["temporal_gap_interval_count"] == 1
 
     with pytest.raises(RadarTimingError, match="invalid view-intervals"):
@@ -152,6 +252,9 @@ def test_sequence_gap_is_masked_even_when_timestamps_look_regular() -> None:
 
     assert result.valid_mask[0].tolist() == [True, False, True]
     assert result.values[0, 1, 0] == 0.0
+    assert result.invalid_reason_mask[0, 1] == int(
+        CausalUniformInvalidReasonV1.FRAME_SEQUENCE_GAP
+    )
     assert result.summary["per_view"][0]["frame_sequence_gap_count"] == 1
     assert result.summary["per_view"][0]["sequence_gap_interval_count"] == 1
 
@@ -253,6 +356,9 @@ def test_bounded_plateau_is_retained_and_structurally_masked() -> None:
     assert result.values[0, 0, 0] == 0.0
     assert result.values[0, 1, 0] == pytest.approx(5.5)
     assert result.summary["per_view"][0]["timestamp_plateau_interval_count"] == 1
+    assert result.invalid_reason_mask[0, 0] & int(
+        CausalUniformInvalidReasonV1.TIMESTAMP_PLATEAU
+    )
 
 
 def test_measured_timestamp_fallback_can_be_rejected() -> None:
@@ -309,6 +415,12 @@ def test_plateau_with_sequence_gap_is_structurally_masked_not_interpolated() -> 
     )
     assert not result.valid_mask[0, 0]
     assert result.values[0, 0, 0] == 0.0
+    assert result.invalid_reason_mask[0, 0] & int(
+        CausalUniformInvalidReasonV1.TIMESTAMP_PLATEAU
+    )
+    assert result.invalid_reason_mask[0, 0] & int(
+        CausalUniformInvalidReasonV1.FRAME_SEQUENCE_GAP
+    )
     view = result.summary["per_view"][0]
     assert view["timestamp_plateau_interval_count"] == 1
     assert view["sequence_gap_interval_count"] == 1
@@ -364,6 +476,10 @@ def test_future_submicrosecond_timestamp_cannot_switch_earlier_bin_arithmetic() 
     )
     np.testing.assert_array_equal(
         baseline.valid_mask[:, :5], changed.valid_mask[:, :5]
+    )
+    np.testing.assert_array_equal(
+        baseline.invalid_reason_mask[:, :5],
+        changed.invalid_reason_mask[:, :5],
     )
     assert baseline.values[0, 2, 0] == 0.0
     assert baseline.sample_counts[0, 2] == 4
@@ -456,6 +572,9 @@ def test_plateau_classification_is_timestamp_prefix_invariant() -> None:
     np.testing.assert_array_equal(first.values[:, :2], second.values[:, :2])
     np.testing.assert_array_equal(first.valid_mask[:, :2], second.valid_mask[:, :2])
     np.testing.assert_array_equal(first.sample_counts[:, :2], second.sample_counts[:, :2])
+    np.testing.assert_array_equal(
+        first.invalid_reason_mask[:, :2], second.invalid_reason_mask[:, :2]
+    )
     assert first.summary["per_view"][0]["timestamp_repair"]["plateaus"] == (
         second.summary["per_view"][0]["timestamp_repair"]["plateaus"]
     )
@@ -471,6 +590,12 @@ def test_transform_content_hashes_bind_values_mask_and_counts() -> None:
     assert hashes["valid_mask_sha256"] == canonical_ndarray_sha256(result.valid_mask)
     assert hashes["sample_counts_sha256"] == canonical_ndarray_sha256(
         result.sample_counts
+    )
+    assert hashes["invalid_reason_mask_sha256"] == canonical_ndarray_sha256(
+        result.invalid_reason_mask
+    )
+    assert hashes["invalid_reason_semantics_sha256"] == (
+        CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
     )
     assert len(result.summary["transform_evidence_sha256"]) == 64
 
@@ -488,3 +613,202 @@ def test_transform_content_hashes_bind_values_mask_and_counts() -> None:
     tampered_output = result.values.copy()
     tampered_output[0, 0, 0] += 1.0
     assert canonical_ndarray_sha256(tampered_output) != hashes["output_values_sha256"]
+
+
+def test_invalid_reason_bits_preserve_plateau_gap_sequence_nonfinite_overlap() -> None:
+    times = np.asarray(
+        [0.0, 0.025, 0.025, 0.075, 0.100, 0.125, 0.150, 0.175],
+        dtype=np.float64,
+    )
+    sequence = np.asarray([0, 1, 3, 4, 5, 6, 7, 8], dtype=np.uint32)
+    values = np.arange(times.size, dtype=np.float32)[:, None]
+    values[1, 0] = np.nan
+
+    result = _resample(
+        [values],
+        [times],
+        sequences=[sequence],
+        max_gap_s=0.030,
+    )
+
+    expected = int(
+        CausalUniformInvalidReasonV1.TEMPORAL_GAP
+        | CausalUniformInvalidReasonV1.FRAME_SEQUENCE_GAP
+        | CausalUniformInvalidReasonV1.TIMESTAMP_PLATEAU
+        | CausalUniformInvalidReasonV1.NONFINITE_PAYLOAD
+    )
+    assert result.invalid_reason_mask.dtype == np.uint8
+    assert result.invalid_reason_mask[0].tolist() == [expected, 0]
+    assert result.valid_mask[0].tolist() == [False, True]
+    assert result.values[0, 0, 0] == 0.0
+    assert not np.signbit(result.values[0, 0, 0])
+    evidence = validate_causal_uniform_invalid_reason_contract_v1(result)
+    assert evidence["overlap_interval_count"] == 1
+    assert evidence["maximum_reason_multiplicity"] == 4
+    assert evidence["per_reason_interval_counts"] == {
+        "empty_interval": 0,
+        "temporal_gap": 1,
+        "frame_sequence_gap": 1,
+        "timestamp_plateau": 1,
+        "nonfinite_payload": 1,
+    }
+
+
+def test_empty_interval_preserves_overlapping_temporal_gap_reason() -> None:
+    # The frame at 200 ms is right-edge exclusive, leaving [100, 200) empty.
+    times = np.asarray([0.0, 0.200, 0.225, 0.250, 0.275], dtype=np.float64)
+    values = np.arange(times.size, dtype=np.float32)[:, None]
+
+    result = _resample([values], [times], max_gap_s=0.030)
+
+    empty_and_gap = int(
+        CausalUniformInvalidReasonV1.EMPTY_INTERVAL
+        | CausalUniformInvalidReasonV1.TEMPORAL_GAP
+    )
+    assert result.sample_counts[0].tolist() == [1, 0, 4]
+    assert result.invalid_reason_mask[0].tolist() == [
+        int(CausalUniformInvalidReasonV1.TEMPORAL_GAP),
+        empty_and_gap,
+        0,
+    ]
+    assert result.values[0, 1, 0] == 0.0
+    assert not np.signbit(result.values[0, 1, 0])
+    contract = result.summary["invalid_reason_contract"]
+    assert contract["per_reason_interval_counts"]["empty_interval"] == 1
+    assert contract["per_reason_interval_counts"]["temporal_gap"] == 2
+    assert contract["overlap_interval_count"] == 1
+    assert contract["all_invalid_explained"]
+
+
+def test_invalid_reason_validator_rejects_reason_union_hash_and_zero_tampering() -> None:
+    times = np.asarray(
+        [0.0, 0.025, 0.025, 0.075, 0.100, 0.125, 0.150, 0.175],
+        dtype=np.float64,
+    )
+    values = np.arange(times.size, dtype=np.float32)[:, None]
+    result = _resample([values], [times], max_gap_s=0.030)
+
+    missing_union = result.invalid_reason_mask.copy()
+    missing_union[0, 0] = 0
+    with pytest.raises(RadarTimingError, match="exactly equal"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, invalid_reason_mask=missing_union)
+        )
+
+    wrong_known_reason = result.invalid_reason_mask.copy()
+    wrong_known_reason[0, 0] = np.uint8(
+        CausalUniformInvalidReasonV1.FRAME_SEQUENCE_GAP
+    )
+    with pytest.raises(RadarTimingError, match="content hash mismatch"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, invalid_reason_mask=wrong_known_reason)
+        )
+
+    unknown_reason = result.invalid_reason_mask.copy()
+    unknown_reason[0, 0] |= np.uint8(1 << 7)
+    with pytest.raises(RadarTimingError, match="unknown reason bit"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, invalid_reason_mask=unknown_reason)
+        )
+
+    negative_zero = result.values.copy()
+    negative_zero[0, 0] = np.float32(-0.0)
+    with pytest.raises(RadarTimingError, match="exact positive zero"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, values=negative_zero)
+        )
+
+    bool_laundered_summary = {
+        **result.summary,
+        "invalid_reason_contract": {
+            **result.summary["invalid_reason_contract"],
+            "invalid_interval_count": True,
+        },
+    }
+    with pytest.raises(RadarTimingError, match="exact integer"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, summary=bool_laundered_summary)
+        )
+
+
+def test_invalid_reason_validator_rejects_frame_accounting_tamper() -> None:
+    times = np.arange(12, dtype=np.float64) / 40.0
+    values = np.arange(12, dtype=np.float32)[:, None]
+    result = _resample([values], [times], max_gap_s=0.030)
+    tampered_summary = {
+        **result.summary,
+        "per_view": [
+            {
+                **result.summary["per_view"][0],
+                "frame_accounting": {
+                    **result.summary["per_view"][0]["frame_accounting"],
+                    "unaccounted_payload_frame_count": 1,
+                    "coverage_complete": False,
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(RadarTimingError, match="exactly accounted"):
+        validate_causal_uniform_invalid_reason_contract_v1(
+            replace(result, summary=tampered_summary)
+        )
+
+
+def test_s07_style_causally_unwrapped_counter_reset_remains_compatible() -> None:
+    # S07's raw counter drops by seconds.  The parser repairs it from the past
+    # edge and nominal 25 ms period before this resampler sees it.
+    raw_ms = np.asarray(
+        [4574, 4598, 4623, 243, 269, 294, 319, 344, 369, 394, 419, 444, 469],
+        dtype=np.int64,
+    )
+    repaired_ms = raw_ms.astype(np.float64)
+    offset = 0.0
+    previous = repaired_ms[0]
+    for index in range(1, repaired_ms.size):
+        candidate = repaired_ms[index] + offset
+        if candidate < previous - 100.0:
+            offset += previous + 25.0 - candidate
+            candidate = repaired_ms[index] + offset
+        repaired_ms[index] = candidate
+        previous = candidate
+    relative_s = (repaired_ms - repaired_ms[0]) / 1000.0
+    values = np.arange(relative_s.size, dtype=np.float32)[:, None]
+
+    result = _resample([values], [relative_s], max_gap_s=0.030)
+
+    np.testing.assert_array_equal(np.diff(repaired_ms) >= 0.0, True)
+    assert result.valid_mask.all()
+    np.testing.assert_array_equal(
+        result.invalid_reason_mask,
+        np.zeros_like(result.invalid_reason_mask),
+    )
+    assert result.summary["per_view"][0]["unaccounted_payload_frame_count"] == 0
+
+
+def test_legacy_seven_field_result_stays_readable_but_has_no_reason_authority() -> None:
+    times = np.arange(8, dtype=np.float64) / 40.0
+    current = _resample(
+        [np.arange(8, dtype=np.float32)[:, None]],
+        [times],
+        max_gap_s=0.030,
+    )
+    legacy = CausalUniformRadarResampleV1(
+        current.origin_epoch_s,
+        current.times_s,
+        current.values,
+        current.valid_mask,
+        current.sample_counts,
+        current.interval_s,
+        current.summary,
+    )
+
+    assert legacy.invalid_reason_mask is None
+    with pytest.raises(RadarTimingError, match="legacy resample result"):
+        validate_causal_uniform_invalid_reason_contract_v1(legacy)
+
+    mutated = causal_uniform_invalid_reason_semantics_v1()
+    mutated["flags"][0]["value"] = 255
+    assert causal_uniform_invalid_reason_semantics_v1()["flags"][0]["value"] == int(
+        CausalUniformInvalidReasonV1.EMPTY_INTERVAL
+    )

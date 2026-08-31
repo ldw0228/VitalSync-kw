@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntFlag
 import hashlib
 import json
 from typing import Any, Sequence
@@ -22,8 +23,98 @@ class CommonRadarTimeline:
 
 
 CAUSAL_UNIFORM_RESAMPLE_SCHEMA_V1 = "snn_rr.causal_uniform_radar_resample.v1"
+CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1 = (
+    "snn_rr.causal_uniform_radar_invalid_reason_mask.v1"
+)
 _FIXED_POINT_TICKS_PER_SECOND = 1_000_000_000
 _CANONICAL_ARRAY_HASH_SCHEMA = "snn_rr.canonical_ndarray_sha256.v1"
+
+
+class CausalUniformInvalidReasonV1(IntFlag):
+    """Independent invalidity causes for one radar view/output interval.
+
+    Values are stable serialized bits, not ordinal labels.  Multiple causes
+    are preserved with bitwise OR; a zero mask is the sole valid state.
+    """
+
+    EMPTY_INTERVAL = 1 << 0
+    TEMPORAL_GAP = 1 << 1
+    FRAME_SEQUENCE_GAP = 1 << 2
+    TIMESTAMP_PLATEAU = 1 << 3
+    NONFINITE_PAYLOAD = 1 << 4
+
+
+_INVALID_REASON_FLAGS_V1: tuple[
+    tuple[str, CausalUniformInvalidReasonV1, str], ...
+] = (
+    (
+        "empty_interval",
+        CausalUniformInvalidReasonV1.EMPTY_INTERVAL,
+        "the half-open output interval contains no retained frame",
+    ),
+    (
+        "temporal_gap",
+        CausalUniformInvalidReasonV1.TEMPORAL_GAP,
+        "the maximum support gap, including interval edges, exceeds max_gap_s",
+    ),
+    (
+        "frame_sequence_gap",
+        CausalUniformInvalidReasonV1.FRAME_SEQUENCE_GAP,
+        "the first frame after a non-unit frame-sequence edge lies in the interval",
+    ),
+    (
+        "timestamp_plateau",
+        CausalUniformInvalidReasonV1.TIMESTAMP_PLATEAU,
+        "a retained frame on a duplicate measured-timestamp edge lies in the interval",
+    ),
+    (
+        "nonfinite_payload",
+        CausalUniformInvalidReasonV1.NONFINITE_PAYLOAD,
+        (
+            "at least one selected payload component is non-finite, or the "
+            "finite interval mean cannot be represented as finite float32 "
+            "after stable scaled-float64 aggregation"
+        ),
+    ),
+)
+_INVALID_REASON_KNOWN_BITS_V1 = sum(
+    int(flag) for _, flag, _ in _INVALID_REASON_FLAGS_V1
+)
+_INVALID_REASON_SEMANTICS_DOCUMENT_V1: dict[str, Any] = {
+    "schema_version": CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+    "mask_dtype": "uint8",
+    "mask_layout": ["radar_view", "output_interval"],
+    "validity_semantics": "valid_mask == (invalid_reason_mask == 0)",
+    "overlap_policy": "independent_causes_preserved_by_bitwise_or",
+    "invalid_output_policy": "all_components_exact_positive_zero",
+    "valid_output_policy": "all_components_finite_float32",
+    "aggregation_policy": (
+        "scaled_float64_mean_then_checked_float32_conversion"
+    ),
+    "empty_interval_temporal_gap_policy": (
+        "empty intervals also carry temporal_gap when their edge-to-edge support "
+        "gap exceeds max_gap_s"
+    ),
+    "timestamp_plateau_policy": "retain_measured_timestamps_and_payload; never_interpolate",
+    "flags": [
+        {
+            "name": name,
+            "value": int(flag),
+            "bit_index": int(flag).bit_length() - 1,
+            "condition": condition,
+        }
+        for name, flag, condition in _INVALID_REASON_FLAGS_V1
+    ],
+    "known_bits_mask": _INVALID_REASON_KNOWN_BITS_V1,
+}
+CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1 = hashlib.sha256(
+    json.dumps(
+        _INVALID_REASON_SEMANTICS_DOCUMENT_V1,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 
 def _strict_finite_real(value: Any, label: str) -> float:
@@ -84,11 +175,24 @@ def _strict_int64_array(value: Any, label: str) -> np.ndarray:
         raise RadarTimingError(f"{label} is not integral") from exc
 
 
+def _strict_nonnegative_evidence_count(value: Any, label: str) -> int:
+    """Read a serialized count without accepting bool/float/string aliases."""
+
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise RadarTimingError(f"{label} must be an exact integer")
+    result = int(value)
+    if result < 0:
+        raise RadarTimingError(f"{label} cannot be negative")
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class CausalUniformRadarResampleV1:
     """Uniform, right-edge-timestamped radar samples and their validity mask.
 
-    ``values[:, k]`` is the arithmetic mean of the measured frames whose
+    ``values[:, k]`` is the checked float32 arithmetic mean of the measured frames whose
     timestamps fall in ``[times_s[k] - interval_s, times_s[k])``.  The
     half-open interval makes the causal boundary explicit: a frame stamped
     exactly at an output edge belongs to the following output, never the one
@@ -103,6 +207,24 @@ class CausalUniformRadarResampleV1:
     sample_counts: np.ndarray
     interval_s: float
     summary: dict[str, Any]
+    # Added additively so callers constructing the historical seven-field
+    # result remain source-compatible.  Results produced by the current
+    # resampler always carry the versioned uint8 mask; ``None`` denotes a
+    # legacy result with no invalid-reason authority.
+    invalid_reason_mask: np.ndarray | None = None
+
+
+def causal_uniform_invalid_reason_semantics_v1() -> dict[str, Any]:
+    """Return an independent copy of the stable invalid-reason semantics."""
+
+    return json.loads(
+        json.dumps(
+            _INVALID_REASON_SEMANTICS_DOCUMENT_V1,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def canonical_ndarray_sha256(value: np.ndarray) -> str:
@@ -150,6 +272,366 @@ def canonical_ndarray_sequence_sha256(values: Sequence[np.ndarray]) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _invalid_reason_array_evidence_v1(
+    invalid_reason_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    output_values: np.ndarray,
+    sample_counts: np.ndarray,
+) -> dict[str, Any]:
+    """Validate exact array-level reason invariants and return count evidence."""
+
+    reasons = np.asarray(invalid_reason_mask)
+    valid = np.asarray(valid_mask)
+    output = np.asarray(output_values)
+    counts = np.asarray(sample_counts)
+    if reasons.dtype != np.dtype(np.uint8) or reasons.ndim != 2:
+        raise RadarTimingError("invalid_reason_mask must be a uint8 [view, output] array")
+    if valid.dtype != np.dtype(bool) or valid.shape != reasons.shape:
+        raise RadarTimingError("valid_mask must be boolean and match invalid_reason_mask")
+    if counts.shape != reasons.shape or not np.issubdtype(counts.dtype, np.integer):
+        raise RadarTimingError("sample_counts must be integral and match invalid_reason_mask")
+    if output.ndim < 2 or output.shape[:2] != reasons.shape:
+        raise RadarTimingError("output values do not match invalid_reason_mask")
+    if np.any(counts < 0):
+        raise RadarTimingError("sample_counts cannot be negative")
+
+    unknown_bits = np.bitwise_and(
+        reasons,
+        np.uint8(0xFF ^ _INVALID_REASON_KNOWN_BITS_V1),
+    )
+    if np.any(unknown_bits != 0):
+        raise RadarTimingError("invalid_reason_mask contains an unknown reason bit")
+
+    reason_union = reasons != 0
+    if not np.array_equal(reason_union, ~valid):
+        raise RadarTimingError("invalid reason union does not exactly equal ~valid_mask")
+
+    empty_bits = (
+        np.bitwise_and(
+            reasons,
+            np.uint8(CausalUniformInvalidReasonV1.EMPTY_INTERVAL),
+        )
+        != 0
+    )
+    if not np.array_equal(empty_bits, counts == 0):
+        raise RadarTimingError("empty-interval reason does not exactly match sample_counts")
+
+    invalid_values = output[reason_union]
+    if invalid_values.size and (
+        np.any(invalid_values != 0.0) or np.any(np.signbit(invalid_values))
+    ):
+        raise RadarTimingError(
+            "invalid resampling cells must contain exact positive zero"
+        )
+    valid_values = output[valid]
+    if valid_values.size and not np.isfinite(valid_values).all():
+        raise RadarTimingError(
+            "valid resampling cells must contain only finite values"
+        )
+
+    per_reason_counts: dict[str, int] = {}
+    multiplicity = np.zeros(reasons.shape, dtype=np.uint8)
+    for name, flag, _ in _INVALID_REASON_FLAGS_V1:
+        present = np.bitwise_and(reasons, np.uint8(flag)) != 0
+        per_reason_counts[name] = int(np.count_nonzero(present))
+        multiplicity += present.astype(np.uint8, copy=False)
+    invalid_count = int(np.count_nonzero(reason_union))
+    return {
+        "invalid_interval_count": invalid_count,
+        "valid_interval_count": int(reasons.size - invalid_count),
+        "per_reason_interval_counts": per_reason_counts,
+        "overlap_interval_count": int(np.count_nonzero(multiplicity > 1)),
+        "maximum_reason_multiplicity": int(np.max(multiplicity, initial=0)),
+        "all_invalid_explained": bool(
+            np.array_equal(reason_union, ~valid)
+            and not np.any(unknown_bits)
+        ),
+        "invalid_outputs_exact_positive_zero": True,
+    }
+
+
+def _stable_float32_interval_mean_v1(selected: np.ndarray) -> np.ndarray | None:
+    """Return a finite float32 mean, or ``None`` when it is unrepresentable.
+
+    NumPy's float32 mean first forms a float32 sum, so several finite values
+    near ``finfo(float32).max`` can overflow even when their arithmetic mean
+    is representable.  Scaling each component before a float64 accumulation
+    prevents that intermediate overflow.  The conversion back to the public
+    float32 result is allowed only after an explicit representability check.
+    """
+
+    values = np.asarray(selected)
+    if values.ndim < 1 or values.shape[0] <= 0 or not np.isfinite(values).all():
+        return None
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        working = values.astype(np.float64, copy=False)
+        if not np.isfinite(working).all():
+            return None
+        scale = np.max(np.abs(working), axis=0)
+        denominator = np.where(scale == 0.0, 1.0, scale)
+        normalized_mean = np.mean(
+            working / denominator,
+            axis=0,
+            dtype=np.float64,
+        )
+        representability_limit = np.float64(np.finfo(np.float32).max) / denominator
+        if (
+            not np.isfinite(normalized_mean).all()
+            or np.any(np.abs(normalized_mean) > representability_limit)
+        ):
+            return None
+        mean64 = normalized_mean * scale
+        if not np.isfinite(mean64).all():
+            return None
+        mean32 = np.asarray(mean64, dtype=np.float32)
+    if not np.isfinite(mean32).all():
+        return None
+    return mean32
+
+
+def _validate_frame_accounting_documents_v1(
+    *,
+    per_view_documents: Any,
+    sample_counts: np.ndarray,
+) -> None:
+    """Fail closed unless each retained frame has one support category."""
+
+    if not isinstance(per_view_documents, list) or len(per_view_documents) != len(
+        sample_counts
+    ):
+        raise RadarTimingError("per-view frame-accounting evidence is incomplete")
+    category_names = (
+        "outside_common_intersection_prefix_frame_count",
+        "leading_partial_edge_frame_count",
+        "assigned_to_output_intervals_frame_count",
+        "trailing_partial_edge_frame_count",
+        "outside_common_intersection_suffix_frame_count",
+    )
+
+    for view_index, document in enumerate(per_view_documents):
+        if not isinstance(document, dict):
+            raise RadarTimingError("per-view timing evidence must be a mapping")
+        accounting = document.get("frame_accounting")
+        if not isinstance(accounting, dict) or accounting.get("schema_version") != (
+            "snn_rr.radar_frame_accounting.v1"
+        ):
+            raise RadarTimingError("frame-accounting schema is missing or unsupported")
+        categories = accounting.get("categories")
+        if not isinstance(categories, dict) or set(categories) != set(category_names):
+            raise RadarTimingError("frame-accounting categories are incomplete")
+        try:
+            category_values = [
+                _strict_nonnegative_evidence_count(
+                    categories[name], f"frame-accounting category {name}"
+                )
+                for name in category_names
+            ]
+            retained_count = _strict_nonnegative_evidence_count(
+                accounting["retained_input_frame_count"],
+                "retained input frame count",
+            )
+            category_sum = _strict_nonnegative_evidence_count(
+                accounting["category_sum"], "frame-accounting category sum"
+            )
+            unaccounted = _strict_nonnegative_evidence_count(
+                accounting["unaccounted_payload_frame_count"],
+                "unaccounted payload frame count",
+            )
+            document_unaccounted = _strict_nonnegative_evidence_count(
+                document["unaccounted_payload_frame_count"],
+                "per-view unaccounted payload frame count",
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RadarTimingError("frame-accounting counts are invalid") from exc
+        expected_sum = sum(category_values)
+        assigned = int(
+            np.sum(np.asarray(sample_counts[view_index]), dtype=np.int64)
+        )
+        if not (
+            expected_sum == category_sum == retained_count
+            and unaccounted == 0
+            and category_values[2] == assigned
+            and accounting.get("categories_disjoint") is True
+            and accounting.get("coverage_complete") is True
+            and accounting.get("assigned_count_matches_sample_counts") is True
+            and document_unaccounted == 0
+        ):
+            raise RadarTimingError("not every retained frame is exactly accounted")
+
+
+def validate_causal_uniform_invalid_reason_contract_v1(
+    result: CausalUniformRadarResampleV1,
+) -> dict[str, Any]:
+    """Validate a produced result's v1 reason, hash, and accounting evidence.
+
+    Historical results without ``invalid_reason_mask`` remain readable through
+    :class:`CausalUniformRadarResampleV1`, but deliberately fail this stronger
+    authority check rather than being upgraded by inference.
+    """
+
+    if not isinstance(result, CausalUniformRadarResampleV1):
+        raise RadarTimingError("invalid-reason validation requires a resample result")
+    if result.invalid_reason_mask is None:
+        raise RadarTimingError("legacy resample result has no invalid-reason contract")
+    if not isinstance(result.summary, dict):
+        raise RadarTimingError("resample summary must be a mapping")
+
+    evidence = _invalid_reason_array_evidence_v1(
+        result.invalid_reason_mask,
+        result.valid_mask,
+        result.values,
+        result.sample_counts,
+    )
+    contract = result.summary.get("invalid_reason_contract")
+    if not isinstance(contract, dict):
+        raise RadarTimingError("invalid-reason contract evidence is missing")
+    expected_semantics = causal_uniform_invalid_reason_semantics_v1()
+    if contract.get("semantics") != expected_semantics:
+        raise RadarTimingError("invalid-reason semantics do not match v1")
+    encoded_semantics = json.dumps(
+        contract["semantics"],
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if (
+        hashlib.sha256(encoded_semantics).hexdigest()
+        != CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+        or contract.get("semantics_sha256")
+        != CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+    ):
+        raise RadarTimingError("invalid-reason semantics hash does not match v1")
+
+    reason_sha256 = canonical_ndarray_sha256(result.invalid_reason_mask)
+    content_hashes = result.summary.get("content_hashes")
+    if not isinstance(content_hashes, dict):
+        raise RadarTimingError("resample content hashes are missing")
+    expected_array_hashes = {
+        "output_times_sha256": canonical_ndarray_sha256(result.times_s),
+        "output_values_sha256": canonical_ndarray_sha256(result.values),
+        "valid_mask_sha256": canonical_ndarray_sha256(result.valid_mask),
+        "sample_counts_sha256": canonical_ndarray_sha256(result.sample_counts),
+        "invalid_reason_mask_sha256": reason_sha256,
+        "invalid_reason_semantics_sha256": (
+            CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+        ),
+    }
+    for key, expected in expected_array_hashes.items():
+        if content_hashes.get(key) != expected:
+            raise RadarTimingError(f"resample content hash mismatch: {key}")
+    if contract.get("invalid_reason_mask_sha256") != reason_sha256:
+        raise RadarTimingError("invalid-reason contract mask hash mismatch")
+    for key in (
+        "invalid_interval_count",
+        "valid_interval_count",
+        "overlap_interval_count",
+        "maximum_reason_multiplicity",
+    ):
+        recorded = _strict_nonnegative_evidence_count(
+            contract.get(key), f"invalid-reason evidence {key}"
+        )
+        if recorded != evidence[key]:
+            raise RadarTimingError(f"invalid-reason contract evidence mismatch: {key}")
+    for key in ("all_invalid_explained", "invalid_outputs_exact_positive_zero"):
+        if contract.get(key) is not evidence[key]:
+            raise RadarTimingError(f"invalid-reason contract evidence mismatch: {key}")
+    recorded_reason_counts = contract.get("per_reason_interval_counts")
+    if not isinstance(recorded_reason_counts, dict) or set(recorded_reason_counts) != {
+        name for name, _, _ in _INVALID_REASON_FLAGS_V1
+    }:
+        raise RadarTimingError("invalid-reason aggregate counts do not match v1")
+    for name, expected_count in evidence["per_reason_interval_counts"].items():
+        if _strict_nonnegative_evidence_count(
+            recorded_reason_counts.get(name),
+            f"invalid-reason aggregate count {name}",
+        ) != int(expected_count):
+            raise RadarTimingError(
+                f"invalid-reason contract evidence mismatch: {name}"
+            )
+
+    transform_evidence_sha256 = hashlib.sha256(
+        json.dumps(
+            content_hashes,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if result.summary.get("transform_evidence_sha256") != transform_evidence_sha256:
+        raise RadarTimingError("transform evidence hash does not bind content hashes")
+
+    per_view = result.summary.get("per_view")
+    _validate_frame_accounting_documents_v1(
+        per_view_documents=per_view,
+        sample_counts=np.asarray(result.sample_counts),
+    )
+    assert isinstance(per_view, list)
+    legacy_count_keys = {
+        "empty_interval": "empty_interval_count",
+        "temporal_gap": "temporal_gap_interval_count",
+        "frame_sequence_gap": "sequence_gap_interval_count",
+        "timestamp_plateau": "timestamp_plateau_interval_count",
+        "nonfinite_payload": "nonfinite_interval_count",
+    }
+    reasons = np.asarray(result.invalid_reason_mask)
+    for view_index, document in enumerate(per_view):
+        view_reasons = reasons[view_index]
+        recorded_valid_count = _strict_nonnegative_evidence_count(
+            document.get("valid_output_count"), "per-view valid output count"
+        )
+        recorded_invalid_count = _strict_nonnegative_evidence_count(
+            document.get("invalid_output_count"), "per-view invalid output count"
+        )
+        if recorded_valid_count != int(
+            np.count_nonzero(view_reasons == 0)
+        ) or recorded_invalid_count != int(np.count_nonzero(view_reasons != 0)):
+            raise RadarTimingError("per-view valid/invalid counts do not match reasons")
+        recorded_reason_counts = document.get("invalid_reason_interval_counts")
+        if not isinstance(recorded_reason_counts, dict):
+            raise RadarTimingError("per-view invalid-reason counts are missing")
+        for name, flag, _ in _INVALID_REASON_FLAGS_V1:
+            expected_count = int(
+                np.count_nonzero(np.bitwise_and(view_reasons, np.uint8(flag)))
+            )
+            if (
+                _strict_nonnegative_evidence_count(
+                    document.get(legacy_count_keys[name]),
+                    f"per-view legacy reason count {name}",
+                )
+                != expected_count
+                or _strict_nonnegative_evidence_count(
+                    recorded_reason_counts.get(name),
+                    f"per-view reason count {name}",
+                )
+                != expected_count
+            ):
+                raise RadarTimingError(f"per-view reason count mismatch: {name}")
+        if set(recorded_reason_counts) != {
+            name for name, _, _ in _INVALID_REASON_FLAGS_V1
+        }:
+            raise RadarTimingError("per-view invalid-reason count keys do not match v1")
+
+    all_views_valid = np.all(np.asarray(result.valid_mask), axis=0)
+    if _strict_nonnegative_evidence_count(
+        result.summary.get("all_views_valid_interval_count"),
+        "all-views-valid interval count",
+    ) != int(
+        np.count_nonzero(all_views_valid)
+    ) or _strict_nonnegative_evidence_count(
+        result.summary.get("any_view_invalid_interval_count"),
+        "any-view-invalid interval count",
+    ) != int(
+        np.count_nonzero(~all_views_valid)
+    ):
+        raise RadarTimingError("cross-view validity counts do not match reasons")
+    return {
+        "schema_version": CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1,
+        "semantics_sha256": CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1,
+        "invalid_reason_mask_sha256": reason_sha256,
+        **evidence,
+    }
 
 
 def repair_common_timestamp_plateaus(
@@ -506,7 +988,8 @@ def causal_uniform_resample_radar_views_v1(
 ) -> CausalUniformRadarResampleV1:
     """Resample independently timed radar views onto a causal uniform grid.
 
-    Version-1 uses an arithmetic mean over half-open intervals
+    Version-1 uses a scaled-float64 arithmetic mean with checked float32
+    conversion over half-open intervals
     ``[right_edge - 1/output_hz, right_edge)``.  Consequently regular 40 Hz
     samples at ``0, 25, 50, 75, ...`` milliseconds reproduce the legacy
     non-overlapping four-frame mean exactly at 10 Hz, while the returned time
@@ -520,7 +1003,9 @@ def causal_uniform_resample_radar_views_v1(
     frame after a sequence discontinuity or any duplicate-clock plateau.
     ``gap_policy='mask'`` writes exact zero and exposes validity structurally;
     ``gap_policy='raise'`` fails the complete call if any output interval is
-    invalid.
+    invalid.  The additive ``invalid_reason_mask`` records every independent
+    cause with the versioned uint8 bit semantics; it never infers a cause from
+    a numeric zero.
 
     No sample stamped at or after an output edge contributes to that output.
     This is a target-free timing transform and performs no interpolation from
@@ -752,6 +1237,9 @@ def causal_uniform_resample_radar_views_v1(
     )
     valid_mask = np.zeros((view_count, len(right_edges)), dtype=bool)
     sample_counts = np.zeros((view_count, len(right_edges)), dtype=np.int32)
+    invalid_reason_mask = np.zeros(
+        (view_count, len(right_edges)), dtype=np.uint8
+    )
 
     for view_index, (payload, coordinates, sequence) in enumerate(
         zip(
@@ -763,15 +1251,8 @@ def causal_uniform_resample_radar_views_v1(
     ):
         sequence_gap_coordinates = coordinates[1:][np.diff(sequence) != 1]
         plateau_coordinates = coordinates[1:][np.diff(coordinates) == 0]
-        empty_count = 0
-        temporal_gap_count = 0
-        sequence_gap_count = 0
-        timestamp_plateau_count = 0
-        nonfinite_count = 0
         maximum_observed_bin_gap = 0.0
-        for output_index, (right, right_coordinate) in enumerate(
-            zip(right_edges, right_edge_coordinates, strict=True)
-        ):
+        for output_index, right_coordinate in enumerate(right_edge_coordinates):
             left_coordinate = right_coordinate - interval_coordinate
             lower = int(
                 np.searchsorted(coordinates, left_coordinate, side="left")
@@ -781,9 +1262,9 @@ def causal_uniform_resample_radar_views_v1(
             )
             count = upper - lower
             sample_counts[view_index, output_index] = count
+            reason = CausalUniformInvalidReasonV1(0)
             if count <= 0:
-                empty_count += 1
-                continue
+                reason |= CausalUniformInvalidReasonV1.EMPTY_INTERVAL
 
             bin_coordinates = coordinates[lower:upper]
             coverage_points = np.concatenate(
@@ -793,7 +1274,7 @@ def causal_uniform_resample_radar_views_v1(
                     np.asarray([right_coordinate], dtype=coordinates.dtype),
                 )
             )
-            observed_gap_coordinate = float(np.max(np.diff(coverage_points)))
+            observed_gap_coordinate = int(np.max(np.diff(coverage_points)))
             observed_gap = (
                 observed_gap_coordinate / _FIXED_POINT_TICKS_PER_SECOND
             )
@@ -802,7 +1283,7 @@ def causal_uniform_resample_radar_views_v1(
                 observed_gap_coordinate > maximum_gap_coordinate
             )
             if gap_invalid:
-                temporal_gap_count += 1
+                reason |= CausalUniformInvalidReasonV1.TEMPORAL_GAP
 
             sequence_invalid = bool(
                 np.any(
@@ -811,7 +1292,7 @@ def causal_uniform_resample_radar_views_v1(
                 )
             )
             if sequence_invalid:
-                sequence_gap_count += 1
+                reason |= CausalUniformInvalidReasonV1.FRAME_SEQUENCE_GAP
 
             plateau_invalid = bool(
                 np.any(
@@ -820,23 +1301,23 @@ def causal_uniform_resample_radar_views_v1(
                 )
             )
             if plateau_invalid:
-                timestamp_plateau_count += 1
+                reason |= CausalUniformInvalidReasonV1.TIMESTAMP_PLATEAU
 
             selected = np.asarray(payload[lower:upper])
-            finite = bool(np.isfinite(selected).all())
-            if not finite:
-                nonfinite_count += 1
-            valid = (
-                not gap_invalid
-                and not sequence_invalid
-                and not plateau_invalid
-                and finite
+            selected_finite = bool(np.isfinite(selected).all())
+            aggregate = (
+                _stable_float32_interval_mean_v1(selected)
+                if count > 0 and selected_finite
+                else None
             )
+            if not selected_finite or (count > 0 and aggregate is None):
+                reason |= CausalUniformInvalidReasonV1.NONFINITE_PAYLOAD
+            invalid_reason_mask[view_index, output_index] = np.uint8(reason)
+            valid = reason == 0
             valid_mask[view_index, output_index] = valid
             if valid:
-                output[view_index, output_index] = selected.mean(
-                    axis=0, dtype=np.float32
-                )
+                assert aggregate is not None
+                output[view_index, output_index] = aggregate
 
         counts = sample_counts[view_index]
         frame_accounting = _frame_accounting_v1(
@@ -853,15 +1334,34 @@ def causal_uniform_resample_radar_views_v1(
             raise RadarTimingError(
                 "frame accounting disagrees with output-interval sample counts"
             )
+        if (
+            not frame_accounting["coverage_complete"]
+            or frame_accounting["unaccounted_payload_frame_count"] != 0
+            or frame_accounting["category_sum"]
+            != frame_accounting["retained_input_frame_count"]
+        ):
+            raise RadarTimingError("not every retained frame is exactly accounted")
+        view_reasons = invalid_reason_mask[view_index]
+        reason_counts = {
+            name: int(
+                np.count_nonzero(np.bitwise_and(view_reasons, np.uint8(flag)))
+            )
+            for name, flag, _ in _INVALID_REASON_FLAGS_V1
+        }
         per_view_documents[view_index].update(
             {
                 "valid_output_count": int(valid_mask[view_index].sum()),
                 "invalid_output_count": int((~valid_mask[view_index]).sum()),
-                "empty_interval_count": empty_count,
-                "temporal_gap_interval_count": temporal_gap_count,
-                "sequence_gap_interval_count": sequence_gap_count,
-                "timestamp_plateau_interval_count": timestamp_plateau_count,
-                "nonfinite_interval_count": nonfinite_count,
+                "empty_interval_count": reason_counts["empty_interval"],
+                "temporal_gap_interval_count": reason_counts["temporal_gap"],
+                "sequence_gap_interval_count": reason_counts[
+                    "frame_sequence_gap"
+                ],
+                "timestamp_plateau_interval_count": reason_counts[
+                    "timestamp_plateau"
+                ],
+                "nonfinite_interval_count": reason_counts["nonfinite_payload"],
+                "invalid_reason_interval_counts": reason_counts,
                 "minimum_samples_per_interval": int(np.min(counts)),
                 "maximum_samples_per_interval": int(np.max(counts)),
                 "maximum_observed_interval_gap_s": maximum_observed_bin_gap,
@@ -872,15 +1372,20 @@ def causal_uniform_resample_radar_views_v1(
             }
         )
 
-    invalid_count = int(np.count_nonzero(~valid_mask))
+    invalid_reason_evidence = _invalid_reason_array_evidence_v1(
+        invalid_reason_mask,
+        valid_mask,
+        output,
+        sample_counts,
+    )
+    invalid_count = int(invalid_reason_evidence["invalid_interval_count"])
     if gap_policy == "raise" and invalid_count:
         raise RadarTimingError(
             f"causal uniform resampling produced {invalid_count} invalid view-intervals"
         )
-    if np.any(output[~valid_mask] != 0.0):
-        raise RadarTimingError("invalid resampling cells violated exact-zero policy")
 
     all_views_valid = np.all(valid_mask, axis=0)
+    invalid_reason_mask_sha256 = canonical_ndarray_sha256(invalid_reason_mask)
     content_hashes = {
         "hash_schema_version": _CANONICAL_ARRAY_HASH_SCHEMA,
         "corrected_input_values_sha256": canonical_ndarray_sequence_sha256(
@@ -896,6 +1401,10 @@ def causal_uniform_resample_radar_views_v1(
         "output_values_sha256": canonical_ndarray_sha256(output),
         "valid_mask_sha256": canonical_ndarray_sha256(valid_mask),
         "sample_counts_sha256": canonical_ndarray_sha256(sample_counts),
+        "invalid_reason_mask_sha256": invalid_reason_mask_sha256,
+        "invalid_reason_semantics_sha256": (
+            CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+        ),
     }
     transform_evidence_sha256 = hashlib.sha256(
         json.dumps(
@@ -927,9 +1436,17 @@ def causal_uniform_resample_radar_views_v1(
         "any_view_invalid_interval_count": int((~all_views_valid).sum()),
         "content_hashes": content_hashes,
         "transform_evidence_sha256": transform_evidence_sha256,
+        "invalid_reason_contract": {
+            "semantics": causal_uniform_invalid_reason_semantics_v1(),
+            "semantics_sha256": (
+                CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1
+            ),
+            "invalid_reason_mask_sha256": invalid_reason_mask_sha256,
+            **invalid_reason_evidence,
+        },
         "per_view": per_view_documents,
     }
-    return CausalUniformRadarResampleV1(
+    result = CausalUniformRadarResampleV1(
         origin_epoch_s=origin,
         times_s=right_edges,
         values=output,
@@ -937,7 +1454,10 @@ def causal_uniform_resample_radar_views_v1(
         sample_counts=sample_counts,
         interval_s=interval_s,
         summary=summary,
+        invalid_reason_mask=invalid_reason_mask,
     )
+    validate_causal_uniform_invalid_reason_contract_v1(result)
+    return result
 
 
 def block_mean_times(times_s: np.ndarray, factor: int) -> np.ndarray:
@@ -956,9 +1476,14 @@ __all__ = [
     "RadarTimingError",
     "CommonRadarTimeline",
     "CAUSAL_UNIFORM_RESAMPLE_SCHEMA_V1",
+    "CAUSAL_UNIFORM_INVALID_REASON_SCHEMA_V1",
+    "CAUSAL_UNIFORM_INVALID_REASON_SEMANTICS_SHA256_V1",
+    "CausalUniformInvalidReasonV1",
     "CausalUniformRadarResampleV1",
     "canonical_ndarray_sha256",
     "canonical_ndarray_sequence_sha256",
+    "causal_uniform_invalid_reason_semantics_v1",
+    "validate_causal_uniform_invalid_reason_contract_v1",
     "repair_common_timestamp_plateaus",
     "fuse_common_radar_timeline",
     "causal_uniform_resample_radar_views_v1",

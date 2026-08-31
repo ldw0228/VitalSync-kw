@@ -13,12 +13,16 @@ metadata only.  They are explicitly forbidden as deployable model features.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import asdict
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -35,16 +39,24 @@ from snn_rr.acquisition_protocol import (  # noqa: E402
     BoundaryCandidate,
     DecodedProtocol,
     SessionProtocolRecord,
+    _source_snapshot,
     decode_ordered_protocol,
     load_dataset_issue_records,
     load_protocol_config,
     records_by_session,
 )
 from snn_rr.acquisition_contract import (  # noqa: E402
+    ACQUISITION_SCHEMA_V3,
+    RAW_CONSUMPTION_BINDING_SCHEMA,
     AcquisitionCohortAuthority,
+    build_v3_sync_signals_artifact_binding,
     build_v2_raw_input_binding_state,
     build_v2_xethru_record_contract,
     load_acquisition_cohort_authority,
+    validate_consumption_against_contract,
+    validate_timing_reason_authority,
+    validate_v3_sync_signals_artifact,
+    v3_diagnostic_execution_source_generation,
 )
 from snn_rr.data import (  # noqa: E402
     SubjectManifest,
@@ -65,6 +77,11 @@ from snn_rr.radar_timing import (  # noqa: E402
     CausalUniformRadarResampleV1,
     causal_uniform_resample_radar_views_v1,
 )
+from snn_rr.raw_snapshot import (  # noqa: E402
+    LoadedRawSession,
+    RawConsumptionReceipt,
+    RawSessionReader,
+)
 from snn_rr.synchronization import (  # noqa: E402
     MarkerCandidate,
     SynchronizationResult,
@@ -83,7 +100,9 @@ from snn_rr.synchronization import (  # noqa: E402
 
 
 SCHEMA_VERSION = "snn_rr.acquisition_reconstruction.v2"
+SCHEMA_VERSION_V3 = ACQUISITION_SCHEMA_V3
 DEFAULT_OUTPUT = PROJECT_ROOT / "artifacts/acquisition/reconstruction_v2"
+DEFAULT_OUTPUT_V3 = PROJECT_ROOT / "artifacts/acquisition/reconstruction_v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,7 +130,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / "configs/acquisition_cohort_v1.yaml",
     )
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--schema-version",
+        choices=("v3", "legacy-v2"),
+        default="v3",
+        help="v3 is one-shot diagnostic reconstruction; legacy-v2 is historical",
+    )
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--approval-dir", type=Path)
     parser.add_argument("--subjects", nargs="*", help="optional IDs such as S02_RJS")
     parser.add_argument("--force", action="store_true")
@@ -135,9 +160,14 @@ def _sha256_file(path: Path) -> str:
 
 def _sha256_paths(paths: Iterable[Path]) -> str:
     digest = hashlib.sha256()
-    for path in sorted({item.resolve() for item in paths}, key=str):
+    for path in sorted(
+        {item.expanduser().absolute() for item in paths}, key=str
+    ):
+        _payload, file_sha256 = _source_snapshot(
+            path, label="acquisition pipeline path snapshot"
+        )
         digest.update(str(path).encode("utf-8"))
-        digest.update(bytes.fromhex(_sha256_file(path)))
+        digest.update(bytes.fromhex(file_sha256))
     return digest.hexdigest()
 
 
@@ -151,6 +181,25 @@ def _canonical_sha256(value: Any) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _legacy_v2_resampling_projection(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Serialize the immutable eight-hash v2 resampling contract."""
+
+    projected = json.loads(
+        json.dumps(summary, ensure_ascii=False, allow_nan=False)
+    )
+    content_hashes = projected.get("content_hashes")
+    if not isinstance(content_hashes, dict):
+        raise ValueError("resampling summary lacks content hashes")
+    content_hashes.pop("invalid_reason_mask_sha256", None)
+    content_hashes.pop("invalid_reason_semantics_sha256", None)
+    projected.pop("invalid_reason_contract", None)
+    for view in projected.get("per_view", []):
+        if isinstance(view, dict):
+            view.pop("invalid_reason_interval_counts", None)
+    projected["transform_evidence_sha256"] = _canonical_sha256(content_hashes)
+    return projected
 
 
 def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
@@ -287,6 +336,118 @@ def _load_radar_views(
     )
 
 
+def _load_consumed_radar_views(
+    loaded: LoadedRawSession,
+    *,
+    sync_config: Any,
+) -> tuple[
+    list[np.ndarray],
+    list[np.ndarray],
+    list[np.ndarray],
+    list[float],
+    list[str],
+    dict[str, Any],
+]:
+    """Project arrays and evidence from one already-consumed raw snapshot."""
+
+    if type(loaded) is not LoadedRawSession:
+        raise ValueError("v3 reconstruction requires an exact LoadedRawSession")
+    payloads: list[np.ndarray] = []
+    relative_times: list[np.ndarray] = []
+    frame_sequences: list[np.ndarray] = []
+    starts: list[float] = []
+    timestamp_sources: list[str] = []
+    timestamp_repairs: list[int] = []
+    metadata_warnings: list[tuple[str, ...]] = []
+    for radar_id in (1, 2, 3):
+        recording = loaded.radars[radar_id]
+        start_epoch_ms = recording.meta.start_epoch_ms
+        if start_epoch_ms is None:
+            raise ValueError(
+                f"{loaded.session_id} radar{radar_id} lacks a measured start epoch"
+            )
+        payloads.append(np.asarray(recording.bins, dtype=np.float32))
+        relative_times.append(
+            np.asarray(recording.timestamps_ms, dtype=np.float64) / 1000.0
+        )
+        frame_sequences.append(
+            np.asarray(recording.frame_sequence, dtype=np.uint32)
+        )
+        starts.append(float(start_epoch_ms) / 1000.0)
+        timestamp_sources.append(recording.meta.timestamp_source)
+        timestamp_repairs.append(recording.meta.timestamp_repairs)
+        metadata_warnings.append(tuple(recording.meta.warnings))
+    warning_evidence = _radar_metadata_warning_evidence(
+        session_id=loaded.session_id,
+        warnings_by_view=metadata_warnings,
+        sync_config=sync_config,
+    )
+    record_contract = loaded.receipt.xethru_record_contract
+    metadata_contract = loaded.receipt.xethru_metadata_contract
+    summary = {
+        "timestamp_sources": timestamp_sources,
+        "timestamp_repairs": timestamp_repairs,
+        "start_epochs_s": starts,
+        "start_spread_ms": 1000.0 * float(np.ptp(starts)),
+        "per_radar_frame_counts": [len(item) for item in payloads],
+        "xethru_record_contract": record_contract,
+        "xethru_record_contract_evidence_sha256": _canonical_sha256(
+            record_contract
+        ),
+        "xethru_metadata_contract": metadata_contract,
+        "xethru_metadata_contract_evidence_sha256": _canonical_sha256(
+            metadata_contract
+        ),
+        **warning_evidence,
+    }
+    return (
+        payloads,
+        relative_times,
+        frame_sequences,
+        starts,
+        timestamp_sources,
+        summary,
+    )
+
+
+def _v3_raw_contract_fields(
+    receipt: RawConsumptionReceipt,
+    *,
+    radar_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create and immediately validate the portable v3 raw binding fields."""
+
+    bindings = receipt.input_bindings
+    graph = receipt.raw_input_graph
+    raw_consumption = {
+        "schema": RAW_CONSUMPTION_BINDING_SCHEMA,
+        "diagnostic_only": True,
+        "scientific_authority": False,
+        "portable_projection": receipt.portable_projection,
+        "portable_content_sha256": receipt.portable_content_sha256,
+    }
+    fields = {
+        "session_id": receipt.session_id,
+        "raw_input_bindings": bindings,
+        "raw_input_bindings_sha256": _canonical_sha256(bindings),
+        "raw_input_graph": graph,
+        "raw_input_graph_sha256": _canonical_sha256(graph),
+        "raw_consumption": raw_consumption,
+        "sensor_summary": {
+            "radar": dict(radar_summary),
+            "biopac": {
+                "parser_evidence": receipt.biopac_parser_evidence.to_dict()
+            },
+        },
+    }
+    validated = validate_consumption_against_contract(receipt, fields)
+    if validated != raw_consumption:
+        raise RuntimeError(
+            f"{receipt.session_id} portable raw-consumption binding changed"
+        )
+    return fields
+
+
 def _radar_metadata_warning_evidence(
     *,
     session_id: str,
@@ -387,6 +548,8 @@ def _build_range_tracks(
     *,
     output_path: Path,
     layout_maximum_frames: int,
+    include_invalid_reason_mask: bool = False,
+    serialized_resampling_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     downsampled = resampled.values
     times = resampled.times_s
@@ -395,6 +558,10 @@ def _build_range_tracks(
         "radar_valid_mask": resampled.valid_mask.astype(bool),
         "radar_sample_counts": resampled.sample_counts.astype(np.int32),
     }
+    if include_invalid_reason_mask and resampled.invalid_reason_mask is not None:
+        arrays["radar_invalid_reason_mask"] = resampled.invalid_reason_mask.astype(
+            np.uint8
+        )
     evidence_documents: list[dict[str, Any]] = []
     selected: list[str] = []
     for radar_index in range(3):
@@ -432,7 +599,11 @@ def _build_range_tracks(
         # contract.  It cannot authorize range_aux as an inference feature.
         "layout_selection_causal": False,
         "inference_feature_eligible": False,
-        "radar_resampling": resampled.summary,
+        "radar_resampling": dict(
+            resampled.summary
+            if serialized_resampling_summary is None
+            else serialized_resampling_summary
+        ),
     }
 
 
@@ -585,9 +756,19 @@ def reconstruct_subject(
     layout_maximum_frames: int,
     reconstruction_context: Mapping[str, Any],
     force: bool,
+    schema_version: str = SCHEMA_VERSION,
 ) -> dict[str, Any]:
+    if schema_version not in {SCHEMA_VERSION, SCHEMA_VERSION_V3}:
+        raise ValueError("unsupported reconstruction schema")
+    is_v3 = schema_version == SCHEMA_VERSION_V3
+    if is_v3 and force:
+        raise ValueError("v3 reconstruction forbids --force and overwrite")
     session_dir = output_root / "sessions" / subject.subject_id
     manifest_path = session_dir / "session_manifest.json"
+    if is_v3 and manifest_path.exists():
+        raise FileExistsError(
+            f"v3 reconstruction session output already exists: {manifest_path}"
+        )
     if manifest_path.is_file() and not force:
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
         if document.get("content_sha256") != canonical_content_sha256(document):
@@ -596,7 +777,7 @@ def reconstruct_subject(
             )
         if not subject.usable:
             expected_unusable = {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": schema_version,
                 "session_id": subject.subject_id,
                 "physical_identity": identity_for_session(subject.subject_id),
                 "usable": False,
@@ -614,13 +795,23 @@ def reconstruct_subject(
                     None if session_record is None else session_record.to_dict()
                 ),
                 "review_reasons": ["raw_session_unusable"],
+                **(
+                    {}
+                    if not is_v3
+                    else {
+                        "raw_consumed_bytes_verified": False,
+                        "timing_adjudicated": False,
+                        "sync_raw_replay_verified": False,
+                        "protocol_raw_replay_verified": False,
+                    }
+                ),
             }
             expected_unusable["content_sha256"] = canonical_content_sha256(
                 expected_unusable
             )
             if document == expected_unusable:
                 return document
-            if document.get("schema_version") == SCHEMA_VERSION:
+            if document.get("schema_version") == schema_version:
                 raise ValueError(
                     f"stale reconstruction context for {subject.subject_id}; use --force"
                 )
@@ -657,7 +848,7 @@ def reconstruct_subject(
             "manual_approval_content_sha256"
         )
         if (
-            document.get("schema_version") == SCHEMA_VERSION
+            document.get("schema_version") == schema_version
             and document.get("reconstruction_context") == dict(reconstruction_context)
             and document.get("raw_input_bindings") == current_bindings
             and (
@@ -672,7 +863,7 @@ def reconstruct_subject(
             and stored_approval_hash == source_approval_hash
         ):
             return document
-        if document.get("schema_version") == SCHEMA_VERSION:
+        if document.get("schema_version") == schema_version:
             raise ValueError(
                 f"stale reconstruction context for {subject.subject_id}; use --force"
             )
@@ -680,7 +871,7 @@ def reconstruct_subject(
 
     if not subject.usable:
         document = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": schema_version,
             "session_id": subject.subject_id,
             "physical_identity": identity_for_session(subject.subject_id),
             "usable": False,
@@ -696,24 +887,89 @@ def reconstruct_subject(
             "reason": "missing paired three-radar/BIOPAC recording",
             "session_record": None if session_record is None else session_record.to_dict(),
             "review_reasons": ["raw_session_unusable"],
+            **(
+                {}
+                if not is_v3
+                else {
+                    "raw_consumed_bytes_verified": False,
+                    "timing_adjudicated": False,
+                    "sync_raw_replay_verified": False,
+                    "protocol_raw_replay_verified": False,
+                }
+            ),
         }
         document["content_sha256"] = canonical_content_sha256(document)
         _atomic_json(manifest_path, document)
         return document
 
-    preload_bindings, preload_raw_graph = build_v2_raw_input_binding_state(
-        subject, dataset_root
+    consumption_receipt: RawConsumptionReceipt | None = None
+    raw_consumption: dict[str, Any] | None = None
+    raw_consumption_receipt_binding: dict[str, Any] | None = None
+    if is_v3:
+        loaded = RawSessionReader.from_subject(
+            dataset_root,
+            subject,
+            timezone_name="Asia/Seoul",
+            fallback_rate_hz=40.0,
+            biopac_strict=False,
+            require_valid_records=True,
+        ).consume()
+        consumption_receipt = loaded.receipt
+        assert subject.selected_session is not None
+        for radar_id in (1, 2, 3):
+            discovered_stream = subject.selected_session.radars[radar_id]
+            consumed_stream = loaded.radars[radar_id]
+            if (
+                consumed_stream.meta.start_epoch_ms
+                != discovered_stream.start_epoch_ms
+                or consumed_stream.frame_count != discovered_stream.frame_count
+                or consumed_stream.meta.timestamp_source
+                != discovered_stream.timestamp_source
+                or not np.isclose(
+                    consumed_stream.meta.duration_seconds,
+                    discovered_stream.duration_seconds,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                or tuple(consumed_stream.meta.warnings)
+                != tuple(discovered_stream.warnings)
+            ):
+                raise RuntimeError(
+                    f"{subject.subject_id} selected radar{radar_id} discovery "
+                    "differs from consumed metadata"
+                )
+        biopac = loaded.biopac
+        (
+            payloads,
+            relative_times,
+            frame_sequences,
+            radar_starts,
+            timestamp_sources,
+            radar_summary,
+        ) = _load_consumed_radar_views(loaded, sync_config=sync_config)
+        raw_fields = _v3_raw_contract_fields(
+            consumption_receipt, radar_summary=radar_summary
+        )
+        bindings = dict(raw_fields["raw_input_bindings"])
+        raw_input_graph = dict(raw_fields["raw_input_graph"])
+        raw_consumption = dict(raw_fields["raw_consumption"])
+        del loaded
+    else:
+        preload_bindings, preload_raw_graph = build_v2_raw_input_binding_state(
+            subject, dataset_root
+        )
+        biopac = load_biopac_mat(subject.biopac_path, strict=False)
+        (
+            payloads,
+            relative_times,
+            frame_sequences,
+            radar_starts,
+            timestamp_sources,
+            radar_summary,
+        ) = _load_radar_views(subject, sync_config=sync_config)
+    biopac_reference_eligible = bool(
+        biopac.parser_eligible and len(biopac.warnings) == 0
     )
-    biopac = load_biopac_mat(subject.biopac_path, strict=False)
-    biopac_reference_eligible = len(biopac.warnings) == 0
-    (
-        payloads,
-        relative_times,
-        frame_sequences,
-        radar_starts,
-        timestamp_sources,
-        radar_summary,
-    ) = _load_radar_views(subject, sync_config=sync_config)
     radar_outlier_replacements: list[int] = []
     corrected_payloads: list[np.ndarray] = []
     for values in payloads:
@@ -750,11 +1006,27 @@ def reconstruct_subject(
         for item in feature_resample.summary["per_view"]
     )
     time_arithmetic = feature_resample.summary.get("time_arithmetic", {})
+    timing_reason_authority: dict[str, Any] | None = None
+    if is_v3:
+        timing_reason_authority = validate_timing_reason_authority(feature_resample)
+        timing_cells_eligible = bool(
+            timing_reason_authority["exact_mask_equivalence"]
+            and timing_reason_authority["all_invalid_explained"]
+            and timing_reason_authority["invalid_outputs_exact_positive_zero"]
+            and timing_reason_authority["valid_outputs_finite"]
+        )
+    else:
+        timing_cells_eligible = bool(feature_resample.valid_mask.all())
+    serialized_resampling_summary = (
+        feature_resample.summary
+        if is_v3
+        else _legacy_v2_resampling_projection(feature_resample.summary)
+    )
     measured_timing_eligible = bool(
         len(timestamp_sources) == 3
         and all(source == "meta_v13" for source in timestamp_sources)
         and radar_summary.get("metadata_warnings_eligible") is True
-        and feature_resample.valid_mask.all()
+        and timing_cells_eligible
         and isinstance(time_arithmetic, dict)
         and time_arithmetic.get("half_open_boundary_exact") is True
         and max(timestamp_corrections, default=0.0) <= 0.050
@@ -763,12 +1035,12 @@ def reconstruct_subject(
     radar_summary.update(
         {
             "origin_epoch_s": feature_resample.origin_epoch_s,
-            "sync_marker_resampling": feature_resample.summary,
-            "feature_resampling": feature_resample.summary,
-            "resampling_content_hashes": feature_resample.summary[
+            "sync_marker_resampling": serialized_resampling_summary,
+            "feature_resampling": serialized_resampling_summary,
+            "resampling_content_hashes": serialized_resampling_summary[
                 "content_hashes"
             ],
-            "resampling_transform_evidence_sha256": feature_resample.summary[
+            "resampling_transform_evidence_sha256": serialized_resampling_summary[
                 "transform_evidence_sha256"
             ],
             "maximum_timestamp_correction_s": max(
@@ -777,6 +1049,11 @@ def reconstruct_subject(
             "unaccounted_payload_frame_count": unaccounted_payload_frames,
             "timestamp_plateau_interval_count": timestamp_plateau_intervals,
             "measured_timing_eligible": measured_timing_eligible,
+            **(
+                {}
+                if timing_reason_authority is None
+                else {"timing_reason_authority": timing_reason_authority}
+            ),
         }
     )
     rsp_times_s = np.arange(len(biopac.rsp), dtype=np.float64) / biopac.sample_rate_hz
@@ -847,13 +1124,46 @@ def reconstruct_subject(
         rsp_markers=base_result.rsp_markers,
         diagnostics=diagnostics,
     )
-    bindings, raw_input_graph = build_v2_raw_input_binding_state(
-        subject, dataset_root
-    )
-    if bindings != preload_bindings or raw_input_graph != preload_raw_graph:
-        raise RuntimeError(
-            f"raw acquisition inputs changed while loading {subject.subject_id}"
+    if is_v3:
+        assert consumption_receipt is not None and raw_consumption is not None
+        validate_consumption_against_contract(
+            consumption_receipt,
+            {
+                "session_id": subject.subject_id,
+                "raw_input_bindings": bindings,
+                "raw_input_bindings_sha256": _canonical_sha256(bindings),
+                "raw_input_graph": raw_input_graph,
+                "raw_input_graph_sha256": _canonical_sha256(raw_input_graph),
+                "raw_consumption": raw_consumption,
+                "sensor_summary": {
+                    "radar": radar_summary,
+                    "biopac": biopac.summary(),
+                },
+            },
         )
+        raw_receipt_document = consumption_receipt.to_dict()
+        raw_receipt_path = session_dir / "raw_consumption_receipt.json"
+        _atomic_json(raw_receipt_path, raw_receipt_document)
+        stored_raw_receipt = json.loads(raw_receipt_path.read_text(encoding="utf-8"))
+        if stored_raw_receipt != raw_receipt_document:
+            raise RuntimeError(
+                f"{subject.subject_id} raw-consumption receipt changed on write"
+            )
+        raw_consumption_receipt_binding = {
+            "artifact": str(raw_receipt_path.relative_to(output_root)),
+            "artifact_sha256": _sha256_file(raw_receipt_path),
+            "content_sha256": consumption_receipt.content_sha256,
+            "diagnostic_only": True,
+            "scientific_authority": False,
+        }
+    else:
+        bindings, raw_input_graph = build_v2_raw_input_binding_state(
+            subject, dataset_root
+        )
+        if bindings != preload_bindings or raw_input_graph != preload_raw_graph:
+            raise RuntimeError(
+                f"raw acquisition inputs changed while loading {subject.subject_id}"
+            )
     receipt = build_sync_receipt(
         sync_result,
         session_id=subject.subject_id,
@@ -870,8 +1180,11 @@ def reconstruct_subject(
         manual_approval = validate_manual_approval(manual_approval, validated_receipt)
         approval_artifact_path = session_dir / "manual_approval.json"
         _atomic_json(approval_artifact_path, manual_approval)
-    authorized = synchronization_is_authorized(
-        validated_receipt, manual_approval=manual_approval
+    authorized = bool(
+        not is_v3
+        and synchronization_is_authorized(
+            validated_receipt, manual_approval=manual_approval
+        )
     )
 
     # Radar-only candidates are mapped through a proposal learned from noisy
@@ -892,13 +1205,37 @@ def reconstruct_subject(
         session_record=session_record,
     )
 
-    _atomic_npz(
-        session_dir / "sync_signals.npz",
-        radar_times_s=radar_times_s.astype(np.float64),
-        radar_motion_robust_z=envelope.robust_z.astype(np.float32),
-        radar_motion_valid_mask=envelope.valid_mask.astype(bool),
-        rsp_marker_times_s=np.asarray([item.time_s for item in rsp_markers]),
-        radar_marker_times_s=np.asarray([item.time_s for item in radar_markers]),
+    sync_signal_arrays: dict[str, np.ndarray] = {
+        "radar_times_s": radar_times_s.astype(np.float64),
+        "radar_motion_robust_z": envelope.robust_z.astype(np.float32),
+        "radar_motion_valid_mask": envelope.valid_mask.astype(bool),
+        "rsp_marker_times_s": np.asarray([item.time_s for item in rsp_markers]),
+        "radar_marker_times_s": np.asarray(
+            [item.time_s for item in radar_markers]
+        ),
+    }
+    if is_v3:
+        if feature_resample.invalid_reason_mask is None:
+            raise RuntimeError("v3 timing reason mask disappeared before publication")
+        sync_signal_arrays.update(
+            {
+                "radar_resample_valid_mask": feature_resample.valid_mask.astype(
+                    bool
+                ),
+                "radar_invalid_reason_mask": (
+                    feature_resample.invalid_reason_mask.astype(np.uint8)
+                ),
+            }
+        )
+    sync_signals_path = session_dir / "sync_signals.npz"
+    _atomic_npz(sync_signals_path, **sync_signal_arrays)
+    sync_signals_artifact = (
+        build_v3_sync_signals_artifact_binding(
+            sync_signals_path,
+            artifact_relative_path=str(sync_signals_path.relative_to(output_root)),
+        )
+        if is_v3
+        else None
     )
     range_document: dict[str, Any] = {
         "status": "not_built",
@@ -913,6 +1250,8 @@ def reconstruct_subject(
                 feature_resample,
                 output_path=session_dir / "range_tracks.npz",
                 layout_maximum_frames=layout_maximum_frames,
+                include_invalid_reason_mask=is_v3,
+                serialized_resampling_summary=serialized_resampling_summary,
             ),
         }
 
@@ -935,6 +1274,8 @@ def reconstruct_subject(
         review_reasons.append("radar_timestamp_plateau_structurally_masked")
     review_reasons.append("independent_raw_derived_sync_verifier_absent")
     review_reasons.append("independent_protocol_decode_verifier_absent")
+    if is_v3:
+        review_reasons.append("raw_consumption_receipt_diagnostic_only")
     alignment_eligible = bool(
         authorized and measured_timing_eligible and biopac_reference_eligible
     )
@@ -950,15 +1291,25 @@ def reconstruct_subject(
     # The base RR feature cache does not consume the unconfirmed I/Q-derived
     # range tracker or protocol stage labels.  Its scientific gate therefore
     # depends only on measured timing and an authorized radar/BIOPAC mapping.
-    strict_cache_eligible = alignment_eligible
-    scientific_eligible = strict_cache_eligible
+    strict_cache_eligible = bool(alignment_eligible and not is_v3)
+    scientific_eligible = bool(strict_cache_eligible and not is_v3)
 
     document: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "created_at_utc": _utc_now(),
         "session_id": subject.subject_id,
         "physical_identity": identity_for_session(subject.subject_id),
         "usable": True,
+        **(
+            {}
+            if not is_v3
+            else {
+                "raw_consumed_bytes_verified": True,
+                "timing_adjudicated": True,
+                "sync_raw_replay_verified": False,
+                "protocol_raw_replay_verified": False,
+            }
+        ),
         "reconstruction_context": dict(reconstruction_context),
         "scientific_eligible": scientific_eligible,
         "eligibility": {
@@ -974,6 +1325,14 @@ def reconstruct_subject(
         "raw_input_bindings": bindings,
         "raw_input_graph": raw_input_graph,
         "raw_input_graph_sha256": _canonical_sha256(raw_input_graph),
+        **({} if raw_consumption is None else {"raw_consumption": raw_consumption}),
+        **(
+            {}
+            if raw_consumption_receipt_binding is None
+            else {
+                "raw_consumption_receipt": raw_consumption_receipt_binding
+            }
+        ),
         "sensor_summary": {
             "radar": radar_summary,
             "biopac": biopac.summary(),
@@ -1000,6 +1359,11 @@ def reconstruct_subject(
             ),
             "match_count": len(sync_result.matches),
         },
+        **(
+            {}
+            if sync_signals_artifact is None
+            else {"sync_signals_artifact": sync_signals_artifact}
+        ),
         "protocol": protocol.to_dict(),
         "protocol_contract": {
             "schema_version": protocol_config.schema_version,
@@ -1080,9 +1444,60 @@ def _validate_session_publication(
     if not subject.usable:
         return disk_document
 
-    current_bindings, current_raw_graph = build_v2_raw_input_binding_state(
-        subject, dataset_root
-    )
+    is_v3 = disk_document.get("schema_version") == SCHEMA_VERSION_V3
+    if is_v3:
+        current_bindings = disk_document.get("raw_input_bindings")
+        current_raw_graph = disk_document.get("raw_input_graph")
+        raw_consumption = disk_document.get("raw_consumption")
+        if not isinstance(raw_consumption, Mapping):
+            raise RuntimeError(f"{session_id} raw-consumption binding is missing")
+        portable = raw_consumption.get("portable_projection")
+        if (
+            not isinstance(portable, Mapping)
+            or raw_consumption.get("portable_content_sha256")
+            != _canonical_sha256(portable)
+        ):
+            raise RuntimeError(f"{session_id} portable raw-consumption hash mismatch")
+        raw_receipt_binding = disk_document.get("raw_consumption_receipt")
+        if not isinstance(raw_receipt_binding, Mapping) or set(
+            raw_receipt_binding
+        ) != {
+            "artifact",
+            "artifact_sha256",
+            "content_sha256",
+            "diagnostic_only",
+            "scientific_authority",
+        }:
+            raise RuntimeError(f"{session_id} raw-consumption receipt binding is invalid")
+        raw_receipt_path = _resolve_publication_artifact(
+            output_root,
+            raw_receipt_binding.get("artifact"),
+            label=f"{session_id} raw-consumption receipt",
+        )
+        raw_receipt_document = json.loads(
+            raw_receipt_path.read_text(encoding="utf-8")
+        )
+        if (
+            raw_receipt_binding.get("diagnostic_only") is not True
+            or raw_receipt_binding.get("scientific_authority") is not False
+            or raw_receipt_binding.get("artifact_sha256")
+            != _sha256_file(raw_receipt_path)
+            or raw_receipt_binding.get("content_sha256")
+            != raw_receipt_document.get("content_sha256")
+            or raw_receipt_document.get("content_sha256")
+            != canonical_content_sha256(raw_receipt_document)
+            or raw_receipt_document.get("portable_projection") != portable
+            or raw_receipt_document.get("portable_content_sha256")
+            != raw_consumption.get("portable_content_sha256")
+        ):
+            raise RuntimeError(f"{session_id} raw-consumption receipt changed")
+        validate_v3_sync_signals_artifact(
+            disk_document, reconstruction_root=output_root
+        )
+    else:
+        current_bindings, current_raw_graph = build_v2_raw_input_binding_state(
+            subject, dataset_root
+        )
     if disk_document.get("raw_input_bindings") != current_bindings:
         raise RuntimeError(f"{session_id} raw input bindings changed")
     if disk_document.get("raw_input_bindings_sha256") != _canonical_sha256(
@@ -1161,15 +1576,139 @@ def _validate_session_publication(
     return disk_document
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Return whether either resolved path contains the other."""
+
+    left_resolved = left.resolve(strict=False)
+    right_resolved = right.resolve(strict=False)
+    try:
+        left_resolved.relative_to(right_resolved)
+        return True
+    except ValueError:
+        pass
+    try:
+        right_resolved.relative_to(left_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def _prepare_v3_staging_root(
+    final_root: Path,
+    *,
+    protected_sources: Iterable[Path],
+) -> Path:
+    """Create a private unpublished sibling for a new no-overwrite v3 root."""
+
+    final = final_root
+    if os.path.lexists(final):
+        raise FileExistsError(f"v3 output root must be absent: {final}")
+    for source in protected_sources:
+        if _paths_overlap(final, source):
+            raise ValueError(f"v3 output overlaps protected source: {source}")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{final.name}.unpublished-",
+            dir=final.parent,
+        )
+    )
+    os.chmod(staging, 0o700)
+    return staging
+
+
+def _publish_v3_root_noreplace(staging_root: Path, final_root: Path) -> None:
+    """Atomically publish one complete directory without replacing a peer."""
+
+    staging = staging_root.resolve(strict=True)
+    final = final_root
+    if staging.parent != final.parent:
+        raise RuntimeError("v3 staging/final roots must be siblings")
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace directory publication is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(staging),
+        -100,
+        os.fsencode(final),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(f"v3 output was concurrently published: {final}")
+        raise OSError(error_number, os.strerror(error_number), str(final))
+    parent_fd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _fsync_v3_staging_tree(staging_root: Path) -> None:
+    """Make every staged regular file and directory durable before rename."""
+
+    for current_root, directory_names, filenames in os.walk(
+        staging_root, topdown=False, followlinks=False
+    ):
+        current = Path(current_root)
+        for filename in filenames:
+            path = current / filename
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        for directory_name in directory_names:
+            directory = current / directory_name
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        descriptor = os.open(
+            current,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def main() -> int:
     args = parse_args()
+    is_v3 = args.schema_version == "v3"
+    schema_version = SCHEMA_VERSION_V3 if is_v3 else SCHEMA_VERSION
+    if is_v3 and args.force:
+        raise ValueError("v3 reconstruction forbids --force and overwrite")
     dataset_root = args.dataset_root.resolve()
-    output_root = args.output_dir.resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
     sync_config_path = args.sync_config.resolve()
     protocol_config_path = args.protocol_config.resolve()
     spreadsheet_path = args.spreadsheet.resolve()
     cohort_authority_path = args.cohort_authority.resolve()
+    requested_output = (
+        DEFAULT_OUTPUT_V3 if args.output_dir is None and is_v3 else
+        DEFAULT_OUTPUT if args.output_dir is None else args.output_dir
+    )
+    requested_output = Path(os.path.abspath(os.fspath(requested_output)))
+    final_output_root = requested_output.parent.resolve() / requested_output.name
     parsed_input_hashes = {
         "sync_config_sha256": _sha256_file(sync_config_path),
         "protocol_config_sha256": _sha256_file(protocol_config_path),
@@ -1209,6 +1748,7 @@ def main() -> int:
     _validate_dataset_against_cohort_authority(dataset, cohort_authority)
     pipeline_paths = [
         Path(__file__),
+        SOURCE_ROOT / "snn_rr/__init__.py",
         SOURCE_ROOT / "snn_rr/acquisition_contract.py",
         SOURCE_ROOT / "snn_rr/data.py",
         SOURCE_ROOT / "snn_rr/synchronization.py",
@@ -1216,15 +1756,27 @@ def main() -> int:
         SOURCE_ROOT / "snn_rr/radar_timing.py",
         SOURCE_ROOT / "snn_rr/range_tracking.py",
         SOURCE_ROOT / "snn_rr/preprocess.py",
+        SOURCE_ROOT / "snn_rr/raw_snapshot.py",
     ]
     pipeline_digest = _sha256_paths(pipeline_paths)
+    execution_source_generation = (
+        v3_diagnostic_execution_source_generation(pipeline_digest)
+        if is_v3
+        else None
+    )
     reconstruction_context = {
+        "schema_version": schema_version,
         "pipeline_sha256": pipeline_digest,
         **parsed_input_hashes,
         "cohort_authority_content_sha256": cohort_authority.content_sha256,
         "subjects_filter_applied": args.subjects is not None,
         "build_range_tracks": not args.skip_range_tracks,
         "layout_maximum_frames": args.layout_maximum_frames,
+        **(
+            {"execution_source_generation": execution_source_generation}
+            if is_v3
+            else {}
+        ),
     }
     expected_session_ids = cohort_authority.expected_session_ids
     expected_usable_session_ids = cohort_authority.expected_usable_session_ids
@@ -1235,6 +1787,26 @@ def main() -> int:
         missing = wanted - {item.subject_id for item in selected}
         if missing:
             raise KeyError(f"unknown subjects: {sorted(missing)}")
+
+    if is_v3:
+        protected_sources = [
+            dataset_root,
+            sync_config_path,
+            protocol_config_path,
+            spreadsheet_path,
+            cohort_authority_path,
+            Path(__file__),
+            SOURCE_ROOT,
+        ]
+        if args.approval_dir is not None:
+            protected_sources.append(args.approval_dir.resolve())
+        output_root = _prepare_v3_staging_root(
+            final_output_root,
+            protected_sources=protected_sources,
+        )
+    else:
+        output_root = final_output_root
+        output_root.mkdir(parents=True, exist_ok=True)
 
     documents: list[dict[str, Any]] = []
     for subject in selected:
@@ -1253,6 +1825,7 @@ def main() -> int:
                 layout_maximum_frames=args.layout_maximum_frames,
                 reconstruction_context=reconstruction_context,
                 force=args.force,
+                schema_version=schema_version,
             )
         )
 
@@ -1266,14 +1839,15 @@ def main() -> int:
     ):
         if _sha256_file(path) != reconstruction_context[key]:
             raise RuntimeError(f"acquisition input changed during reconstruction: {path}")
-    final_dataset = build_dataset_manifest(dataset_root)
-    _validate_dataset_against_cohort_authority(
-        final_dataset, cohort_authority
-    )
-    if _canonical_sha256(final_dataset.to_dict()) != _canonical_sha256(
-        dataset.to_dict()
-    ):
-        raise RuntimeError("dataset manifest changed during reconstruction")
+    if not is_v3:
+        final_dataset = build_dataset_manifest(dataset_root)
+        _validate_dataset_against_cohort_authority(
+            final_dataset, cohort_authority
+        )
+        if _canonical_sha256(final_dataset.to_dict()) != _canonical_sha256(
+            dataset.to_dict()
+        ):
+            raise RuntimeError("dataset manifest changed during reconstruction")
     final_documents = [
         _validate_session_publication(
             subject,
@@ -1322,8 +1896,18 @@ def main() -> int:
         if item.get("synchronization", {}).get("authorized") is True
     ]
     eligible = [item for item in usable if item.get("scientific_eligible") is True]
+    raw_consumed_bytes_verified = bool(
+        usable
+        and all(item.get("raw_consumed_bytes_verified") is True for item in usable)
+    )
+    timing_adjudicated = bool(
+        usable and all(item.get("timing_adjudicated") is True for item in usable)
+    )
     root_scientific_eligible = bool(
-        full_cohort_complete and usable and len(eligible) == len(usable)
+        not is_v3
+        and full_cohort_complete
+        and usable
+        and len(eligible) == len(usable)
     )
     strict_failure_reasons: list[str] = []
     if selection_scope != "full_cohort":
@@ -1347,8 +1931,11 @@ def main() -> int:
             "independent_protocol_decode_verifier_absent",
         )
     )
+    if is_v3:
+        strict_failure_reasons.append("raw_consumption_receipts_diagnostic_only")
+        strict_failure_reasons.append("actual_loader_compiled_bytes_unbound")
     root: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "created_at_utc": _utc_now(),
         "dataset_root": str(dataset_root),
         "dataset_private_physiological_data": True,
@@ -1363,6 +1950,11 @@ def main() -> int:
         "cohort_authority_content_sha256": cohort_authority.content_sha256,
         "cohort_authority_schema": "snn_rr.acquisition_cohort_authority.v1",
         "pipeline_sha256": pipeline_digest,
+        **(
+            {"execution_source_generation": execution_source_generation}
+            if is_v3
+            else {}
+        ),
         "dataset_manifest_sha256": _canonical_sha256(dataset.to_dict()),
         "expected_session_ids": list(expected_session_ids),
         "expected_session_ids_sha256": _canonical_sha256(expected_session_ids),
@@ -1420,6 +2012,16 @@ def main() -> int:
         "full_cohort_complete": full_cohort_complete,
         "complete": full_cohort_complete,
         "scientific_eligible": root_scientific_eligible,
+        **(
+            {}
+            if not is_v3
+            else {
+                "raw_consumed_bytes_verified": raw_consumed_bytes_verified,
+                "timing_adjudicated": timing_adjudicated,
+                "sync_raw_replay_verified": False,
+                "protocol_raw_replay_verified": False,
+            }
+        ),
         "strict_failure_reasons": sorted(set(strict_failure_reasons)),
         "annotation_contract": ANNOTATION_USAGE_CONTRACT,
         "sessions": [
@@ -1428,6 +2030,27 @@ def main() -> int:
                 "physical_identity": item["physical_identity"],
                 "usable": item.get("usable", False),
                 "scientific_eligible": item.get("scientific_eligible", False),
+                **(
+                    {}
+                    if not is_v3
+                    else {
+                        "raw_consumed_bytes_verified": item.get(
+                            "raw_consumed_bytes_verified", False
+                        ),
+                        "timing_adjudicated": item.get(
+                            "timing_adjudicated", False
+                        ),
+                        "sync_raw_replay_verified": item.get(
+                            "sync_raw_replay_verified", False
+                        ),
+                        "protocol_raw_replay_verified": item.get(
+                            "protocol_raw_replay_verified", False
+                        ),
+                        "sync_authorized": item.get("synchronization", {}).get(
+                            "authorized", False
+                        ),
+                    }
+                ),
                 "manifest": f"sessions/{item['session_id']}/session_manifest.json",
                 "manifest_sha256": _sha256_file(
                     output_root
@@ -1441,7 +2064,18 @@ def main() -> int:
         ],
     }
     root["content_sha256"] = canonical_content_sha256(root)
-    _atomic_json(output_root / "manifest.json", root)
+    root_manifest_path = output_root / "manifest.json"
+    _atomic_json(root_manifest_path, root)
+    disk_root = json.loads(root_manifest_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(disk_root, dict)
+        or _canonical_sha256(disk_root) != _canonical_sha256(root)
+        or disk_root.get("content_sha256") != canonical_content_sha256(disk_root)
+    ):
+        raise RuntimeError("acquisition root changed before publication")
+    if is_v3:
+        _fsync_v3_staging_tree(output_root)
+        _publish_v3_root_noreplace(output_root, final_output_root)
     print(
         f"Reconstructed {len(documents)} sessions: {len(usable)} usable, "
         f"{len(authorized)} sync-authorized, {len(eligible)} scientific-eligible",

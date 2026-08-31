@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
+from io import BytesIO
+from pathlib import Path, PurePosixPath
 import re
 import struct
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -29,9 +30,15 @@ RADAR_BINS = 182
 RADAR_SAMPLE_RATE_HZ = 40.0
 BIOPAC_SAMPLE_RATE_HZ = 250.0
 BIOPAC_ISI_MS = 4.0
+BIOPAC_ISI_CANONICAL_UNIT = "ms"
+BIOPAC_PARSER_EVIDENCE_SCHEMA = "snn_rr.biopac_parser_evidence.v1"
 XETHRU_MAGIC = 0xA0B1C2D3
 XETHRU_META_VERSION = 13
 XETHRU_META_RECORD_FORMAT = 1024
+XETHRU_META_EVIDENCE_SCHEMA = "snn_rr.xethru_v13_metadata_evidence.v1"
+XETHRU_META_CLOSE_TIMESTAMP_POLICY = (
+    "diagnostic_only_not_a_geometry_gate_observed_post_frame_variation"
+)
 
 # On disk: uint32 zero, uint32 frame sequence, uint32 bin count, 182 float32.
 # Explicit little endian is important when the audit is run on a big-endian
@@ -52,12 +59,30 @@ _META_FIXED_RECORD = struct.Struct("<BIQQQI")
 _BIOPAC_DATETIME_RE = re.compile(
     r"(?P<date>\d{4}-\d{2}-\d{2})T(?P<hour>\d{2})[_:-](?P<minute>\d{2})[_:-](?P<second>\d{2})"
 )
+_BIOPAC_RSP_LABEL_RE = re.compile(r"(?<![A-Z0-9])RSP(?![A-Z0-9])")
+_BIOPAC_ECG_LABEL_RE = re.compile(r"(?<![A-Z0-9])ECG(?![A-Z0-9])")
 _RADAR_DIR_DATETIME_RE = re.compile(r"xethru_recording_(\d{8})_(\d{6})")
 _DATA_CHUNK_DATETIME_RE = re.compile(r"xethru_datafloat_(\d{8})_(\d{6})\.dat$")
 
 
 class DataFormatError(ValueError):
-    """Raised when a raw file cannot be interpreted safely."""
+    """Raised when a raw file cannot be interpreted safely.
+
+    ``diagnostics`` is intentionally JSON-compatible.  Callers using a
+    permissive audit path can therefore retain the exact fail-closed reason
+    without parsing exception prose.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "data_format_error",
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = dict(diagnostics or {})
 
 
 def _coerce_timezone(value: str | tzinfo | None) -> tzinfo:
@@ -113,6 +138,217 @@ def _unwrap_relative_timestamps(
 
 
 @dataclass(frozen=True, slots=True)
+class XeThruMetaIssue:
+    code: str
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"code": self.code, "severity": "error", "message": self.message}
+
+
+@dataclass(frozen=True, slots=True)
+class XeThruMetaChunkEvidence:
+    chunk_index: int
+    footer_filename: str | None
+    frame_count: int
+    record_size_mismatch_count: int
+    file_offset_mismatch_count: int
+    logical_end_mismatch_count: int
+    metadata_chunk_bytes: int
+    logical_start: int
+    logical_end: int
+    close_marker_count: int
+    close_encoded_data_size: int | None
+    close_file_offset: int | None
+    close_logical_end: int | None
+    last_frame_timestamp_ms: int | None
+    close_timestamp_ms: int | None
+    expected_filename: str | None
+    expected_bytes: int | None
+
+    @property
+    def geometry_eligible(self) -> bool:
+        return (
+            self.frame_count > 0
+            and self.record_size_mismatch_count == 0
+            and self.file_offset_mismatch_count == 0
+            and self.logical_end_mismatch_count == 0
+            and self.close_marker_count == 1
+            and self.close_encoded_data_size == 0
+            and self.close_file_offset == self.metadata_chunk_bytes
+            and self.close_logical_end == self.logical_end
+        )
+
+    @property
+    def filename_matches(self) -> bool | None:
+        if self.expected_filename is None:
+            return None
+        return self.footer_filename == self.expected_filename
+
+    @property
+    def bytes_match(self) -> bool | None:
+        if self.expected_bytes is None:
+            return None
+        return self.metadata_chunk_bytes == self.expected_bytes
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_index": self.chunk_index,
+            "footer_filename": self.footer_filename,
+            "frame_count": self.frame_count,
+            "record_bytes": XETHRU_RECORD_BYTES,
+            "record_size_mismatch_count": self.record_size_mismatch_count,
+            "file_offset_mismatch_count": self.file_offset_mismatch_count,
+            "logical_end_mismatch_count": self.logical_end_mismatch_count,
+            "metadata_chunk_bytes": self.metadata_chunk_bytes,
+            "logical_start": self.logical_start,
+            "logical_end": self.logical_end,
+            "close_marker_count": self.close_marker_count,
+            "close_encoded_data_size": self.close_encoded_data_size,
+            "close_file_offset": self.close_file_offset,
+            "close_logical_end": self.close_logical_end,
+            "last_frame_timestamp_ms": self.last_frame_timestamp_ms,
+            "close_timestamp_ms": self.close_timestamp_ms,
+            "expected_filename": self.expected_filename,
+            "expected_bytes": self.expected_bytes,
+            "filename_matches": self.filename_matches,
+            "bytes_match": self.bytes_match,
+            "geometry_eligible": self.geometry_eligible,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class XeThruMetaEvidence:
+    """Structured v13 geometry evidence, never an authorization token.
+
+    The gated rules mirror all 90 recorder metadata files present in the
+    restored cohort: 87 selected usable radar streams plus three unselected
+    streams.  Frame offsets start at zero and advance by 740 bytes within each
+    chunk; logical ends advance cumulatively; every chunk has one kind-2 close;
+    and the kind-3 footer is an exact ordered inventory.  Close timestamps are
+    retained but deliberately not gated: observed close-minus-last-frame
+    deltas are 0, 1, 2, or 16 ms, so equality would be an invented rule.
+    """
+
+    payload_bytes: int
+    record_table_offset: int | None
+    footer_offset: int | None
+    footer_end_offset: int | None
+    declared_chunk_count: int | None
+    footer_filenames: tuple[str, ...]
+    frame_record_count: int
+    close_marker_count: int
+    entry_order_mismatch_count: int
+    chunk_index_set: tuple[int, ...]
+    expected_chunk_filenames: tuple[str, ...] | None
+    expected_chunk_byte_counts: tuple[int, ...] | None
+    chunks: tuple[XeThruMetaChunkEvidence, ...]
+    issues: tuple[XeThruMetaIssue, ...]
+
+    @property
+    def internal_geometry_eligible(self) -> bool:
+        expected_indices = tuple(range(len(self.chunks)))
+        table_span_exact = (
+            self.record_table_offset is not None
+            and self.footer_offset
+            == self.record_table_offset
+            + (self.frame_record_count + self.close_marker_count)
+            * _META_FIXED_RECORD.size
+        )
+        try:
+            footer_span_exact = (
+                self.footer_offset is not None
+                and self.footer_end_offset
+                == self.footer_offset
+                + 5
+                + sum(
+                    4 + len(name.encode("utf-8")) + 1
+                    for name in self.footer_filenames
+                )
+            )
+        except UnicodeEncodeError:
+            footer_span_exact = False
+        return (
+            not self.issues
+            and bool(self.chunks)
+            and table_span_exact
+            and footer_span_exact
+            and self.chunk_index_set == expected_indices
+            and self.declared_chunk_count == len(self.chunks)
+            and self.footer_filenames
+            == tuple(item.footer_filename for item in self.chunks)
+            and self.frame_record_count
+            == sum(item.frame_count for item in self.chunks)
+            and self.close_marker_count == len(self.chunks)
+            and self.entry_order_mismatch_count == 0
+            and self.footer_end_offset == self.payload_bytes
+            and all(item.geometry_eligible for item in self.chunks)
+        )
+
+    @property
+    def expected_graph_bound(self) -> bool:
+        return (
+            self.expected_chunk_filenames is not None
+            and self.expected_chunk_byte_counts is not None
+        )
+
+    @property
+    def exact_graph_join(self) -> bool:
+        return (
+            self.expected_graph_bound
+            and len(self.chunks) == len(self.expected_chunk_filenames or ())
+            and len(self.chunks) == len(self.expected_chunk_byte_counts or ())
+            and all(
+                item.filename_matches is True and item.bytes_match is True
+                for item in self.chunks
+            )
+        )
+
+    @property
+    def consumption_eligible(self) -> bool:
+        return self.internal_geometry_eligible and self.exact_graph_join
+
+    def _document(self) -> dict[str, Any]:
+        return {
+            "schema": XETHRU_META_EVIDENCE_SCHEMA,
+            "diagnostic_only": True,
+            "scientific_authority": False,
+            "record_format": XETHRU_META_RECORD_FORMAT,
+            "record_bytes": XETHRU_RECORD_BYTES,
+            "close_timestamp_policy": XETHRU_META_CLOSE_TIMESTAMP_POLICY,
+            "payload_bytes": self.payload_bytes,
+            "record_table_offset": self.record_table_offset,
+            "footer_offset": self.footer_offset,
+            "footer_end_offset": self.footer_end_offset,
+            "declared_chunk_count": self.declared_chunk_count,
+            "footer_filenames": list(self.footer_filenames),
+            "frame_record_count": self.frame_record_count,
+            "close_marker_count": self.close_marker_count,
+            "entry_order_mismatch_count": self.entry_order_mismatch_count,
+            "chunk_index_set": list(self.chunk_index_set),
+            "expected_chunk_filenames": (
+                None
+                if self.expected_chunk_filenames is None
+                else list(self.expected_chunk_filenames)
+            ),
+            "expected_chunk_byte_counts": (
+                None
+                if self.expected_chunk_byte_counts is None
+                else list(self.expected_chunk_byte_counts)
+            ),
+            "chunks": [item.to_dict() for item in self.chunks],
+            "internal_geometry_eligible": self.internal_geometry_eligible,
+            "expected_graph_bound": self.expected_graph_bound,
+            "exact_graph_join": self.exact_graph_join,
+            "consumption_eligible": self.consumption_eligible,
+            "issues": [item.to_dict() for item in self.issues],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return validate_xethru_meta_evidence(self._document())
+
+
+@dataclass(frozen=True, slots=True)
 class XeThruMeta:
     """Parsed subset of a XeThru recorder version-13 metadata file."""
 
@@ -128,6 +364,9 @@ class XeThruMeta:
     frame_record_count: int = 0
     end_marker_count: int = 0
     timestamp_repairs: int = 0
+    metadata_evidence: XeThruMetaEvidence | None = field(
+        default=None, repr=False, compare=False
+    )
     warnings: tuple[str, ...] = ()
 
     @property
@@ -167,18 +406,439 @@ class XeThruMeta:
             "chunk_filenames": list(self.chunk_filenames),
             "declared_chunk_count": self.declared_chunk_count,
             "end_marker_count": self.end_marker_count,
+            "metadata_evidence": (
+                None
+                if self.metadata_evidence is None
+                else self.metadata_evidence.to_dict()
+            ),
             "warnings": list(self.warnings),
         }
 
 
-def parse_xethru_meta(
-    path: str | Path,
+def validate_xethru_meta_evidence(
+    value: XeThruMetaEvidence | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate exact v13 table/footer/consumed-chunk join evidence."""
+
+    document = value._document() if type(value) is XeThruMetaEvidence else value
+    if not isinstance(document, Mapping):
+        raise DataFormatError(
+            "XeThru metadata evidence must be an object",
+            code="xethru_metadata_evidence_invalid",
+        )
+    expected_keys = {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "record_format",
+        "record_bytes",
+        "close_timestamp_policy",
+        "payload_bytes",
+        "record_table_offset",
+        "footer_offset",
+        "footer_end_offset",
+        "declared_chunk_count",
+        "footer_filenames",
+        "frame_record_count",
+        "close_marker_count",
+        "entry_order_mismatch_count",
+        "chunk_index_set",
+        "expected_chunk_filenames",
+        "expected_chunk_byte_counts",
+        "chunks",
+        "internal_geometry_eligible",
+        "expected_graph_bound",
+        "exact_graph_join",
+        "consumption_eligible",
+        "issues",
+    }
+    if set(document) != expected_keys:
+        raise DataFormatError(
+            "XeThru metadata evidence fields are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    if (
+        document.get("schema") != XETHRU_META_EVIDENCE_SCHEMA
+        or document.get("diagnostic_only") is not True
+        or document.get("scientific_authority") is not False
+        or document.get("record_format") != XETHRU_META_RECORD_FORMAT
+        or document.get("record_bytes") != XETHRU_RECORD_BYTES
+        or document.get("close_timestamp_policy")
+        != XETHRU_META_CLOSE_TIMESTAMP_POLICY
+    ):
+        raise DataFormatError(
+            "XeThru metadata evidence contract constants are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+
+    def exact_int(name: str, *, nullable: bool = False) -> int | None:
+        item = document.get(name)
+        if nullable and item is None:
+            return None
+        if type(item) is not int or item < 0:
+            raise DataFormatError(
+                f"XeThru metadata evidence {name} is invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+        return item
+
+    payload_bytes = exact_int("payload_bytes")
+    record_table_offset = exact_int("record_table_offset", nullable=True)
+    footer_offset = exact_int("footer_offset", nullable=True)
+    footer_end_offset = exact_int("footer_end_offset", nullable=True)
+    declared_count = exact_int("declared_chunk_count", nullable=True)
+    frame_count = exact_int("frame_record_count")
+    close_count = exact_int("close_marker_count")
+    order_mismatches = exact_int("entry_order_mismatch_count")
+    assert payload_bytes is not None
+    if payload_bytes <= 0 or any(
+        item is not None and item > payload_bytes
+        for item in (record_table_offset, footer_offset, footer_end_offset)
+    ):
+        raise DataFormatError(
+            "XeThru metadata evidence byte offsets are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    if (
+        record_table_offset is not None
+        and footer_offset is not None
+        and record_table_offset > footer_offset
+    ) or (
+        footer_offset is not None
+        and footer_end_offset is not None
+        and footer_offset > footer_end_offset
+    ):
+        raise DataFormatError(
+            "XeThru metadata evidence offset ordering is invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+
+    def string_list(
+        name: str, *, nullable: bool = False, allow_empty: bool = False
+    ) -> tuple[str, ...] | None:
+        item = document.get(name)
+        if nullable and item is None:
+            return None
+        if not isinstance(item, list) or any(
+            type(entry) is not str or (not allow_empty and not entry) for entry in item
+        ):
+            raise DataFormatError(
+                f"XeThru metadata evidence {name} is invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+        return tuple(item)
+
+    footer_names = string_list("footer_filenames", allow_empty=True)
+    expected_names = string_list("expected_chunk_filenames", nullable=True)
+    assert footer_names is not None
+    try:
+        encoded_footer_name_lengths = tuple(
+            len(name.encode("utf-8")) for name in footer_names
+        )
+        for name in expected_names or ():
+            name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise DataFormatError(
+            "XeThru metadata filename inventory is not valid UTF-8",
+            code="xethru_metadata_evidence_invalid",
+        ) from exc
+    for name in expected_names or ():
+        candidate = PurePosixPath(name)
+        if candidate.name != name or name in {".", ".."} or "\x00" in name:
+            raise DataFormatError(
+                "XeThru metadata evidence filename inventory is invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+    footer_inventory_valid = all(
+        bool(name)
+        and PurePosixPath(name).name == name
+        and name not in {".", ".."}
+        and "\x00" not in name
+        for name in footer_names
+    ) and len(set(footer_names)) == len(footer_names)
+    if expected_names is not None and len(set(expected_names)) != len(expected_names):
+        raise DataFormatError(
+            "XeThru metadata expected graph repeats a filename",
+            code="xethru_metadata_evidence_invalid",
+        )
+
+    expected_bytes_raw = document.get("expected_chunk_byte_counts")
+    if expected_bytes_raw is None:
+        expected_bytes: tuple[int, ...] | None = None
+    elif not isinstance(expected_bytes_raw, list) or any(
+        type(item) is not int
+        or item <= 0
+        or item % XETHRU_RECORD_BYTES != 0
+        for item in expected_bytes_raw
+    ):
+        raise DataFormatError(
+            "XeThru metadata expected chunk bytes are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    else:
+        expected_bytes = tuple(expected_bytes_raw)
+    expected_graph_bound = expected_names is not None and expected_bytes is not None
+    if (expected_names is None) != (expected_bytes is None):
+        raise DataFormatError(
+            "XeThru metadata expected graph is partially bound",
+            code="xethru_metadata_evidence_invalid",
+        )
+
+    index_set_raw = document.get("chunk_index_set")
+    if not isinstance(index_set_raw, list) or any(
+        type(item) is not int or item < 0 for item in index_set_raw
+    ):
+        raise DataFormatError(
+            "XeThru metadata chunk index set is invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    index_set = tuple(index_set_raw)
+    if index_set != tuple(sorted(set(index_set))):
+        raise DataFormatError(
+            "XeThru metadata chunk index set is not canonical",
+            code="xethru_metadata_evidence_invalid",
+        )
+
+    chunk_documents = document.get("chunks")
+    if not isinstance(chunk_documents, list):
+        raise DataFormatError(
+            "XeThru metadata chunks are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    chunk_keys = {
+        "chunk_index",
+        "footer_filename",
+        "frame_count",
+        "record_bytes",
+        "record_size_mismatch_count",
+        "file_offset_mismatch_count",
+        "logical_end_mismatch_count",
+        "metadata_chunk_bytes",
+        "logical_start",
+        "logical_end",
+        "close_marker_count",
+        "close_encoded_data_size",
+        "close_file_offset",
+        "close_logical_end",
+        "last_frame_timestamp_ms",
+        "close_timestamp_ms",
+        "expected_filename",
+        "expected_bytes",
+        "filename_matches",
+        "bytes_match",
+        "geometry_eligible",
+    }
+    cumulative = 0
+    computed_frame_count = 0
+    computed_close_count = 0
+    all_geometry_eligible = True
+    all_joined = expected_graph_bound and len(chunk_documents) == len(
+        expected_names or ()
+    ) == len(expected_bytes or ())
+    observed_chunk_names: list[str | None] = []
+    for expected_index, chunk in enumerate(chunk_documents):
+        if not isinstance(chunk, Mapping) or set(chunk) != chunk_keys:
+            raise DataFormatError(
+                "XeThru metadata chunk evidence fields are invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+
+        def chunk_int(name: str, *, nullable: bool = False) -> int | None:
+            item = chunk.get(name)
+            if nullable and item is None:
+                return None
+            if type(item) is not int or item < 0:
+                raise DataFormatError(
+                    f"XeThru metadata chunk {expected_index} {name} is invalid",
+                    code="xethru_metadata_evidence_invalid",
+                )
+            return item
+
+        chunk_index = chunk_int("chunk_index")
+        chunk_frames = chunk_int("frame_count")
+        record_size_mismatches = chunk_int("record_size_mismatch_count")
+        file_offset_mismatches = chunk_int("file_offset_mismatch_count")
+        logical_end_mismatches = chunk_int("logical_end_mismatch_count")
+        metadata_bytes = chunk_int("metadata_chunk_bytes")
+        logical_start = chunk_int("logical_start")
+        logical_end = chunk_int("logical_end")
+        chunk_closes = chunk_int("close_marker_count")
+        close_size = chunk_int("close_encoded_data_size", nullable=True)
+        close_file_offset = chunk_int("close_file_offset", nullable=True)
+        close_logical_end = chunk_int("close_logical_end", nullable=True)
+        last_timestamp = chunk_int("last_frame_timestamp_ms", nullable=True)
+        close_timestamp = chunk_int("close_timestamp_ms", nullable=True)
+        assert chunk_index is not None and chunk_frames is not None
+        assert record_size_mismatches is not None
+        assert file_offset_mismatches is not None
+        assert logical_end_mismatches is not None
+        assert metadata_bytes is not None and logical_start is not None
+        assert logical_end is not None and chunk_closes is not None
+        if any(
+            item is not None and item > 0xFFFFFFFF
+            for item in (last_timestamp, close_timestamp)
+        ):
+            raise DataFormatError(
+                "XeThru metadata chunk timestamp is invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+        footer_filename = chunk.get("footer_filename")
+        expected_filename = chunk.get("expected_filename")
+        chunk_expected_bytes = chunk.get("expected_bytes")
+        if (
+            (footer_filename is not None and type(footer_filename) is not str)
+            or (expected_filename is not None and type(expected_filename) is not str)
+            or (
+                chunk_expected_bytes is not None
+                and (
+                    type(chunk_expected_bytes) is not int
+                    or chunk_expected_bytes <= 0
+                )
+            )
+            or chunk.get("record_bytes") != XETHRU_RECORD_BYTES
+        ):
+            raise DataFormatError(
+                "XeThru metadata chunk filename/size fields are invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+        if expected_graph_bound and expected_index < len(expected_names or ()):
+            if (
+                expected_filename != (expected_names or ())[expected_index]
+                or chunk_expected_bytes != (expected_bytes or ())[expected_index]
+            ):
+                raise DataFormatError(
+                    "XeThru metadata chunk expected-graph cross-link is invalid",
+                    code="xethru_metadata_evidence_invalid",
+                )
+        elif expected_filename is not None or chunk_expected_bytes is not None:
+            raise DataFormatError(
+                "XeThru metadata unbound chunk claims an expected graph",
+                code="xethru_metadata_evidence_invalid",
+            )
+        expected_geometry = (
+            chunk_frames > 0
+            and record_size_mismatches == 0
+            and file_offset_mismatches == 0
+            and logical_end_mismatches == 0
+            and metadata_bytes == chunk_frames * XETHRU_RECORD_BYTES
+            and logical_start == cumulative
+            and logical_end == cumulative + metadata_bytes
+            and chunk_closes == 1
+            and close_size == 0
+            and close_file_offset == metadata_bytes
+            and close_logical_end == logical_end
+            and last_timestamp is not None
+            and close_timestamp is not None
+        )
+        if chunk.get("geometry_eligible") is not expected_geometry:
+            raise DataFormatError(
+                "XeThru metadata chunk geometry eligibility mismatch",
+                code="xethru_metadata_evidence_invalid",
+            )
+        filename_matches = (
+            None
+            if expected_filename is None
+            else footer_filename == expected_filename
+        )
+        bytes_match = (
+            None
+            if chunk_expected_bytes is None
+            else metadata_bytes == chunk_expected_bytes
+        )
+        if (
+            chunk.get("filename_matches") is not filename_matches
+            or chunk.get("bytes_match") is not bytes_match
+        ):
+            raise DataFormatError(
+                "XeThru metadata chunk graph-join predicate mismatch",
+                code="xethru_metadata_evidence_invalid",
+            )
+        all_geometry_eligible &= expected_geometry
+        all_joined &= filename_matches is True and bytes_match is True
+        computed_frame_count += chunk_frames
+        computed_close_count += chunk_closes
+        cumulative = logical_end
+        observed_chunk_names.append(footer_filename)
+        if chunk_index != expected_index:
+            all_geometry_eligible = False
+
+    issues = document.get("issues")
+    if not isinstance(issues, list):
+        raise DataFormatError(
+            "XeThru metadata evidence issues are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    issue_codes: set[str] = set()
+    for issue in issues:
+        if (
+            not isinstance(issue, Mapping)
+            or set(issue) != {"code", "severity", "message"}
+            or type(issue.get("code")) is not str
+            or not issue.get("code")
+            or issue.get("severity") != "error"
+            or type(issue.get("message")) is not str
+            or not issue.get("message")
+            or issue["code"] in issue_codes
+        ):
+            raise DataFormatError(
+                "XeThru metadata evidence issue entry is invalid",
+                code="xethru_metadata_evidence_invalid",
+            )
+        issue_codes.add(issue["code"])
+    internal_eligible = (
+        not issues
+        and bool(chunk_documents)
+        and record_table_offset is not None
+        and footer_offset
+        == record_table_offset
+        + (frame_count + close_count) * _META_FIXED_RECORD.size
+        and footer_end_offset
+        == footer_offset
+        + 5
+        + sum(4 + length + 1 for length in encoded_footer_name_lengths)
+        and index_set == tuple(range(len(chunk_documents)))
+        and declared_count == len(chunk_documents)
+        and footer_inventory_valid
+        and footer_names == tuple(observed_chunk_names)
+        and computed_frame_count == frame_count
+        and computed_close_count == close_count == len(chunk_documents)
+        and order_mismatches == 0
+        and footer_end_offset == payload_bytes
+        and all_geometry_eligible
+    )
+    exact_join = expected_graph_bound and all_joined
+    consumption_eligible = internal_eligible and exact_join
+    if (
+        document.get("internal_geometry_eligible") is not internal_eligible
+        or document.get("expected_graph_bound") is not expected_graph_bound
+        or document.get("exact_graph_join") is not exact_join
+        or document.get("consumption_eligible") is not consumption_eligible
+    ):
+        raise DataFormatError(
+            "XeThru metadata evidence eligibility predicates are invalid",
+            code="xethru_metadata_evidence_invalid",
+        )
+    return {
+        key: (
+            [dict(item) for item in item_value]
+            if key == "issues"
+            else item_value
+        )
+        for key, item_value in document.items()
+    }
+
+
+def parse_xethru_meta_bytes(
+    payload: bytes,
     *,
+    source_path: str | Path,
     expected_frames: int | None = None,
+    expected_chunk_filenames: Sequence[str] | None = None,
+    expected_chunk_byte_counts: Sequence[int] | None = None,
     fallback_rate_hz: float = RADAR_SAMPLE_RATE_HZ,
     strict: bool = False,
 ) -> XeThruMeta:
-    """Parse HAI XeThru ``xethru_recording_meta.dat`` version 13.
+    """Parse exact XeThru metadata bytes without reopening their source path.
 
     The fixed 33-byte frame entries contain chunk id/size, file and logical
     byte offsets, and a relative millisecond timestamp.  Type-2 entries close
@@ -186,10 +846,76 @@ def parse_xethru_meta(
     filenames.  Timestamp entries remain usable when that footer is missing or
     truncated.  If entries themselves are unusable or disagree with
     ``expected_frames``, a deterministic 40 Hz timeline is returned.
+
+    Supplying both expected chunk arguments performs the consumed-graph join:
+    footer name, per-chunk frame geometry, and byte count must all agree.  A
+    successful join remains diagnostic provenance; it does not establish
+    synchronization or scientific authority.
     """
 
-    meta_path = Path(path)
+    if type(payload) is not bytes:
+        raise TypeError("XeThru metadata payload must be exact bytes")
+    meta_path = Path(source_path)
     warnings: list[str] = []
+    issues: list[XeThruMetaIssue] = []
+
+    def add_warning(message: str) -> None:
+        if message not in warnings:
+            warnings.append(message)
+
+    def add_issue(code: str, message: str) -> None:
+        if all(item.code != code for item in issues):
+            issues.append(XeThruMetaIssue(code=code, message=message))
+        add_warning(message)
+
+    if (expected_chunk_filenames is None) != (expected_chunk_byte_counts is None):
+        raise ValueError(
+            "expected_chunk_filenames and expected_chunk_byte_counts must be bound together"
+        )
+    expected_names: tuple[str, ...] | None = None
+    expected_bytes: tuple[int, ...] | None = None
+    if expected_chunk_filenames is not None:
+        if isinstance(expected_chunk_filenames, (str, bytes)) or not isinstance(
+            expected_chunk_filenames, Sequence
+        ):
+            raise TypeError("expected_chunk_filenames must be a sequence")
+        if isinstance(expected_chunk_byte_counts, (str, bytes)) or not isinstance(
+            expected_chunk_byte_counts, Sequence
+        ):
+            raise TypeError("expected_chunk_byte_counts must be a sequence")
+        expected_names = tuple(expected_chunk_filenames)
+        assert expected_chunk_byte_counts is not None
+        expected_bytes = tuple(expected_chunk_byte_counts)
+        if (
+            not expected_names
+            or len(expected_names) != len(expected_bytes)
+            or any(
+                type(name) is not str
+                or not name
+                or PurePosixPath(name).name != name
+                or "\x00" in name
+                for name in expected_names
+            )
+            or len(set(expected_names)) != len(expected_names)
+            or any(
+                type(byte_count) is not int
+                or byte_count <= 0
+                or byte_count % XETHRU_RECORD_BYTES != 0
+                for byte_count in expected_bytes
+            )
+        ):
+            raise ValueError("expected XeThru chunk graph is invalid")
+        try:
+            for name in expected_names:
+                name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("expected XeThru chunk graph is invalid") from exc
+        graph_frame_count = sum(
+            byte_count // XETHRU_RECORD_BYTES for byte_count in expected_bytes
+        )
+        if expected_frames is not None and graph_frame_count != expected_frames:
+            raise ValueError("expected frame total disagrees with expected chunk bytes")
+
     magic: int | None = None
     version: int | None = None
     start_epoch_ms: int | None = None
@@ -200,36 +926,30 @@ def parse_xethru_meta(
     end_markers = 0
     timestamp_repairs = 0
 
-    try:
-        payload = meta_path.read_bytes()
-    except OSError as exc:
-        if strict:
-            raise DataFormatError(f"cannot read metadata {meta_path}: {exc}") from exc
-        warnings.append(f"metadata unreadable: {exc}")
-        count = max(0, int(expected_frames or 0))
-        return XeThruMeta(
-            path=meta_path,
-            magic=None,
-            version=None,
-            start_epoch_ms=None,
-            device_name=None,
-            relative_timestamps_ms=_fallback_timestamps(count, fallback_rate_hz),
-            warnings=tuple(warnings),
-        )
-
     record_offset: int | None = None
     if len(payload) >= 16:
         magic, version = struct.unpack_from("<II", payload, 0)
         start_epoch_ms = struct.unpack_from("<Q", payload, 8)[0]
         if not 946_684_800_000 <= start_epoch_ms <= 4_102_444_800_000:
-            warnings.append(f"implausible start epoch milliseconds: {start_epoch_ms}")
+            add_issue(
+                "xethru_start_epoch_implausible",
+                f"implausible start epoch milliseconds: {start_epoch_ms}",
+            )
             start_epoch_ms = None
         if magic != XETHRU_MAGIC:
-            warnings.append(f"unexpected metadata magic 0x{magic:08x}")
+            add_issue(
+                "xethru_magic_invalid", f"unexpected metadata magic 0x{magic:08x}"
+            )
         if version != XETHRU_META_VERSION:
-            warnings.append(f"metadata version {version}, expected {XETHRU_META_VERSION}")
+            add_issue(
+                "xethru_version_invalid",
+                f"metadata version {version}, expected {XETHRU_META_VERSION}",
+            )
     else:
-        warnings.append(f"metadata header truncated ({len(payload)} bytes)")
+        add_issue(
+            "xethru_header_truncated",
+            f"metadata header truncated ({len(payload)} bytes)",
+        )
 
     if len(payload) >= _META_HEADER_NAME_LENGTH_OFFSET + 4:
         name_length = struct.unpack_from(
@@ -238,17 +958,41 @@ def parse_xethru_meta(
         name_start = _META_HEADER_NAME_LENGTH_OFFSET + 4
         name_end = name_start + name_length
         if 0 < name_length <= 4096 and name_end <= len(payload):
-            device_name = (
-                payload[name_start:name_end]
-                .rstrip(b"\x00")
-                .decode("utf-8", errors="replace")
-            )
+            encoded_device_name = payload[name_start:name_end]
+            if not encoded_device_name.endswith(b"\x00"):
+                add_issue(
+                    "xethru_device_name_terminator_missing",
+                    "metadata device name is not NUL-terminated",
+                )
+            else:
+                if b"\x00" in encoded_device_name[:-1]:
+                    add_issue(
+                        "xethru_device_name_embedded_nul",
+                        "metadata device name contains more than one NUL",
+                    )
+                encoded_device_name = encoded_device_name[:-1]
+            try:
+                device_name = encoded_device_name.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                device_name = encoded_device_name.decode("utf-8", errors="replace")
+                add_issue(
+                    "xethru_device_name_utf8_invalid",
+                    "metadata device name is not valid UTF-8",
+                )
             # Recorder v13 writes four zero bytes after the NUL-inclusive name.
             candidate = name_end + 4
             if candidate + _META_FIXED_RECORD.size <= len(payload):
                 record_offset = candidate
+            if payload[name_end:candidate] != b"\x00" * 4:
+                add_issue(
+                    "xethru_header_padding_invalid",
+                    "metadata device-name padding is not four zero bytes",
+                )
         else:
-            warnings.append(f"invalid device-name length: {name_length}")
+            add_issue(
+                "xethru_device_name_length_invalid",
+                f"invalid device-name length: {name_length}",
+            )
 
     # A conservative recovery path for a damaged name-length field.  Requiring
     # the complete kind/format marker avoids matching arbitrary float payload.
@@ -257,73 +1001,312 @@ def parse_xethru_meta(
         recovered = payload.find(marker, 80, min(len(payload), 4096))
         if recovered >= 0:
             record_offset = recovered
-            warnings.append("recovered metadata record table by signature")
+            add_issue(
+                "xethru_record_table_recovered",
+                "recovered metadata record table by signature",
+            )
         else:
             record_offset = None
-            warnings.append("metadata frame table not found")
+            add_issue(
+                "xethru_record_table_missing", "metadata frame table not found"
+            )
 
+    entries: list[tuple[int, int, int, int, int, int]] = []
     footer_offset: int | None = None
     if record_offset is not None:
         cursor = record_offset
         while cursor + _META_FIXED_RECORD.size <= len(payload):
-            kind, record_format, encoded_size, _file_offset, _logical_end, timestamp = (
-                _META_FIXED_RECORD.unpack_from(payload, cursor)
-            )
-            if kind not in (1, 2) or record_format != XETHRU_META_RECORD_FORMAT:
+            if payload[cursor] == 3:
                 footer_offset = cursor
                 break
-            chunk_index = encoded_size >> 32
-            data_size = encoded_size & 0xFFFFFFFF
-            if kind == 1:
-                if data_size != XETHRU_RECORD_BYTES:
-                    warnings.append(
-                        f"frame entry declares {data_size} bytes in chunk {chunk_index}, "
-                        f"expected {XETHRU_RECORD_BYTES}"
-                    )
-                raw_timestamps.append(timestamp)
-            else:
-                end_markers += 1
+            entry = _META_FIXED_RECORD.unpack_from(payload, cursor)
+            kind, record_format, _encoded_size, _file_offset, _logical_end, _timestamp = entry
+            if kind not in (1, 2) or record_format != XETHRU_META_RECORD_FORMAT:
+                footer_offset = cursor
+                add_issue(
+                    "xethru_record_entry_tag_invalid",
+                    f"metadata entry at byte {cursor} has kind/format {kind}/{record_format}",
+                )
+                break
+            entries.append(entry)
             cursor += _META_FIXED_RECORD.size
         else:
             footer_offset = cursor
+
+    frame_entries_by_chunk: dict[
+        int, list[tuple[int, int, int, int, int, int]]
+    ] = {}
+    close_entries_by_chunk: dict[
+        int, list[tuple[int, int, int, int, int, int]]
+    ] = {}
+    observed_entry_order: list[tuple[int, int]] = []
+    for entry in entries:
+        kind, _record_format, encoded_size, _file_offset, _logical_end, timestamp = entry
+        chunk_index = int(encoded_size >> 32)
+        observed_entry_order.append((int(kind), chunk_index))
+        if kind == 1:
+            frame_entries_by_chunk.setdefault(chunk_index, []).append(entry)
+            raw_timestamps.append(int(timestamp))
+        else:
+            close_entries_by_chunk.setdefault(chunk_index, []).append(entry)
+            end_markers += 1
+    chunk_indices = tuple(
+        sorted(set(frame_entries_by_chunk) | set(close_entries_by_chunk))
+    )
+    if chunk_indices != tuple(range(len(chunk_indices))):
+        add_issue(
+            "xethru_chunk_indices_noncontiguous",
+            f"metadata chunk indices are not contiguous from zero: {list(chunk_indices)}",
+        )
+    expected_entry_order: list[tuple[int, int]] = []
+    for chunk_index in chunk_indices:
+        expected_entry_order.extend(
+            [(1, chunk_index)] * len(frame_entries_by_chunk.get(chunk_index, ()))
+        )
+        expected_entry_order.extend(
+            [(2, chunk_index)] * len(close_entries_by_chunk.get(chunk_index, ()))
+        )
+    overlap = min(len(observed_entry_order), len(expected_entry_order))
+    entry_order_mismatch_count = sum(
+        observed_entry_order[index] != expected_entry_order[index]
+        for index in range(overlap)
+    ) + abs(len(observed_entry_order) - len(expected_entry_order))
+    if entry_order_mismatch_count:
+        add_issue(
+            "xethru_entry_order_invalid",
+            f"metadata table has {entry_order_mismatch_count} chunk-transition/order mismatch(es)",
+        )
 
     # Footer: byte kind=3, uint32 filename count, then count repetitions of
     # uint32 NUL-inclusive length + UTF-8 filename.  Parse each independently so
     # a partially written last filename does not invalidate earlier names.
     if footer_offset is not None:
         cursor = footer_offset
-        if cursor < len(payload) and payload[cursor] != 3:
-            nearby = payload.find(b"\x03", cursor, min(len(payload), cursor + 32))
-            cursor = nearby if nearby >= 0 else cursor
         if cursor + 5 <= len(payload) and payload[cursor] == 3:
             declared_chunks = struct.unpack_from("<I", payload, cursor + 1)[0]
             cursor += 5
             if declared_chunks > 100_000:
-                warnings.append(f"implausible footer chunk count: {declared_chunks}")
+                add_issue(
+                    "xethru_footer_count_implausible",
+                    f"implausible footer chunk count: {declared_chunks}",
+                )
                 declared_chunks = None
             else:
                 for index in range(declared_chunks):
                     if cursor + 4 > len(payload):
-                        warnings.append(f"footer truncated before chunk name {index}")
+                        add_issue(
+                            "xethru_footer_truncated",
+                            f"footer truncated before chunk name {index}",
+                        )
                         break
                     length = struct.unpack_from("<I", payload, cursor)[0]
                     cursor += 4
                     if length <= 0 or length > 4096 or cursor + length > len(payload):
-                        warnings.append(f"invalid/truncated footer chunk name {index}")
+                        add_issue(
+                            "xethru_footer_name_length_invalid",
+                            f"invalid/truncated footer chunk name {index}",
+                        )
                         break
-                    filename = (
-                        payload[cursor : cursor + length]
-                        .rstrip(b"\x00")
-                        .decode("utf-8", errors="replace")
-                    )
+                    encoded_filename = payload[cursor : cursor + length]
+                    if not encoded_filename.endswith(b"\x00"):
+                        add_issue(
+                            "xethru_footer_name_terminator_missing",
+                            f"footer chunk name {index} is not NUL-terminated",
+                        )
+                    else:
+                        if b"\x00" in encoded_filename[:-1]:
+                            add_issue(
+                                "xethru_footer_name_embedded_nul",
+                                f"footer chunk name {index} contains more than one NUL",
+                            )
+                        encoded_filename = encoded_filename[:-1]
+                    try:
+                        filename = encoded_filename.decode("utf-8", errors="strict")
+                    except UnicodeDecodeError:
+                        filename = encoded_filename.decode("utf-8", errors="replace")
+                        add_issue(
+                            "xethru_footer_name_utf8_invalid",
+                            f"footer chunk name {index} is not valid UTF-8",
+                        )
+                    if (
+                        not filename
+                        or PurePosixPath(filename).name != filename
+                        or filename in {".", ".."}
+                    ):
+                        add_issue(
+                            "xethru_footer_name_invalid",
+                            f"footer chunk name {index} is not a canonical filename",
+                        )
                     chunk_filenames.append(filename)
                     cursor += length
-        elif raw_timestamps:
-            warnings.append("metadata filename footer missing")
+            if cursor != len(payload):
+                add_issue(
+                    "xethru_footer_trailing_bytes",
+                    f"metadata footer leaves {len(payload) - cursor} trailing byte(s)",
+                )
+            footer_end_offset = cursor
+        else:
+            add_issue(
+                "xethru_footer_missing", "metadata filename footer missing or invalid"
+            )
+            footer_end_offset = cursor
+    else:
+        footer_end_offset = None
+        add_issue("xethru_footer_missing", "metadata filename footer missing")
+
+    if declared_chunks is not None and declared_chunks != len(chunk_filenames):
+        add_issue(
+            "xethru_footer_inventory_incomplete",
+            f"footer parsed {len(chunk_filenames)} of {declared_chunks} declared filename(s)",
+        )
+    if len(set(chunk_filenames)) != len(chunk_filenames):
+        add_issue(
+            "xethru_footer_filename_duplicate",
+            "metadata footer repeats a chunk filename",
+        )
+    if declared_chunks != len(chunk_indices):
+        add_issue(
+            "xethru_footer_chunk_count_mismatch",
+            f"footer chunk count {declared_chunks} differs from table chunk count {len(chunk_indices)}",
+        )
+
+    chunk_evidence: list[XeThruMetaChunkEvidence] = []
+    cumulative_logical_bytes = 0
+    for chunk_index in chunk_indices:
+        frames = frame_entries_by_chunk.get(chunk_index, [])
+        closes = close_entries_by_chunk.get(chunk_index, [])
+        record_size_mismatches = 0
+        file_offset_mismatches = 0
+        logical_end_mismatches = 0
+        for local_index, frame in enumerate(frames):
+            _kind, _format, encoded_size, file_offset, logical_end, _timestamp = frame
+            data_size = int(encoded_size & 0xFFFFFFFF)
+            if data_size != XETHRU_RECORD_BYTES:
+                record_size_mismatches += 1
+            if int(file_offset) != local_index * XETHRU_RECORD_BYTES:
+                file_offset_mismatches += 1
+            if int(logical_end) != (
+                cumulative_logical_bytes + (local_index + 1) * XETHRU_RECORD_BYTES
+            ):
+                logical_end_mismatches += 1
+        metadata_chunk_bytes = len(frames) * XETHRU_RECORD_BYTES
+        logical_start = cumulative_logical_bytes
+        logical_end = logical_start + metadata_chunk_bytes
+        close = closes[0] if closes else None
+        close_size = None if close is None else int(close[2] & 0xFFFFFFFF)
+        close_file_offset = None if close is None else int(close[3])
+        close_logical_end = None if close is None else int(close[4])
+        last_frame_timestamp = None if not frames else int(frames[-1][5])
+        close_timestamp = None if close is None else int(close[5])
+        footer_filename = (
+            chunk_filenames[chunk_index]
+            if 0 <= chunk_index < len(chunk_filenames)
+            else None
+        )
+        expected_filename = (
+            expected_names[chunk_index]
+            if expected_names is not None and chunk_index < len(expected_names)
+            else None
+        )
+        expected_byte_count = (
+            expected_bytes[chunk_index]
+            if expected_bytes is not None and chunk_index < len(expected_bytes)
+            else None
+        )
+        item = XeThruMetaChunkEvidence(
+            chunk_index=chunk_index,
+            footer_filename=footer_filename,
+            frame_count=len(frames),
+            record_size_mismatch_count=record_size_mismatches,
+            file_offset_mismatch_count=file_offset_mismatches,
+            logical_end_mismatch_count=logical_end_mismatches,
+            metadata_chunk_bytes=metadata_chunk_bytes,
+            logical_start=logical_start,
+            logical_end=logical_end,
+            close_marker_count=len(closes),
+            close_encoded_data_size=close_size,
+            close_file_offset=close_file_offset,
+            close_logical_end=close_logical_end,
+            last_frame_timestamp_ms=last_frame_timestamp,
+            close_timestamp_ms=close_timestamp,
+            expected_filename=expected_filename,
+            expected_bytes=expected_byte_count,
+        )
+        chunk_evidence.append(item)
+        if not frames:
+            add_issue(
+                "xethru_chunk_empty", f"metadata chunk {chunk_index} has no frames"
+            )
+        if record_size_mismatches:
+            add_issue(
+                "xethru_frame_record_size_invalid",
+                f"metadata chunk {chunk_index} has {record_size_mismatches} frame-size mismatch(es)",
+            )
+        if file_offset_mismatches:
+            add_issue(
+                "xethru_file_offsets_invalid",
+                f"metadata chunk {chunk_index} has {file_offset_mismatches} file-offset mismatch(es)",
+            )
+        if logical_end_mismatches:
+            add_issue(
+                "xethru_logical_ends_invalid",
+                f"metadata chunk {chunk_index} has {logical_end_mismatches} logical-end mismatch(es)",
+            )
+        if len(closes) != 1:
+            add_issue(
+                "xethru_close_marker_count_invalid",
+                f"metadata chunk {chunk_index} has {len(closes)} close marker(s), expected one",
+            )
+        elif (
+            close_size != 0
+            or close_file_offset != metadata_chunk_bytes
+            or close_logical_end != logical_end
+        ):
+            add_issue(
+                "xethru_close_marker_geometry_invalid",
+                f"metadata chunk {chunk_index} close marker disagrees with chunk geometry",
+            )
+        cumulative_logical_bytes = logical_end
+
+    if expected_names is not None:
+        if len(expected_names) != len(chunk_evidence):
+            add_issue(
+                "xethru_expected_chunk_count_mismatch",
+                f"consumed graph has {len(expected_names)} chunks but metadata has {len(chunk_evidence)}",
+            )
+        for item in chunk_evidence:
+            if item.filename_matches is not True:
+                add_issue(
+                    "xethru_expected_filename_mismatch",
+                    f"metadata chunk {item.chunk_index} filename does not match consumed graph",
+                )
+            if item.bytes_match is not True:
+                add_issue(
+                    "xethru_expected_bytes_mismatch",
+                    f"metadata chunk {item.chunk_index} byte count does not match consumed graph",
+                )
+
+    evidence = XeThruMetaEvidence(
+        payload_bytes=len(payload),
+        record_table_offset=record_offset,
+        footer_offset=footer_offset,
+        footer_end_offset=footer_end_offset,
+        declared_chunk_count=declared_chunks,
+        footer_filenames=tuple(chunk_filenames),
+        frame_record_count=len(raw_timestamps),
+        close_marker_count=end_markers,
+        entry_order_mismatch_count=entry_order_mismatch_count,
+        chunk_index_set=chunk_indices,
+        expected_chunk_filenames=expected_names,
+        expected_chunk_byte_counts=expected_bytes,
+        chunks=tuple(chunk_evidence),
+        issues=tuple(issues),
+    )
+    evidence.to_dict()
 
     use_fallback = not raw_timestamps
     if expected_frames is not None and len(raw_timestamps) != expected_frames:
-        warnings.append(
+        add_warning(
             f"metadata/data frame mismatch: {len(raw_timestamps)} != {expected_frames}"
         )
         use_fallback = True
@@ -333,19 +1316,34 @@ def parse_xethru_meta(
         timestamps = _fallback_timestamps(count, fallback_rate_hz)
         timestamp_source = f"fallback_{fallback_rate_hz:g}hz"
         if not raw_timestamps:
-            warnings.append(f"using {fallback_rate_hz:g} Hz timestamp fallback")
+            add_warning(f"using {fallback_rate_hz:g} Hz timestamp fallback")
     else:
         timestamps, timestamp_repairs = _unwrap_relative_timestamps(
             raw_timestamps, 1000.0 / fallback_rate_hz
         )
         timestamp_source = "meta_v13"
         if timestamp_repairs:
-            warnings.append(
+            add_warning(
                 f"unwrapped {timestamp_repairs} relative-timestamp counter reset(s)"
             )
 
-    if strict and warnings:
-        raise DataFormatError(f"{meta_path}: " + "; ".join(warnings))
+    strict_contract_ineligible = (
+        not evidence.internal_geometry_eligible
+        or (evidence.expected_graph_bound and not evidence.exact_graph_join)
+    )
+    if strict and (warnings or strict_contract_ineligible):
+        reasons = list(warnings)
+        if strict_contract_ineligible and not reasons:
+            reasons.append("XeThru metadata contract is ineligible")
+        raise DataFormatError(
+            f"{meta_path}: " + "; ".join(reasons),
+            code=(
+                "xethru_metadata_ineligible"
+                if issues or strict_contract_ineligible
+                else "xethru_metadata_strict_warning"
+            ),
+            diagnostics=evidence.to_dict(),
+        )
 
     return XeThruMeta(
         path=meta_path,
@@ -360,7 +1358,47 @@ def parse_xethru_meta(
         frame_record_count=len(raw_timestamps),
         end_marker_count=end_markers,
         timestamp_repairs=timestamp_repairs,
-        warnings=tuple(dict.fromkeys(warnings)),
+        metadata_evidence=evidence,
+        warnings=tuple(warnings),
+    )
+
+
+def parse_xethru_meta(
+    path: str | Path,
+    *,
+    expected_frames: int | None = None,
+    expected_chunk_filenames: Sequence[str] | None = None,
+    expected_chunk_byte_counts: Sequence[int] | None = None,
+    fallback_rate_hz: float = RADAR_SAMPLE_RATE_HZ,
+    strict: bool = False,
+) -> XeThruMeta:
+    """Parse a legacy pathname by first materializing one exact byte payload."""
+
+    meta_path = Path(path)
+    try:
+        payload = meta_path.read_bytes()
+    except OSError as exc:
+        if strict:
+            raise DataFormatError(f"cannot read metadata {meta_path}: {exc}") from exc
+        warnings = (f"metadata unreadable: {exc}",)
+        count = max(0, int(expected_frames or 0))
+        return XeThruMeta(
+            path=meta_path,
+            magic=None,
+            version=None,
+            start_epoch_ms=None,
+            device_name=None,
+            relative_timestamps_ms=_fallback_timestamps(count, fallback_rate_hz),
+            warnings=warnings,
+        )
+    return parse_xethru_meta_bytes(
+        payload,
+        source_path=meta_path,
+        expected_frames=expected_frames,
+        expected_chunk_filenames=expected_chunk_filenames,
+        expected_chunk_byte_counts=expected_chunk_byte_counts,
+        fallback_rate_hz=fallback_rate_hz,
+        strict=strict,
     )
 
 
@@ -596,6 +1634,445 @@ def _matlab_strings(value: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+_BIOPAC_ISI_UNIT_FACTORS_TO_MS: dict[str, float] = {
+    "ms": 1.0,
+    "msec": 1.0,
+    "msecs": 1.0,
+    "millisecond": 1.0,
+    "milliseconds": 1.0,
+    "s": 1000.0,
+    "sec": 1000.0,
+    "secs": 1000.0,
+    "second": 1000.0,
+    "seconds": 1000.0,
+    "us": 0.001,
+    "usec": 0.001,
+    "usecs": 0.001,
+    "microsecond": 0.001,
+    "microseconds": 0.001,
+}
+
+
+def _normalize_biopac_isi_unit(value: str) -> str:
+    return (
+        value.strip()
+        .casefold()
+        .replace("μ", "u")
+        .replace("µ", "u")
+        .replace(" ", "")
+        .replace(".", "")
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class BiopacParserIssue:
+    """One deterministic reason that a permissively parsed MAT is ineligible."""
+
+    code: str
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"code": self.code, "severity": "error", "message": self.message}
+
+
+@dataclass(frozen=True, slots=True)
+class BiopacParserEvidence:
+    """Portable evidence for channel identity and sample-interval semantics.
+
+    ``parser_eligible`` is only a format/metadata predicate.  It grants no
+    synchronization, label, training, evaluation, or release authority.
+    """
+
+    source_data_shape: tuple[int, int]
+    effective_data_shape: tuple[int, int]
+    orientation: str
+    channel_labels: tuple[str, ...]
+    channel_units: tuple[str, ...]
+    rsp_candidate_indices: tuple[int, ...]
+    ecg_candidate_indices: tuple[int, ...]
+    rsp_index: int
+    ecg_index: int
+    source_isi_value_count: int
+    source_isi_value: float | None
+    source_isi_units: tuple[str, ...]
+    source_isi_unit: str | None
+    normalized_source_isi_unit: str | None
+    conversion_factor_to_ms: float | None
+    effective_interval_source: str
+    effective_isi_ms: float
+    effective_sample_rate_hz: float
+    issues: tuple[BiopacParserIssue, ...]
+
+    @property
+    def parser_eligible(self) -> bool:
+        return not self.issues
+
+    def _document(self) -> dict[str, Any]:
+        return {
+            "schema": BIOPAC_PARSER_EVIDENCE_SCHEMA,
+            "diagnostic_only": True,
+            "scientific_authority": False,
+            "parser_eligible": self.parser_eligible,
+            "source_data_shape": list(self.source_data_shape),
+            "effective_data_shape": list(self.effective_data_shape),
+            "orientation": self.orientation,
+            "channel_count": self.effective_data_shape[1],
+            "label_count": len(self.channel_labels),
+            "channel_labels": list(self.channel_labels),
+            "unit_count": len(self.channel_units),
+            "channel_units": list(self.channel_units),
+            "rsp_candidate_indices": list(self.rsp_candidate_indices),
+            "ecg_candidate_indices": list(self.ecg_candidate_indices),
+            "rsp_index": self.rsp_index,
+            "ecg_index": self.ecg_index,
+            "source_isi_value_count": self.source_isi_value_count,
+            "source_isi_value": self.source_isi_value,
+            "source_isi_units": list(self.source_isi_units),
+            "source_isi_unit": self.source_isi_unit,
+            "normalized_source_isi_unit": self.normalized_source_isi_unit,
+            "conversion_factor_to_ms": self.conversion_factor_to_ms,
+            "canonical_isi_unit": BIOPAC_ISI_CANONICAL_UNIT,
+            "effective_interval_source": self.effective_interval_source,
+            "effective_isi_ms": self.effective_isi_ms,
+            "effective_sample_rate_hz": self.effective_sample_rate_hz,
+            "expected_isi_ms": BIOPAC_ISI_MS,
+            "issues": [item.to_dict() for item in self.issues],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return validate_biopac_parser_evidence(self._document())
+
+
+def _exact_finite_real(value: Any) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    result = float(value)
+    return result if np.isfinite(result) else None
+
+
+def validate_biopac_parser_evidence(
+    value: BiopacParserEvidence | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and return one canonical JSON-compatible evidence document."""
+
+    document = value._document() if type(value) is BiopacParserEvidence else value
+    if not isinstance(document, Mapping):
+        raise DataFormatError(
+            "BIOPAC parser evidence must be an object",
+            code="biopac_parser_evidence_invalid",
+        )
+    expected_keys = {
+        "schema",
+        "diagnostic_only",
+        "scientific_authority",
+        "parser_eligible",
+        "source_data_shape",
+        "effective_data_shape",
+        "orientation",
+        "channel_count",
+        "label_count",
+        "channel_labels",
+        "unit_count",
+        "channel_units",
+        "rsp_candidate_indices",
+        "ecg_candidate_indices",
+        "rsp_index",
+        "ecg_index",
+        "source_isi_value_count",
+        "source_isi_value",
+        "source_isi_units",
+        "source_isi_unit",
+        "normalized_source_isi_unit",
+        "conversion_factor_to_ms",
+        "canonical_isi_unit",
+        "effective_interval_source",
+        "effective_isi_ms",
+        "effective_sample_rate_hz",
+        "expected_isi_ms",
+        "issues",
+    }
+    if set(document) != expected_keys:
+        raise DataFormatError(
+            "BIOPAC parser evidence fields are invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+    if (
+        document.get("schema") != BIOPAC_PARSER_EVIDENCE_SCHEMA
+        or document.get("diagnostic_only") is not True
+        or document.get("scientific_authority") is not False
+        or type(document.get("parser_eligible")) is not bool
+        or document.get("canonical_isi_unit") != BIOPAC_ISI_CANONICAL_UNIT
+        or _exact_finite_real(document.get("expected_isi_ms")) != BIOPAC_ISI_MS
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence authority/unit fields are invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+
+    def _shape(name: str) -> tuple[int, int]:
+        raw = document.get(name)
+        if (
+            not isinstance(raw, list)
+            or len(raw) != 2
+            or any(type(item) is not int or item <= 0 for item in raw)
+        ):
+            raise DataFormatError(
+                f"BIOPAC parser evidence {name} is invalid",
+                code="biopac_parser_evidence_invalid",
+            )
+        return int(raw[0]), int(raw[1])
+
+    source_shape = _shape("source_data_shape")
+    effective_shape = _shape("effective_data_shape")
+    orientation = document.get("orientation")
+    if orientation == "samples_by_channels":
+        expected_shape = source_shape
+    elif orientation == "transposed_channels_by_samples":
+        expected_shape = (source_shape[1], source_shape[0])
+    else:
+        raise DataFormatError(
+            "BIOPAC parser evidence orientation is invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+    if effective_shape != expected_shape or effective_shape[1] < 2:
+        raise DataFormatError(
+            "BIOPAC parser evidence shape/orientation mismatch",
+            code="biopac_parser_evidence_invalid",
+        )
+
+    def _strings(name: str) -> tuple[str, ...]:
+        raw = document.get(name)
+        if not isinstance(raw, list) or any(type(item) is not str for item in raw):
+            raise DataFormatError(
+                f"BIOPAC parser evidence {name} is invalid",
+                code="biopac_parser_evidence_invalid",
+            )
+        return tuple(raw)
+
+    labels = _strings("channel_labels")
+    units = _strings("channel_units")
+    source_isi_units = _strings("source_isi_units")
+    channel_count = document.get("channel_count")
+    label_count = document.get("label_count")
+    unit_count = document.get("unit_count")
+    if (
+        type(channel_count) is not int
+        or channel_count != effective_shape[1]
+        or type(label_count) is not int
+        or label_count != len(labels)
+        or label_count != channel_count
+        or type(unit_count) is not int
+        or unit_count != len(units)
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence channel metadata counts are invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+
+    def _indices(name: str) -> tuple[int, ...]:
+        raw = document.get(name)
+        if not isinstance(raw, list) or any(type(item) is not int for item in raw):
+            raise DataFormatError(
+                f"BIOPAC parser evidence {name} is invalid",
+                code="biopac_parser_evidence_invalid",
+            )
+        return tuple(raw)
+
+    rsp_candidates = _indices("rsp_candidate_indices")
+    ecg_candidates = _indices("ecg_candidate_indices")
+    normalized_labels = tuple(item.upper() for item in labels)
+    recomputed_rsp_candidates = tuple(
+        index
+        for index, item in enumerate(normalized_labels)
+        if _BIOPAC_RSP_LABEL_RE.search(item)
+    )
+    recomputed_ecg_candidates = tuple(
+        index
+        for index, item in enumerate(normalized_labels)
+        if _BIOPAC_ECG_LABEL_RE.search(item)
+    )
+    rsp_index = document.get("rsp_index")
+    ecg_index = document.get("ecg_index")
+    if (
+        len(rsp_candidates) != 1
+        or len(ecg_candidates) != 1
+        or rsp_candidates != recomputed_rsp_candidates
+        or ecg_candidates != recomputed_ecg_candidates
+        or type(rsp_index) is not int
+        or type(ecg_index) is not int
+        or rsp_index != rsp_candidates[0]
+        or ecg_index != ecg_candidates[0]
+        or rsp_index == ecg_index
+        or not 0 <= rsp_index < channel_count
+        or not 0 <= ecg_index < channel_count
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence channel identity is invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+
+    source_count = document.get("source_isi_value_count")
+    source_value_raw = document.get("source_isi_value")
+    source_value = (
+        None if source_value_raw is None else _exact_finite_real(source_value_raw)
+    )
+    if (
+        type(source_count) is not int
+        or source_count < 0
+        or (source_value_raw is not None and source_value is None)
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence source interval is invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+    source_unit = document.get("source_isi_unit")
+    normalized_unit = document.get("normalized_source_isi_unit")
+    factor_raw = document.get("conversion_factor_to_ms")
+    factor = None if factor_raw is None else _exact_finite_real(factor_raw)
+    has_resolved_source_unit = (
+        len(source_isi_units) == 1 and bool(source_isi_units[0])
+    )
+    if (
+        (source_unit is not None and type(source_unit) is not str)
+        or (normalized_unit is not None and type(normalized_unit) is not str)
+        or (factor_raw is not None and factor is None)
+        or ((source_unit is not None) != has_resolved_source_unit)
+        or ((normalized_unit is not None) != has_resolved_source_unit)
+        or (source_unit is not None and source_unit not in source_isi_units)
+        or (
+            source_unit is not None
+            and normalized_unit != _normalize_biopac_isi_unit(source_unit)
+        )
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence source unit is invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+    if normalized_unit in _BIOPAC_ISI_UNIT_FACTORS_TO_MS:
+        if factor != _BIOPAC_ISI_UNIT_FACTORS_TO_MS[normalized_unit]:
+            raise DataFormatError(
+                "BIOPAC parser evidence conversion factor is invalid",
+                code="biopac_parser_evidence_invalid",
+            )
+    elif factor is not None:
+        raise DataFormatError(
+            "BIOPAC parser evidence gives a factor to an unsupported unit",
+            code="biopac_parser_evidence_invalid",
+        )
+
+    interval_source = document.get("effective_interval_source")
+    effective_isi_ms = _exact_finite_real(document.get("effective_isi_ms"))
+    sample_rate_hz = _exact_finite_real(document.get("effective_sample_rate_hz"))
+    if (
+        interval_source not in {"converted_mat_metadata", "diagnostic_fallback_4ms"}
+        or effective_isi_ms is None
+        or effective_isi_ms <= 0.0
+        or sample_rate_hz is None
+        or sample_rate_hz <= 0.0
+        or not np.isclose(
+            sample_rate_hz,
+            1000.0 / effective_isi_ms,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence effective interval is invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+    if interval_source == "converted_mat_metadata":
+        if (
+            source_count != 1
+            or source_value is None
+            or source_value <= 0.0
+            or factor is None
+            or not np.isclose(
+                effective_isi_ms,
+                source_value * factor,
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            raise DataFormatError(
+                "BIOPAC parser evidence did not bind its converted interval",
+                code="biopac_parser_evidence_invalid",
+            )
+    elif effective_isi_ms != BIOPAC_ISI_MS:
+        raise DataFormatError(
+            "BIOPAC parser fallback interval is not the declared 4 ms",
+            code="biopac_parser_evidence_invalid",
+        )
+
+    issues = document.get("issues")
+    if not isinstance(issues, list):
+        raise DataFormatError(
+            "BIOPAC parser evidence issues are invalid",
+            code="biopac_parser_evidence_invalid",
+        )
+    observed_issue_codes: set[str] = set()
+    for issue in issues:
+        if (
+            not isinstance(issue, Mapping)
+            or set(issue) != {"code", "severity", "message"}
+            or type(issue.get("code")) is not str
+            or not issue.get("code")
+            or issue.get("severity") != "error"
+            or type(issue.get("message")) is not str
+            or not issue.get("message")
+            or issue["code"] in observed_issue_codes
+        ):
+            raise DataFormatError(
+                "BIOPAC parser evidence issue entry is invalid",
+                code="biopac_parser_evidence_invalid",
+            )
+        observed_issue_codes.add(issue["code"])
+    parser_eligible = document["parser_eligible"]
+    if parser_eligible != (not issues):
+        raise DataFormatError(
+            "BIOPAC parser eligibility disagrees with its issues",
+            code="biopac_parser_evidence_invalid",
+        )
+    if parser_eligible and (
+        unit_count != channel_count
+        or effective_isi_ms != BIOPAC_ISI_MS
+        or interval_source != "converted_mat_metadata"
+    ):
+        raise DataFormatError(
+            "BIOPAC parser evidence marks incomplete metadata eligible",
+            code="biopac_parser_evidence_invalid",
+        )
+    return {
+        key: (
+            [dict(item) for item in item_value]
+            if key == "issues"
+            else list(item_value)
+            if isinstance(item_value, tuple)
+            else item_value
+        )
+        for key, item_value in document.items()
+    }
+
+
+def _biopac_fatal_error(
+    path: Path,
+    *,
+    code: str,
+    message: str,
+) -> DataFormatError:
+    issue = BiopacParserIssue(code=code, message=message).to_dict()
+    return DataFormatError(
+        f"{path}: {message}",
+        code=code,
+        diagnostics={
+            "schema": BIOPAC_PARSER_EVIDENCE_SCHEMA,
+            "diagnostic_only": True,
+            "scientific_authority": False,
+            "parser_eligible": False,
+            "issues": [issue],
+        },
+    )
+
+
 @dataclass(slots=True)
 class BiopacRecording:
     path: Path
@@ -607,7 +2084,12 @@ class BiopacRecording:
     isi_ms: float
     sample_rate_hz: float
     start_datetime: datetime
+    parser_evidence: BiopacParserEvidence
     warnings: tuple[str, ...] = ()
+
+    @property
+    def parser_eligible(self) -> bool:
+        return self.parser_evidence.parser_eligible
 
     @property
     def rsp(self) -> np.ndarray:
@@ -638,76 +2120,302 @@ class BiopacRecording:
             "rsp_index": self.rsp_index,
             "ecg_index": self.ecg_index,
             "isi_ms": self.isi_ms,
+            "isi_units": BIOPAC_ISI_CANONICAL_UNIT,
             "sample_rate_hz": self.sample_rate_hz,
             "start_datetime": self.start_datetime.isoformat(),
             "duration_seconds": self.duration_seconds,
+            "parser_eligible": self.parser_eligible,
+            "parser_evidence": self.parser_evidence.to_dict(),
             "warnings": list(self.warnings),
         }
 
 
-def load_biopac_mat(
-    path: str | Path,
+def load_biopac_mat_bytes(
+    payload: bytes,
     *,
+    source_path: str | Path,
     timezone_name: str | tzinfo | None = "Asia/Seoul",
     strict: bool = True,
 ) -> BiopacRecording:
-    """Load the HAI BIOPAC RSP/ECG MATLAB file (250 Hz, ``isi=4 ms``)."""
+    """Parse one exact BIOPAC payload through an in-memory file object."""
 
     try:
         from scipy.io import loadmat
     except ImportError as exc:  # pragma: no cover - dependency error is explicit
         raise RuntimeError("scipy is required to read BIOPAC MATLAB files") from exc
 
-    mat_path = Path(path)
+    if type(payload) is not bytes:
+        raise TypeError("BIOPAC payload must be exact bytes")
+    mat_path = Path(source_path)
     try:
         content = loadmat(
-            mat_path,
+            BytesIO(payload),
             variable_names=["data", "labels", "units", "isi", "isi_units"],
             squeeze_me=True,
             struct_as_record=False,
         )
     except Exception as exc:
-        raise DataFormatError(f"cannot read BIOPAC MAT file {mat_path}: {exc}") from exc
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_mat_decode_error",
+            message=f"cannot decode BIOPAC MAT payload: {exc}",
+        ) from exc
     if "data" not in content:
-        raise DataFormatError(f"BIOPAC MAT file has no 'data' variable: {mat_path}")
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_data_missing",
+            message="BIOPAC MAT file has no 'data' variable",
+        )
 
-    data = np.asarray(content["data"])
-    if data.ndim == 1:
-        data = data[:, None]
-    if data.ndim != 2:
-        raise DataFormatError(f"BIOPAC data must be 2-D, got shape {data.shape}")
+    data = np.array(content["data"], copy=True)
+    if data.ndim != 2 or any(int(item) <= 0 for item in data.shape):
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_data_shape_invalid",
+            message=f"BIOPAC data must be a non-empty 2-D matrix, got shape {data.shape}",
+        )
+    if data.dtype.kind not in "iuf":
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_data_type_invalid",
+            message=f"BIOPAC data must be real numeric, got dtype {data.dtype}",
+        )
+    source_data_shape = (int(data.shape[0]), int(data.shape[1]))
     labels = _matlab_strings(content.get("labels", ()))
     units = _matlab_strings(content.get("units", ()))
-    if labels and data.shape[0] == len(labels) and data.shape[1] != len(labels):
-        data = data.T
+    if not labels:
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_labels_missing",
+            message="BIOPAC channel labels are missing",
+        )
+    labels_match_rows = data.shape[0] == len(labels)
+    labels_match_columns = data.shape[1] == len(labels)
+    if labels_match_rows and labels_match_columns:
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_channel_orientation_ambiguous",
+            message=(
+                "BIOPAC channel orientation is ambiguous because labels match "
+                f"both data axes ({data.shape}, {len(labels)} labels)"
+            ),
+        )
+    if labels_match_rows:
+        data = np.array(data.T, copy=True)
+        orientation = "transposed_channels_by_samples"
+    elif labels_match_columns:
+        orientation = "samples_by_channels"
+    else:
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_label_count_mismatch",
+            message=(
+                f"BIOPAC label count {len(labels)} matches neither data axis "
+                f"{data.shape}"
+            ),
+        )
     if data.shape[1] < 2:
-        raise DataFormatError(f"BIOPAC data requires RSP and ECG channels, got {data.shape}")
-
-    warnings: list[str] = []
-    isi_values = np.asarray(content.get("isi", BIOPAC_ISI_MS), dtype=np.float64).reshape(-1)
-    isi_ms = float(isi_values[0]) if isi_values.size else BIOPAC_ISI_MS
-    if not np.isfinite(isi_ms) or isi_ms <= 0:
-        warnings.append(f"invalid isi={isi_ms}; using {BIOPAC_ISI_MS:g} ms")
-        isi_ms = BIOPAC_ISI_MS
-    sample_rate_hz = 1000.0 / isi_ms
-    if not np.isclose(isi_ms, BIOPAC_ISI_MS, rtol=0.0, atol=1e-6):
-        warnings.append(
-            f"BIOPAC isi is {isi_ms:g} ms ({sample_rate_hz:g} Hz), expected 4 ms (250 Hz)"
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_channel_count_invalid",
+            message=f"BIOPAC data requires RSP and ECG channels, got {data.shape}",
         )
 
     normalized_labels = [item.upper() for item in labels]
-    rsp_candidates = [i for i, item in enumerate(normalized_labels) if "RSP" in item]
-    ecg_candidates = [i for i, item in enumerate(normalized_labels) if "ECG" in item]
-    rsp_index = rsp_candidates[0] if rsp_candidates else 0
-    ecg_index = ecg_candidates[0] if ecg_candidates else 1
-    if not rsp_candidates:
-        warnings.append("RSP label missing; using channel 0")
-    if not ecg_candidates:
-        warnings.append("ECG label missing; using channel 1")
+    rsp_candidates = tuple(
+        index
+        for index, item in enumerate(normalized_labels)
+        if _BIOPAC_RSP_LABEL_RE.search(item)
+    )
+    ecg_candidates = tuple(
+        index
+        for index, item in enumerate(normalized_labels)
+        if _BIOPAC_ECG_LABEL_RE.search(item)
+    )
+    if len(rsp_candidates) != 1:
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_rsp_label_cardinality_invalid",
+            message=(
+                "BIOPAC labels must identify exactly one RSP channel; found "
+                f"indices {list(rsp_candidates)}"
+            ),
+        )
+    if len(ecg_candidates) != 1:
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_ecg_label_cardinality_invalid",
+            message=(
+                "BIOPAC labels must identify exactly one ECG channel; found "
+                f"indices {list(ecg_candidates)}"
+            ),
+        )
+    rsp_index = rsp_candidates[0]
+    ecg_index = ecg_candidates[0]
+    if rsp_index == ecg_index:
+        raise _biopac_fatal_error(
+            mat_path,
+            code="biopac_rsp_ecg_channel_collision",
+            message="BIOPAC RSP and ECG labels resolve to the same channel index",
+        )
+
+    issues: list[BiopacParserIssue] = []
+
+    def add_issue(code: str, message: str) -> None:
+        if all(item.code != code for item in issues):
+            issues.append(BiopacParserIssue(code=code, message=message))
+
+    nonfinite_count = int(np.count_nonzero(~np.isfinite(data)))
+    if nonfinite_count:
+        add_issue(
+            "biopac_signal_nonfinite",
+            f"BIOPAC channel matrix contains {nonfinite_count} non-finite sample(s)",
+        )
+
+    if len(units) != data.shape[1]:
+        add_issue(
+            "biopac_unit_count_mismatch",
+            f"BIOPAC unit count {len(units)} does not equal channel count {data.shape[1]}",
+        )
+
+    raw_isi = content.get("isi")
+    if raw_isi is None:
+        isi_array = np.asarray(())
+        source_isi_value_count = 0
+        source_isi_value: float | None = None
+        add_issue("biopac_isi_missing", "BIOPAC isi metadata is missing")
+    else:
+        isi_array = np.asarray(raw_isi)
+        source_isi_value_count = int(isi_array.size)
+        source_isi_value = None
+        if source_isi_value_count != 1:
+            add_issue(
+                "biopac_isi_cardinality_invalid",
+                "BIOPAC isi metadata must contain exactly one numeric value; "
+                f"found {source_isi_value_count}",
+            )
+        elif isi_array.dtype.kind not in "iuf":
+            add_issue(
+                "biopac_isi_type_invalid",
+                f"BIOPAC isi metadata must be numeric, got dtype {isi_array.dtype}",
+            )
+        else:
+            candidate = float(isi_array.reshape(-1)[0])
+            if not np.isfinite(candidate):
+                add_issue(
+                    "biopac_isi_nonfinite",
+                    "BIOPAC isi metadata must be finite",
+                )
+            elif candidate <= 0.0:
+                source_isi_value = candidate
+                add_issue(
+                    "biopac_isi_nonpositive",
+                    f"BIOPAC isi metadata must be positive, got {candidate:g}",
+                )
+            else:
+                source_isi_value = candidate
+
+    source_isi_units = _matlab_strings(content.get("isi_units", ()))
+    source_isi_unit: str | None = None
+    normalized_source_isi_unit: str | None = None
+    conversion_factor_to_ms: float | None = None
+    if len(source_isi_units) != 1 or not source_isi_units[0]:
+        add_issue(
+            "biopac_isi_units_cardinality_invalid",
+            "BIOPAC isi_units metadata must contain exactly one non-empty unit; "
+            f"found {list(source_isi_units)}",
+        )
+    else:
+        source_isi_unit = source_isi_units[0]
+        normalized_source_isi_unit = _normalize_biopac_isi_unit(source_isi_unit)
+        conversion_factor_to_ms = _BIOPAC_ISI_UNIT_FACTORS_TO_MS.get(
+            normalized_source_isi_unit
+        )
+        if conversion_factor_to_ms is None:
+            add_issue(
+                "biopac_isi_units_unsupported",
+                f"BIOPAC isi_units {source_isi_unit!r} is unsupported",
+            )
+
+    can_convert_interval = (
+        source_isi_value is not None
+        and source_isi_value > 0.0
+        and conversion_factor_to_ms is not None
+    )
+    converted_isi_ms: float | None = None
+    converted_sample_rate_hz: float | None = None
+    if can_convert_interval:
+        with np.errstate(
+            over="ignore", under="ignore", divide="ignore", invalid="ignore"
+        ):
+            converted_isi_ms = float(
+                np.float64(source_isi_value) * np.float64(conversion_factor_to_ms)
+            )
+            converted_sample_rate_hz = float(
+                np.float64(1000.0) / np.float64(converted_isi_ms)
+            )
+        if (
+            not np.isfinite(converted_isi_ms)
+            or converted_isi_ms <= 0.0
+            or not np.isfinite(converted_sample_rate_hz)
+            or converted_sample_rate_hz <= 0.0
+        ):
+            add_issue(
+                "biopac_effective_interval_invalid",
+                "BIOPAC isi conversion did not produce a finite positive interval/rate",
+            )
+            can_convert_interval = False
+    if can_convert_interval:
+        assert converted_isi_ms is not None
+        assert converted_sample_rate_hz is not None
+        isi_ms = converted_isi_ms
+        sample_rate_hz = converted_sample_rate_hz
+        effective_interval_source = "converted_mat_metadata"
+    else:
+        isi_ms = BIOPAC_ISI_MS
+        sample_rate_hz = BIOPAC_SAMPLE_RATE_HZ
+        effective_interval_source = "diagnostic_fallback_4ms"
+    if (
+        effective_interval_source == "converted_mat_metadata"
+        and not np.isclose(isi_ms, BIOPAC_ISI_MS, rtol=0.0, atol=1e-6)
+    ):
+        add_issue(
+            "biopac_effective_isi_unexpected",
+            f"BIOPAC effective isi is {isi_ms:g} ms ({sample_rate_hz:g} Hz), "
+            "expected 4 ms (250 Hz)",
+        )
+
+    evidence = BiopacParserEvidence(
+        source_data_shape=source_data_shape,
+        effective_data_shape=(int(data.shape[0]), int(data.shape[1])),
+        orientation=orientation,
+        channel_labels=labels,
+        channel_units=units,
+        rsp_candidate_indices=rsp_candidates,
+        ecg_candidate_indices=ecg_candidates,
+        rsp_index=rsp_index,
+        ecg_index=ecg_index,
+        source_isi_value_count=source_isi_value_count,
+        source_isi_value=source_isi_value,
+        source_isi_units=source_isi_units,
+        source_isi_unit=source_isi_unit,
+        normalized_source_isi_unit=normalized_source_isi_unit,
+        conversion_factor_to_ms=conversion_factor_to_ms,
+        effective_interval_source=effective_interval_source,
+        effective_isi_ms=isi_ms,
+        effective_sample_rate_hz=sample_rate_hz,
+        issues=tuple(issues),
+    )
+    evidence_document = evidence.to_dict()
+    warnings = tuple(item.message for item in issues)
+    if strict and issues:
+        raise DataFormatError(
+            f"{mat_path}: " + "; ".join(warnings),
+            code="biopac_parser_ineligible",
+            diagnostics=evidence_document,
+        )
 
     start = parse_biopac_start_datetime(mat_path, timezone_name=timezone_name)
-    if strict and warnings:
-        raise DataFormatError(f"{mat_path}: " + "; ".join(warnings))
     return BiopacRecording(
         path=mat_path,
         data=data,
@@ -718,7 +2426,29 @@ def load_biopac_mat(
         isi_ms=isi_ms,
         sample_rate_hz=sample_rate_hz,
         start_datetime=start,
-        warnings=tuple(warnings),
+        parser_evidence=evidence,
+        warnings=warnings,
+    )
+
+
+def load_biopac_mat(
+    path: str | Path,
+    *,
+    timezone_name: str | tzinfo | None = "Asia/Seoul",
+    strict: bool = True,
+) -> BiopacRecording:
+    """Load a legacy BIOPAC pathname from one materialized byte snapshot."""
+
+    mat_path = Path(path)
+    try:
+        payload = mat_path.read_bytes()
+    except OSError as exc:
+        raise DataFormatError(f"cannot read BIOPAC MAT file {mat_path}: {exc}") from exc
+    return load_biopac_mat_bytes(
+        payload,
+        source_path=mat_path,
+        timezone_name=timezone_name,
+        strict=strict,
     )
 
 
@@ -1155,6 +2885,16 @@ def biopac_qc(path: str | Path) -> dict[str, Any]:
     report: dict[str, Any] = {"path": str(path), "status": "error", "warnings": []}
     try:
         recording = load_biopac_mat(path, strict=False)
+    except DataFormatError as exc:
+        report.update(
+            {
+                "error": str(exc),
+                "error_code": exc.code,
+                "parser_eligible": False,
+                "parser_evidence": dict(exc.diagnostics),
+            }
+        )
+        return report
     except Exception as exc:
         report["error"] = str(exc)
         return report
@@ -1172,7 +2912,10 @@ def biopac_qc(path: str | Path) -> dict[str, Any]:
             "labels": list(recording.labels),
             "units": list(recording.units),
             "isi_ms": recording.isi_ms,
+            "isi_units": BIOPAC_ISI_CANONICAL_UNIT,
             "sample_rate_hz": recording.sample_rate_hz,
+            "parser_eligible": recording.parser_eligible,
+            "parser_evidence": recording.parser_evidence.to_dict(),
             "start_datetime": recording.start_datetime.isoformat(),
             "duration_seconds": recording.duration_seconds,
             "rsp_nan_or_inf_count": rsp_nonfinite,
@@ -1192,7 +2935,7 @@ def biopac_qc(path: str | Path) -> dict[str, Any]:
         report["warnings"].append(f"RSP reaches +/-10 V rail ({rsp_clipped} samples)")
     if ecg_clipped:
         report["warnings"].append(f"ECG reaches +/-5 mV rail ({ecg_clipped} samples)")
-    if rsp_nonfinite or ecg_nonfinite:
+    if not recording.parser_eligible or rsp_nonfinite or ecg_nonfinite:
         report["status"] = "error"
     elif report["warnings"]:
         report["status"] = "warning"
@@ -1311,8 +3054,12 @@ def audit_manifest(
 
 
 __all__ = [
+    "BIOPAC_ISI_CANONICAL_UNIT",
     "BIOPAC_ISI_MS",
+    "BIOPAC_PARSER_EVIDENCE_SCHEMA",
     "BIOPAC_SAMPLE_RATE_HZ",
+    "BiopacParserEvidence",
+    "BiopacParserIssue",
     "BiopacRecording",
     "DataFormatError",
     "DatasetManifest",
@@ -1324,18 +3071,27 @@ __all__ = [
     "SplitRadarMemmap",
     "SubjectManifest",
     "XETHRU_META_VERSION",
+    "XETHRU_META_CLOSE_TIMESTAMP_POLICY",
+    "XETHRU_META_EVIDENCE_SCHEMA",
     "XETHRU_RECORD_BYTES",
     "XETHRU_RECORD_DTYPE",
     "XeThruMeta",
+    "XeThruMetaChunkEvidence",
+    "XeThruMetaEvidence",
+    "XeThruMetaIssue",
     "audit_manifest",
     "biopac_qc",
     "build_dataset_manifest",
     "build_manifest",
     "load_biopac_mat",
+    "load_biopac_mat_bytes",
     "load_xethru_recording",
     "load_xethru_records",
     "open_xethru_files",
     "parse_biopac_start_datetime",
     "parse_xethru_meta",
+    "parse_xethru_meta_bytes",
     "radar_qc",
+    "validate_biopac_parser_evidence",
+    "validate_xethru_meta_evidence",
 ]

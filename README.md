@@ -4,13 +4,14 @@
 
 현재 정확도 선두는 주파수 구조를 보존하는 두 12-step SNN의 **validation-locked ensemble**이다. BIOPAC RSP reference QC를 통과한 2,327개 window에서 MAE 1.291 bpm, identity-macro MAE 1.220 bpm을 기록했다. 그러나 사전에 선언한 상용 목표 6개를 모두 통과하지 못했다. 특히 25–35 bpm MAE가 4.216 bpm이다. 따라서 이 저장소는 상용·의료 성능을 입증한 제품이 아니라, 외부 prospective 검증 전 단계의 retrospective 연구 후보이다.
 
-현재 문서 authority는 [Goal v3](artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md)와
+현재 실행 authority는 [Goal v4 raw-authority continuation](artifacts/COMMERCIAL_SNN_GOAL_V4_CONTINUATION_2026-08-31.md),
+[Goal v3](artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md)와
 [2026-08-31 개발 진행상황](artifacts/SNN_PROJECT_DEVELOPMENT_PROGRESS_2026-08-31.md)이
 최우선이다. [기술 상태 보고서](artifacts/SNN_PROJECT_TECHNICAL_STATUS_REPORT_2026-08-30.md)와
 [REPORT.md](REPORT.md)는 동결 결과의 근거다. Goal v2, 이전 master/progress 문서,
 기존 release manifest와 `commercial_goal_report.json`은 역사적 세대의 증거이며 현재
-학습·평가·release authority가 아니다. 서로 충돌하면 Goal v3와 2026-08-31 진행상황을
-따른다.
+학습·평가·release authority가 아니다. 서로 충돌하면 Goal v4, Goal v3와
+2026-08-31 진행상황을 따른다.
 
 SNN 학습 방식(STDP, ANN→SNN, surrogate-gradient, PLIF/ALIF, TET, distillation, self-supervised pretraining)의 비교와 이 데이터에 맞춘 최종 권고 구조·loss·평가 계약은 [SNN 학습 방법론과 최종 권고안](artifacts/SNN_TRAINING_METHODOLOGY_RECOMMENDATION_2026-08-30.md)에 정리했다.
 
@@ -106,7 +107,7 @@ bash restore/verify_restore.sh
 ```
 
 아래 명령은 보존 leader를 새로 증명하는 현재 과학 campaign이 아니라 **역사적 legacy
-reproduction**이다. 현재 acquisition-v2 synchronization authority는 `0/29`이므로 이
+reproduction**이다. 현재 acquisition-v3 synchronization authority는 `0/29`이므로 이
 실행에서 같은 수치가 나와도 새 과학 증거나 상용 성능이 아니다. 보존 경로를 절대
 덮어쓰지 않도록 매 시도마다 고유한 새 versioned root를 지정한다.
 

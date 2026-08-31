@@ -1,4 +1,4 @@
-# SnnProject 개발 진행상황 — acquisition v2 + Goal v3 hardening checkpoint
+# SnnProject 개발 진행상황 — Goal v4 raw-authority checkpoint
 
 - 기준 시각: 2026-08-31, Asia/Seoul
 - 대상: 3대 XeThru UWB radar 기반 호흡수 추정 hybrid/SNN 연구 시스템
@@ -6,7 +6,9 @@
 - 제품 판정: 상용·의료 제품 아님, 내부 상용 정확도 gate `0/6`
 
 현재 실행 authority는 이 문서와
-`artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md`가 공동 최우선이다. Goal v2, 이전
+`artifacts/COMMERCIAL_SNN_GOAL_V4_CONTINUATION_2026-08-31.md`,
+`artifacts/COMMERCIAL_SNN_GOAL_V3_2026-08-31.md`가 공동 최우선이다. Goal v4는 Goal
+v3의 accuracy/prospective gate를 유지한 채 raw-authority 실행 단계를 세분화한다. Goal v2, 이전
 execution plan/progress, 보존 release manifest와 `commercial_goal_report.json`은 역사적
 증거이며 현재 training/evaluation/release authorization이 아니다.
 
@@ -210,8 +212,8 @@ authority failure다. 이를 우회한 학습 수치는 유효한 개선으로 �
 
 ## 6. 테스트와 재현성
 
-- 최종 2026-08-31 generation: 1,766 collected
-- full suite 연속 2회: 각각 1,762 passed, 4 skipped
+- 최종 Goal v4 generation: 1,945 collected
+- full suite 연속 2회: 각각 1,941 passed, 4 skipped
 - managed namespace에서 skip된 실제 bubblewrap 4개: capable host context에서 4/4 passed
 - active V8R4 fixed collection: 739 node IDs, semantic SHA-256
   `b9b192c084d3f6d69094657bceb9047e368c12cac4e4420c2f75ef3c7fc39df4`
@@ -417,3 +419,112 @@ nonfinite 위반은 0이었다. 실제 data authority와 CUDA가 없으므로
 
 현재 상태는 `R0_RESEARCH_ACTIVE`다. Source hardening과 resume-ready 설계는 완료했지만,
 권한 부재를 우회해서 만든 성능 수치는 목표 진척으로 인정하지 않는다.
+
+## 10. Goal v4 raw-authority continuation 결과
+
+이 절은 앞의 acquisition-v2 수치와 9.6의 timing/cache 미완료 항목을 대체한다. 이전
+artifact와 실패 결과는 역사 증거로 계속 보존한다.
+
+### 10.1 Acquisition v3 full diagnostic reconstruction
+
+경로:
+`artifacts/acquisition/reconstruction_v3_20260831_raw_exact_timing_reason_diagnostic`
+
+| 항목 | 결과 |
+|---|---:|
+| source / usable / identities | 30 / 29 / 18 |
+| exact raw consumed-byte receipt | 29 / 29 usable |
+| XeThru metadata↔chunk exact join | 90 / 90 metadata |
+| BIOPAC parser contract | 30 / 30 MAT |
+| measured timing adjudicated | 29 / 29 usable |
+| 원래 timing invalid cells | 31 |
+| invalid 이유 | empty 3, temporal gap 10, plateau 22 |
+| sync decision | manual review 13, rejected 16 |
+| sync / stage / scientific authority | 0 / 29 |
+| protocol status | review 26, uncertain 3 |
+
+Invalid reason은 중복 가능해 reason 합계가 31보다 크다. 31개 cell을 보간·삭제하지 않고
+reason mask와 exact positive zero로 유지했다. Root content SHA-256은
+`295a93ca854c07c5ab23067d6a5e401b503b048e2a710352ff6e37c71abf6f2f`다.
+
+Raw reader는 descriptor-pinned one-shot hash+decode, XeThru record/footer geometry,
+BIOPAC ISI unit·channel identity, portable/full receipt cross-link를 검증한다.
+`sync_signals.npz`도 파일 SHA/bytes와 7개 배열의 dtype·shape·canonical hash로 결합했다.
+실행 source hash는 post-import pathname snapshot일 뿐 실제 compiled loader bytes를
+증명하지 않음을 manifest에 명시했다.
+
+### 10.2 Feature-cache v3 full diagnostic materialization
+
+성공 경로:
+`artifacts/cache/rf32s_acquisition_v3_20260831_diagnostic_a3`
+
+| 항목 | 결과 |
+|---|---:|
+| sessions / identities | 29 / 18 |
+| windows | 9,575 |
+| maps / aux | `[9575,3,73,182]` / `[9575,1205]` |
+| timing valid/reason mask | `[9575,3,320]` / `[9575,3,320]` |
+| feature availability | `[9575,1208]` |
+| mapping 있음 / 없음 | 18 sessions·5,830 rows / 11 sessions·3,745 rows |
+| window-expanded invalid cells | 208 |
+| unavailable radar views | 128 |
+| reference-valid rows | 0 |
+
+Mapping이 없는 11 sessions는 BIOPAC·reference·stage를 사용하지 않고 measured
+radar-relative 32초 support만 생성한다. Reference 관련 값은 명시적
+NaN/-1/null/false sentinel이고 `reference_mapping_available=false`다. Mapping이 있는
+18 sessions도 승인되지 않았으므로 target은 전부 invalid다. Missing view/aux는 별도
+availability가 권한이며 값은 exact positive zero다.
+
+Loader 재검증 결과: 29 sessions, owned/read-only arrays, inventory 233 files,
+classification `acquisition_diagnostic`, scientific false. Scientific load 요청은
+`version-3 cache lacks independently verified upstream scientific authority`로 차단됐다.
+Root content SHA-256은
+`f0bf626e4177b34930317658f2deee67fbab793c9dfe19b7be11e75b8a4acfeb`다.
+
+실패 기록도 유지한다.
+
+- 첫 시도: 실제 4-D map을 가상 5-D branch로 잘못 가정해 S02에서 중단
+- 두 번째 시도: mapping 없는 11 sessions를 skip해 exact 29-session gate에서 중단,
+  private failure receipt와 staging 보존
+- 세 번째 시도: 두 결함 수정 후 private 0700 staging, files 0600, fsync,
+  `RENAME_NOREPLACE`로 완전 게시
+
+### 10.3 SVD v3 full diagnostic materialization
+
+정식 diagnostic 경로:
+`artifacts/cache/svd_components_v3_20260831_diagnostic_c12_n4096_a1`
+
+| 항목 | 결과 |
+|---|---:|
+| sessions / rows | 29 / 9,575 |
+| components / NFFT / iteration | 12 / 4096 / 2 |
+| variants | 10 |
+| mapped / unmapped sessions | 18 / 11 |
+| unavailable views / invalid intervals | 128 / 208 |
+| feature payload bytes | 4,332,894,188 |
+| scientific / training authority | false / false |
+
+SVD는 RawSessionReader로 원자료를 다시 one-shot 소비하고 acquisition receipt,
+measured resampling, valid/reason mask, radar-relative 320-sample support를 RF cache와 exact
+join했다. `--all-windows`를 강제해 target-dependent row selection을 금지한다. Unavailable
+view의 spectra/component/attribute는 모두 exact positive zero다. 29개 session manifest가
+현재 file inventory와 일치한다. Root content SHA-256은
+`c6f979f8438be4959b2bb3effa2b22e8ac17fd87e2f9210cc8954142e3220eec`다.
+
+저비용 전수 smoke도 `components=1, NFFT=512, iteration=0`으로 29/9,575를 먼저
+통과했으며 root content SHA-256은
+`cb49d316be005eee154b37f44dc45b18dfa4813113162ec408da70c34c6cab8f`다.
+
+### 10.4 현재 정확한 resume boundary
+
+- 완료: C0 raw bytes, C1 timing adjudication, C4 diagnostic RF/SVD
+- 미완료: 독립 raw-derived sync verifier, protocol replay trust root,
+  fresh-child actual compiled-source binding
+- 실제 결과: sync authorized 0/29, stage authority 0/29, scientific/training 0/29
+- 실행 환경: PyTorch 2.13.0+cu130, CUDA device unavailable
+- 결과: V8R5 protected training과 새 OOF 미실행, 기존 leader와 상용 gate `0/6` 유지
+
+다음 합법적 실행은 threshold 완화나 self-signed receipt가 아니다. 독립 trust root가
+있는 sync/protocol/source verifier로 C2–C3를 통과하고, 승인된 alignment에서 label을
+새로 구성한 뒤 strict cache를 별도 generation으로 발급하는 순서다.
