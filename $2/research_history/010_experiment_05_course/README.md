@@ -1,3 +1,3 @@
-# 010 — Experiment 5: course
+# 010 실험5 코스
 
-The course has 16 cells at roughly 10 s each plus transitions, so 130–230 s was used for its marker pair. Boundary audit is complete. No formal course model was trained because it is movement-rich and would obscure whether failure came from respiration extraction or activity variation.
+약 10초씩 16칸과 이동시간을 합쳐 130~230초로 마커를 점검했다. 움직임이 많아 호흡추출 실패와 행동변화 실패를 구분하기 어려우므로 정식모델에서는 제외했다.

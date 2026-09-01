@@ -1,7 +1,10 @@
-# `$2` research record
+# `$2` 졸업작품 작업 기록
 
-Numbered, human-readable record of the UWB–BIOPAC work. It includes decisions, reasons, negative results, compact-model code, current waveform-model code, and aggregate metrics. Raw UWB/BIOPAC files, private conversation text, identities, environments, and checkpoints are excluded.
+대화에서 요청하고 실제로 수행한 UWB-BIOPAC 작업을 시간순으로 정리한 폴더다. 단순 결과만 적지 않고 무엇을 했는지, 왜 그렇게 판단했는지, 결과와 한계가 무엇인지 함께 기록했다.
 
-- [`research_history`](research_history/README.md): chronology 001–021
-- [`legacy_compact_model`](legacy_compact_model/README.md): compact ANN/SNN baseline
-- [`waveform`](waveform/README.md): current multi-path waveform model
+- [`산출물`](산출물/README.md): 실제로 만든 엑셀, 워드, 모델 파일과 단계별 간단보고서
+- [`연구경과`](research_history/README.md): 최초 파일 확인부터 현재까지 001~021 시간순 기록
+- [`초기 소형 모델 코드`](legacy_compact_model/README.md): 27명 ANN/SNN 비교 코드
+- [`현재 파형 모델 코드`](waveform/README.md): 멀티패스 CNN-GRU/CNN-SNN 코드와 집계 결과
+
+원시 UWB/BIOPAC 신호와 84MB 학습 데이터셋은 개인정보·용량·재배포 문제 때문에 포함하지 않았다. 모델 재현에 필요한 데이터 형식과 분할 규칙은 각 보고서에 적었다.

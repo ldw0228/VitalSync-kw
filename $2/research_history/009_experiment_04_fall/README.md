@@ -1,3 +1,3 @@
-# 009 — Experiment 4: falls
+# 009 실험4 낙상
 
-The 20-marker protocol already has three subconditions: immediate stand, about 30-s hold, and slow lie-down/hold. The 22-marker protocol adds one object-pickup pair from participant S04 onward. These pairs were audited, but no fall model is claimed; feedback identified fall trials as challenging and inconsistently marked.
+20개 프로토콜에도 즉시 일어나기, 약 30초 유지, 천천히 눕고 유지하기 3조건이 있다. S04 이후 22개 프로토콜에는 물건집기 1쌍이 추가된다. 마커는 점검했지만 낙상모델 성능은 주장하지 않는다.

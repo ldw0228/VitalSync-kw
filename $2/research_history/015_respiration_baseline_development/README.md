@@ -1,3 +1,3 @@
-# 015 — Ten-subject respiration baseline
+# 015 10명 호흡 기준선
 
-The development set contained 80 S01/S02 segments, 70 RR-evaluable. Three-radar signal-processing consensus gave RR MAE about 0.50 bpm and median absolute waveform correlation about 0.83. BIOPAC was used only for target/evaluation, not path selection. Because the same ten subjects informed rule development, this was not accepted as independent generalization evidence.
+실험1·2의 80구간 중 70구간을 평가했다. 3레이더 신호처리 합의 MAE는 약 0.50bpm, 파형 절대상관 중앙값은 약 0.83이었다. 같은 10명을 보며 규칙을 만든 결과이므로 독립일반화 근거는 아니다.

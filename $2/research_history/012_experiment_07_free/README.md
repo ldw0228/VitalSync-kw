@@ -1,3 +1,3 @@
-# 012 — Experiment 7: free movement
+# 012 실험7 자유행동
 
-One short start/end pair was audited with a 5–70 s range. No stable label taxonomy or dedicated model was defined. It is reserved for later robustness/out-of-distribution evaluation rather than current supervised training.
+짧은 시작·종료 한 쌍을 5~70초 범위로 점검했다. 일정한 라벨 정의가 어려워 전용모델은 만들지 않았고 나중의 강건성·미학습상황 시험용으로 남겼다.

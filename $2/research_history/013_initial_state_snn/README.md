@@ -1,3 +1,3 @@
-# 013 — Initial state SNN
+# 013 초기 상태 SNN
 
-Ten subjects produced 840 windows: 341 S01 angle and 499 S02 state. Leave-one-subject-out balanced accuracy/macro-F1 were SNN `0.484/0.409` vs ANN `0.500/0.444` for angle, and SNN `0.372/0.348` vs ANN `0.407/0.367` for state. Both were weak. The small fast model was a prototype on summarized windows, not a literature-scale final SNN, and the target shifted to physiological waveform/RR.
+10명에서 실험1 방향 341창, 실험2 상태 499창을 만들었다. 피험자 독립 균형정확도/매크로F1은 방향 SNN `0.484/0.409`, ANN `0.500/0.444`; 상태 SNN `0.372/0.348`, ANN `0.407/0.367`이었다. 모두 약해 최종목표를 파형·호흡수로 바꿨다.

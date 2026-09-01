@@ -1,3 +1,3 @@
-# 017 — All-27 ANN/SNN cross-validation
+# 017 27명 ANN/SNN 교차검증
 
-The compact dataset had 1,082 30-s windows (947 RR targets). Five subject-level test folds, three validation subjects per fold, seeds 42/314/2718, max 120 epochs and early stopping were used. Subject-macro RR MAE: ANN direct 1.528, SNN direct 1.508, signed-rate 1.449, delta-event 1.426. The DSP baseline was better at 0.992. The whole comparison took about 858 s because the SNN had only 2,690 parameters. It is preserved in [`../../legacy_compact_model`](../../legacy_compact_model/README.md) as a baseline, not the final model.
+30초창 1,082개, 시험 5폴드, 시드 3개, 최대 120에폭과 조기종료를 썼다. MAE는 ANN 1.528, SNN direct 1.508, signed-rate 1.449, delta-event 1.426이었다. 신호처리 0.992가 더 좋았다. 코드는 [`../../legacy_compact_model`](../../legacy_compact_model/README.md)에 있다.

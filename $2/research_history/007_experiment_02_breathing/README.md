@@ -1,3 +1,3 @@
-# 007 — Experiment 2: breathing states
+# 007 실험2 호흡상태
 
-Labels are normal, slow, hold, post-hold, squat/movement and post-exercise. The slide title says 4:30, while detailed steps total about six minutes and the observed median outer interval is about 375.4 s; detailed procedure and actual M03–M04 were preferred. Because hold could end after 25 s, RSP recovery in 25–30 s was used for 8/27; the 30-s protocol fallback was used for 19/27. Exercise peaks were checked so they were not mistaken for boundaries.
+일반·느린호흡·숨참기·회복·스쿼트·운동후로 나눴다. PPT 제목은 4분30초지만 세부절차는 약 6분이고 실제 중앙 구간은 약 375.4초여서 세부절차와 M03~M04를 우선했다. 숨참기는 25~30초 재호흡을 8명에서 찾고 19명은 30초 예정값을 사용했다.

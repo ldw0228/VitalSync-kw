@@ -1,3 +1,3 @@
-# 018 — Feedback integration
+# 018 피드백 반영
 
-Feedback emphasized I/Q and phase correction, denoising, line-of-sight plus auxiliary reflection paths, cautious comparison with MoRe-Fi/RF-Care-family work, focus on S01/S02/roundtrip, and honest successful/failed-subject reporting. This changed the input from a few summarized channels to eight paths per radar with corrected I/Q and common-band phase. Empty-room subtraction and physical ghost-path identification remain unavailable.
+I/Q·위상 보정, 디노이징, 직접·보조반사경로 동시사용, 관련연구의 비판적 비교, 실험1·2·왕복 우선, 성공·실패 피험자 동시보고를 반영했다. 레이더당 8경로와 보정 I/Q·공통대역 위상을 보존했다. 빈환경 차감과 물리적 고스트 확인은 아직 못했다.

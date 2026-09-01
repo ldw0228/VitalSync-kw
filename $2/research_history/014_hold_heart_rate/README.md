@@ -1,3 +1,3 @@
-# 014 — Hold heart-rate exploration
+# 014 숨참기 심박 탐색
 
-Twenty-four synchronized hold windows were evaluated from hold+2 s to recovery−1 s against BIOPAC ECG R peaks. A three-radar median with harmonic correction gave aggregate MAE about 2.66 bpm and correlation about 0.948; without correction MAE was about 10.76. The dependence on a heuristic makes this feasibility evidence, not a medical or trained-model claim.
+24명의 숨참기+2초부터 재호흡-1초까지를 BIOPAC ECG R피크와 비교했다. 3레이더 중앙값+고조파 보정은 MAE 약 2.66bpm이었지만 보정 전은 약 10.76이었다. 규칙 의존성이 커 가능성 탐색으로만 본다.

@@ -1,3 +1,3 @@
-# 011 — Experiment 6: roundtrip
+# 011 실험6 왕복
 
-The forward/backward section is under one minute; 5–70 s was used in marker audit. Feedback recommended it as a third core scenario because controlled distance change can test range-path tracking. Only preliminary range-bin movement analysis exists; no calibrated, subject-disjoint result is claimed. It is the first extension after S01/S02 stabilization.
+앞뒤 왕복은 1분 미만이라 5~70초로 점검했다. 거리변화에 따른 경로추적을 볼 수 있어 실험1·2 다음 후보로 제안됐다. 현재는 거리보정 전 예비분석만 있으며 정식 피험자 독립결과는 없다.

@@ -1,3 +1,3 @@
-# 021 — Current decision
+# 021 현재 결정
 
-Completed: sync equivalence, full marker audit, 27-subject boundaries, state models, DSP/heart-rate explorations, compact formal CV, 72-channel waveform data and one pilot. Not demonstrated: a learned model beating DSP, five-fold waveform reconstruction, superior spike encoding, physical ghost validation, or medical HR/fall performance. Next: tune using train/validation only, lock choices, then compare DSP, compact ANN/SNN, CNN-GRU and CNN-SNN over five subject folds × three seeds, reporting accuracy, waveform, failures, runtime, parameters and spike rate.
+싱크 일치, 마커 전수검사, 27명 경계, 상태모델, 기준선, 소형 교차검증, 72채널 파형데이터와 1폴드 파일럿까지 끝났다. 아직 학습모델이 신호처리를 이기지 못했고 5폴드 파형복원도 안 했다. 다음은 학습·검증에서만 튜닝한 뒤 5폴드×3시드로 모든 기준선을 비교하는 것이다.

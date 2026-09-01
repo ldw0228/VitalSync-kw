@@ -1,31 +1,31 @@
-# Research history: 001–021
+# 연구경과: 001~021
 
-This is a reconstructed lab record, not a verbatim conversation export. Completed evidence, interpretation, and future work are kept separate.
+대화 원문을 복사한 것이 아니라, 대화에서 나온 질문과 실제 실행 결과를 시간순 연구일지로 재구성했다. 완료된 일, 해석, 아직 하지 않은 일을 구분했다.
 
-| No. | Stage | Key outcome |
+| 번호 | 단계 | 핵심 결과 |
 |---:|---|---|
-| 001 | Project scope | Use guide, workbook, MATLAB sync, UWB and BIOPAC; BIOPAC is ground truth only |
-| 002 | Data inventory | 27 usable for final S01/S02 modeling; S01/S22 partial, S24 UWB missing |
-| 003 | Reverse sync | Align by RSP chest-press candidates and three-radar motion; keep manual cases |
-| 004 | MATLAB revalidation | Raw MATLAB/batch marker times matched for all 29 available sets |
-| 005 | Marker audit | Protocol 20 markers for participants S01–S03, 22 from S04; raw counts are only candidates |
-| 006 | Experiment 1 | Orientation is useful as a robustness factor, weak as final classification target |
-| 007 | Experiment 2 | Primary breathing/apnea/motion scenario |
-| 008–012 | Experiments 3–7 | Marker audit completed; only roundtrip has preliminary analysis |
-| 013 | Initial state SNN | ANN and SNN both weak; abandoned as final direction |
-| 014 | Hold heart rate | Interesting but heuristic and exploratory |
-| 015 | 10-subject RR baseline | Strong development result, not independent evidence |
-| 016 | All-27 boundary lock | Protocol and synchronized evidence fixed before formal training |
-| 017 | All-27 ANN/SNN CV | Best compact SNN MAE 1.426; DSP baseline 0.992, so learned model lost |
-| 018 | Feedback integration | Preserve multiple paths and reconstruct waveform |
-| 019 | Waveform dataset | 27 subjects, 1,564 windows, 72×200 input |
-| 020 | Waveform pilot | CNN-GRU currently ahead of CNN-SNN; neither is final |
-| 021 | Current decision | Tune, lock, then run five folds × three seeds and compare with DSP |
+| 001 | 작업범위 결정 | 실험안내서·엑셀·MATLAB 싱크·UWB·BIOPAC 확인 |
+| 002 | 데이터 전수확인 | 최종 S01/S02 모델에 27명 사용 가능 |
+| 003 | 역순 싱크 | RSP 흉부누름 후보와 3레이더 움직임으로 시간축 정렬 |
+| 004 | MATLAB 재검증 | 원본이 있는 29명의 원시 마커와 오프셋이 두 구현에서 일치 |
+| 005 | 마커 전수검사 | 피험자 S01~S03은 20개, S04 이후 22개; 자동 검출수는 후보일 뿐 |
+| 006 | 실험1 | 방향은 최종 분류목표보다 레이더 선택·강건성 조건으로 사용 |
+| 007 | 실험2 | 호흡·숨참기·운동의 주 분석 시나리오 |
+| 008~012 | 실험3~7 | 마커 점검 완료, 왕복만 예비분석 |
+| 013 | 초기 상태 SNN | ANN/SNN 모두 약해 최종 방향에서 제외 |
+| 014 | 숨참기 심박 | 가능성 탐색이지만 보정규칙 의존성이 커 보조결과로 유지 |
+| 015 | 10명 호흡 기준선 | 개발군에서는 좋았으나 독립검증 결과가 아님 |
+| 016 | 27명 경계 확정 | 모델 학습 전에 S01/S02 경계와 제외사유 고정 |
+| 017 | 27명 ANN/SNN | 최선 SNN MAE 1.426, 신호처리 0.992로 학습모델이 열세 |
+| 018 | 피드백 반영 | 다중 경로를 유지하고 호흡 파형을 복원하는 방향으로 전환 |
+| 019 | 파형 데이터셋 | 27명, 1,564창, 입력 72×200 |
+| 020 | 파형 파일럿 | 현재 CNN-GRU가 CNN-SNN보다 낫지만 둘 다 최종결과 아님 |
+| 021 | 현재 결정 | 튜닝 후 5폴드×3시드와 신호처리 기준선을 동일조건 비교 |
 
-## Common definitions
+## 공통 용어
 
-- Protocol marker count: designed start/end boundaries.
-- Automatic raw count: threshold peaks from BIOPAC RSP; not the true count.
-- Selected marker: candidate accepted using order, duration, RSP shape, radar motion and alternatives.
-- Sync equation: `biopac_time = radar_time + offset`.
-- Deployment input: UWB only. BIOPAC supplies synchronization/labels/targets/evaluation during development.
+- 프로토콜 마커 수: 실험 설계상 필요한 시작·종료 경계 수.
+- 자동 원시 검출 수: BIOPAC RSP 임계값을 넘은 피크 수이며 실제 마커 수가 아님.
+- 선택 마커: 순서·시간·RSP 모양·레이더 움직임·대체후보를 확인해 채택한 값.
+- 싱크 정의: `biopac_time = radar_time + offset`.
+- 실제 배포 입력: UWB만 사용한다. BIOPAC은 개발 중 싱크·라벨·정답·평가에만 쓴다.

@@ -1,3 +1,3 @@
-# 019 — Multi-path waveform dataset
+# 019 멀티패스 파형 데이터셋
 
-Twenty-seven subjects yielded 1,564 overlapping 20-s windows at 10 Hz; 1,325 have waveform/RR targets. Input shape is 72×200: `3 radars × 8 paths × [whitened I, whitened Q, common-band phase]`. There are 182 motion-positive and 50 apnea-positive windows. State labels select/audit windows but are not model inputs; BIOPAC is target/evaluation only.
+27명에서 20초창 1,564개를 만들었고 1,325개에 파형·호흡수 정답이 있다. 입력은 `3레이더×8경로×[백색화 I, 백색화 Q, 공통대역 위상]`인 72×200이다. 움직임 양성 182개, 무호흡 양성 50개다.

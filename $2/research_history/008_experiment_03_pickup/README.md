@@ -1,3 +1,3 @@
-# 008 — Experiment 3: pickup
+# 008 실험3 물건집기
 
-Two repetitions correspond to two start/end pairs; the guide gives no exact total time, so 5–90 s was used as a plausibility range. Marker order, duration and alternatives were audited. No dedicated pickup model was trained because this movement-dominated task was secondary to respiration reconstruction.
+두 번의 집기는 각각 시작·종료 한 쌍이다. 총시간이 없어 5~90초를 점검범위로 사용했다. 마커 순서·시간·대체후보만 검토했고 호흡복원보다 우선순위가 낮아 전용모델은 만들지 않았다.

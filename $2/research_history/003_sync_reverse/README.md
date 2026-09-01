@@ -1,3 +1,3 @@
-# 003 — Reverse-order synchronization
+# 003 역순 싱크
 
-Subjects were processed in reverse order as requested. The method loads three 40 Hz UWB streams and BIOPAC RSP, detects strong chest-press protrusions, merges detections within four seconds, then searches offsets from −12 to +12 seconds at 0.1-second resolution for alignment with early radar-motion peaks. Difficult cases are reviewed rather than silently forced. The supplied single-subject interactive reference is [`code/sync_tool_S02.m`](code/sync_tool_S02.m); configure its subject, raw-data and output paths locally.
+요청대로 뒤 피험자부터 처리했다. 40Hz UWB 3대와 BIOPAC RSP를 읽어 강한 흉부누름 피크를 검출하고 4초 이내 피크를 합친 뒤, -12~+12초를 0.1초 간격으로 탐색해 레이더 움직임과 맞췄다. 애매한 사례는 강제확정하지 않았다. 참고 코드는 [`code/sync_tool_S02.m`](code/sync_tool_S02.m)이다.

@@ -1,8 +1,8 @@
-# Protocol / automatic raw / selected counts
+# 프로토콜 수 / 자동 원시 검출 수 / 선택 수
 
-Raw is the high-threshold RSP detection count, not the actual marker count. Zero selected means review was intentionally left open at that audit stage.
+원시는 높은 RSP 임계값으로 자동 검출한 수이며 실제 마커 수가 아니다. 선택 0은 당시 전수검사에서 재검토 상태로 남겨둔 경우다.
 
-|Subject|Protocol|Raw|Selected|Subject|Protocol|Raw|Selected|
+|피험자|프로토콜|원시|선택|피험자|프로토콜|원시|선택|
 |---|---:|---:|---:|---|---:|---:|---:|
 |S01|20|14|0|S16|22|21|22|
 |S02|20|13|20|S17|22|15|22|

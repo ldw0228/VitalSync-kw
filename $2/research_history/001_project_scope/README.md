@@ -1,3 +1,3 @@
-# 001 — Project scope
+# 001 작업범위 결정
 
-The work began by checking the experiment guide, marker workbook, supplied MATLAB sync tool, three UWB recordings and BIOPAC RSP/ECG. The question evolved from filling times to determining whether three UWB radars can reconstruct respiration and estimate respiratory rate across direction and breathing-state changes. Workbook selections, automatically detected RSP peaks and protocol durations were treated as different evidence because none is automatically ground truth.
+실험안내서, 마커 엑셀, MATLAB 싱크 코드, 3개 UWB, BIOPAC RSP/ECG를 확인했다. 단순 시간기입에서 시작했지만 최종 질문은 3레이더로 방향·호흡상태 변화에서도 호흡 파형과 호흡수를 추론할 수 있는지가 되었다. 엑셀 선택값, 자동 RSP 피크, 프로토콜 예정시간은 서로 다른 근거로 구분했다.

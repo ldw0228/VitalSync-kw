@@ -1,3 +1,3 @@
-# 016 — All-27 boundary lock
+# 016 27명 경계 확정
 
-S01/S02 boundaries were rebuilt for 27 usable subjects before formal training. S01 turns use protocol timing plus radar-motion peaks; S02 uses M03–M04, detailed state timing, and aligned RSP recovery only as a label boundary. All windows from one subject stay in one train/validation/test role. State labels and BIOPAC are never deployed inputs.
+정식학습 전 27명의 실험1·2 경계를 다시 만들었다. 실험1 회전은 예정시각과 레이더 움직임, 실험2는 M03~M04와 세부순서·재호흡 경계를 썼다. 한 피험자의 창은 한 분할역할에만 두며 상태명과 BIOPAC은 실제 입력이 아니다.

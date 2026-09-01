@@ -1,3 +1,3 @@
-# 004 — MATLAB revalidation
+# 004 MATLAB 재검증
 
-Independent MATLAB and batch runs were compared on raw marker times, counts and offsets. All 29 available UWB/BIOPAC sets matched; the largest nonzero difference was floating-point noise of about `2.8e-14 s`. S24 could not run because UWB was missing. After protocol review: 15 confirmed, 2 existing values retained, 7 manually corrected, and 6 review-required. Thus workbook differences came from selection/segmentation, not different raw calculations.
+MATLAB과 일괄구현의 원시 마커 시각·개수·오프셋을 비교했다. 원본이 있는 29명은 일치했고 최대 차이는 부동소수점 오차 약 `2.8e-14초`였다. S24는 UWB 누락으로 불가능했다. 최종 상태는 확인 15명, 기존값 유지 2명, 수동보정 7명, 재검토 6명이었다.

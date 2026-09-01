@@ -1,3 +1,3 @@
-# 006 — Experiment 1: orientation
+# 006 실험1 방향
 
-The participant faced radar 1, 2 and 3 for about one minute each. Relative angles are `(0,+45,+90)`, `(-45,0,+45)` and `(-90,-45,0)`. All 27 final turn boundaries used radar-motion peaks near planned screen transitions. Early analysis showed ±90° views degraded RR, but angle classification remained weak, so direction became a robustness factor for adaptive fusion rather than the final prediction target.
+레이더1·2·3을 약 1분씩 바라봤다. 상대각은 `(0,+45,+90)`, `(-45,0,+45)`, `(-90,-45,0)`이다. 27명의 회전경계는 안내화면 예정시각 근처 레이더 움직임 피크로 잡았다. ±90도에서 호흡오차가 커졌지만 방향분류 성능은 약해 최종 목표가 아니라 적응형 융합 조건으로 사용한다.

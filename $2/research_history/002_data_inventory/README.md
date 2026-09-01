@@ -1,3 +1,3 @@
-# 002 — Data inventory
+# 002 데이터 전수확인
 
-Thirty participant codes were reviewed. Twenty-seven had usable S01/S02 UWB and boundaries for final modeling. S01 had an ambiguous S01/S02 boundary, S22 lacked the first S01 boundary, and S24 lacked UWB raw data although BIOPAC existed. The earlier ten-subject set was retained only for developing rules; final evaluation uses subject-disjoint splits across all 27 usable subjects.
+30명 코드를 확인했다. 최종 S01/S02 모델에는 27명을 사용할 수 있었다. S01은 두 실험 경계가 불명확하고, S22는 첫 경계가 없으며, S24는 BIOPAC만 있고 UWB 원본이 없었다. 초기 10명은 규칙개발용이며 최종 평가는 27명을 피험자 독립으로 나눴다.
