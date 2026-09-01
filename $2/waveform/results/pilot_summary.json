@@ -1,0 +1,66 @@
+{
+  "status": "pilot_complete",
+  "dataset": {
+    "subjects": 27,
+    "windows": 1564,
+    "input_shape": [
+      72,
+      200
+    ]
+  },
+  "architecture": {
+    "front_end": "shared 3-block 1D CNN for each radar + learned 3-radar softmax gate",
+    "CNN_GRU": "one 96-unit GRU + waveform decoder + RR/motion/apnea heads",
+    "CNN_SNN": "128-unit recurrent LIF + 64-unit recurrent LIF + waveform decoder + RR/motion/apnea heads"
+  },
+  "protocol": {
+    "mode": "pilot",
+    "max_epochs": 100,
+    "min_epochs": 25,
+    "patience": 15,
+    "seeds": [
+      42
+    ],
+    "folds": [
+      1
+    ]
+  },
+  "metrics": [
+    {
+      "candidate": "CNN_GRU",
+      "fold": 1,
+      "seed": 42,
+      "best_epoch": 20,
+      "epochs_run": 35,
+      "parameters": 108949,
+      "training_seconds": 112.31713850004598,
+      "rr_n": 294,
+      "rr_head_mae_bpm": 3.846107054729851,
+      "rr_head_within2": 0.37755102040816324,
+      "rr_wave_mae_bpm": 3.3975191375836222,
+      "wave_abs_correlation": 0.33624275882576343,
+      "subject_macro_rr_head_mae_bpm": 3.842930866093322,
+      "subject_macro_wave_abs_correlation": 0.33654499088268824,
+      "motion_balanced_accuracy": 0.9689542483660131,
+      "apnea_balanced_accuracy": 0.6741071428571429
+    },
+    {
+      "candidate": "CNN_SNN",
+      "fold": 1,
+      "seed": 42,
+      "best_epoch": 10,
+      "epochs_run": 25,
+      "parameters": 95509,
+      "training_seconds": 160.3934124999214,
+      "rr_n": 294,
+      "rr_head_mae_bpm": 4.598679224650065,
+      "rr_head_within2": 0.2755102040816326,
+      "rr_wave_mae_bpm": 4.823081162511086,
+      "wave_abs_correlation": 0.2678119083050778,
+      "subject_macro_rr_head_mae_bpm": 4.595173523522019,
+      "subject_macro_wave_abs_correlation": 0.2678680693581246,
+      "motion_balanced_accuracy": 0.9591503267973855,
+      "apnea_balanced_accuracy": 0.6443452380952381
+    }
+  ]
+}
