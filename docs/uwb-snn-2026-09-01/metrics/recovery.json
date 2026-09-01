@@ -1,0 +1,71 @@
+{
+ "subjects": [
+  "S02_RJS",
+  "S03_PSJ",
+  "S04_KTW",
+  "S05_LHS",
+  "S06_LDW",
+  "S07_KDM",
+  "S08_MDO",
+  "S09_HDH",
+  "S11_SJE",
+  "S12_KDH",
+  "S13_KTW",
+  "S14_MDO",
+  "S16_LJH",
+  "S17_RJS",
+  "S19_CHW",
+  "S20_YSE",
+  "S21_PSJ",
+  "S22_KJH",
+  "S23_KDM",
+  "S25_GEC",
+  "S26_LDW",
+  "S27_HDH",
+  "S28_KDH",
+  "S29_LHS",
+  "S30_SJE"
+ ],
+ "stats": {
+  "평소호흡(기준)": {
+   "amp_med": 1.0,
+   "amp_mean": 1.0,
+   "amp_sd": 0.0,
+   "rate_med": 0.0,
+   "n_amp_up": 0,
+   "n": 25
+  },
+  "무호흡후 0~20초": {
+   "amp_med": 1.349,
+   "amp_mean": 1.355,
+   "amp_sd": 0.471,
+   "rate_med": 0.0,
+   "n_amp_up": 17,
+   "n": 25
+  },
+  "20~40초": {
+   "amp_med": 1.086,
+   "amp_mean": 1.175,
+   "amp_sd": 0.416,
+   "rate_med": 1.0,
+   "n_amp_up": 10,
+   "n": 25
+  },
+  "40~60초": {
+   "amp_med": 1.029,
+   "amp_mean": 1.199,
+   "amp_sd": 0.558,
+   "rate_med": 2.0,
+   "n_amp_up": 7,
+   "n": 25
+  },
+  "60~80초": {
+   "amp_med": 0.989,
+   "amp_mean": 1.272,
+   "amp_sd": 0.751,
+   "rate_med": 3.0,
+   "n_amp_up": 9,
+   "n": 25
+  }
+ }
+}
