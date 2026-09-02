@@ -1,0 +1,31 @@
+{
+  "subjects": [
+    "S07_KDM",
+    "S08_MDO",
+    "S09_HDH",
+    "S17_RJS",
+    "S18_LJH",
+    "S19_CHW",
+    "S21_PSJ",
+    "S23_KDM",
+    "S26_LDW",
+    "S28_KDH"
+  ],
+  "window_count": 840,
+  "task_counts": {
+    "S01_angle": 341,
+    "S02_state": 499
+  },
+  "label_counts": {
+    "FACE_R1": 109,
+    "FACE_R2": 120,
+    "FACE_R3": 112,
+    "HOLD": 48,
+    "NORMAL": 90,
+    "POST_EXERCISE": 90,
+    "POST_HOLD": 91,
+    "SLOW": 90,
+    "SQUAT": 90
+  },
+  "protocol_note": "숨 참기는 25초 이후 자율 종료 가능. 25~30초 창에서 RSP 호흡 재개를 탐지하고, 실패 시 30초를 사용."
+}

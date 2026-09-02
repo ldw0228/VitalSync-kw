@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760">
+  <style>
+    text { font-family: "Malgun Gothic", "Noto Sans KR", sans-serif; fill: #17233c; }
+    .title { font-size: 31px; font-weight: 700; }
+    .sub { font-size: 17px; fill: #56657a; }
+    .panel { font-size: 23px; font-weight: 700; }
+    .label { font-size: 16px; }
+    .value { font-size: 18px; font-weight: 700; }
+    .note { font-size: 15px; fill: #5e6b7d; }
+    .grid { stroke: #dce3ec; stroke-width: 1; }
+  </style>
+  <rect width="1400" height="760" fill="#ffffff"/>
+  <text x="60" y="55" class="title">호흡수 추정 성능: 정식 compact 비교와 파형 파일럿</text>
+  <text x="60" y="88" class="sub">세로축은 피험자 macro MAE(bpm), 낮을수록 좋음 · 두 패널은 평가 규모가 달라 직접 확정 비교 금지</text>
+  <rect x="55" y="120" width="825" height="555" rx="18" fill="#f7f9fc" stroke="#c9d4e2"/>
+  <text x="85" y="163" class="panel">A. 27명 정식 비교 · 5폴드 × 3시드</text>
+  <text x="85" y="190" class="sub">같은 1,082개 compact 창과 같은 피험자 분할에서 비교</text>
+  <line x1="105" y1="600" x2="835" y2="600" class="grid"/><line x1="105" y1="480" x2="835" y2="480" class="grid"/>
+  <line x1="105" y1="360" x2="835" y2="360" class="grid"/><line x1="105" y1="240" x2="835" y2="240" class="grid"/>
+  <text x="72" y="606" class="note">0</text><text x="72" y="486" class="note">0.5</text><text x="72" y="366" class="note">1.0</text><text x="72" y="246" class="note">1.5</text>
+  <rect x="125" y="362" width="105" height="238" rx="7" fill="#16877c"/><rect x="270" y="233" width="105" height="367" rx="7" fill="#8c9aae"/>
+  <rect x="415" y="238" width="105" height="362" rx="7" fill="#4b74b8"/><rect x="560" y="252" width="105" height="348" rx="7" fill="#3469cc"/>
+  <rect x="705" y="258" width="105" height="342" rx="7" fill="#2455a4"/>
+  <text x="177" y="350" text-anchor="middle" class="value">0.994</text><text x="322" y="221" text-anchor="middle" class="value">1.528</text>
+  <text x="467" y="226" text-anchor="middle" class="value">1.508</text><text x="612" y="240" text-anchor="middle" class="value">1.449</text>
+  <text x="757" y="246" text-anchor="middle" class="value">1.426</text>
+  <text x="177" y="628" text-anchor="middle" class="label">신호처리</text><text x="177" y="650" text-anchor="middle" class="note">기준선</text>
+  <text x="322" y="628" text-anchor="middle" class="label">ANN</text><text x="322" y="650" text-anchor="middle" class="note">direct</text>
+  <text x="467" y="628" text-anchor="middle" class="label">SNN</text><text x="467" y="650" text-anchor="middle" class="note">direct</text>
+  <text x="612" y="628" text-anchor="middle" class="label">SNN</text><text x="612" y="650" text-anchor="middle" class="note">signed-rate</text>
+  <text x="757" y="628" text-anchor="middle" class="label">SNN</text><text x="757" y="650" text-anchor="middle" class="note">delta-event</text>
+  <rect x="910" y="120" width="435" height="555" rx="18" fill="#fff8f2" stroke="#e3cdb9"/>
+  <text x="940" y="163" class="panel">B. 72채널 파형 파일럿</text><text x="940" y="190" class="sub">1폴드 × 1시드, 최종 성능 아님</text>
+  <line x1="955" y1="600" x2="1315" y2="600" class="grid"/><line x1="955" y1="480" x2="1315" y2="480" class="grid"/>
+  <line x1="955" y1="360" x2="1315" y2="360" class="grid"/><line x1="955" y1="240" x2="1315" y2="240" class="grid"/>
+  <text x="925" y="606" class="note">0</text><text x="925" y="486" class="note">1.5</text><text x="925" y="366" class="note">3.0</text><text x="925" y="246" class="note">4.5</text>
+  <rect x="1010" y="293" width="105" height="307" rx="7" fill="#d17a24"/><rect x="1165" y="232" width="105" height="368" rx="7" fill="#a55129"/>
+  <text x="1062" y="281" text-anchor="middle" class="value">3.843</text><text x="1217" y="220" text-anchor="middle" class="value">4.595</text>
+  <text x="1062" y="628" text-anchor="middle" class="label">CNN-GRU</text><text x="1217" y="628" text-anchor="middle" class="label">CNN-SNN</text>
+  <text x="940" y="660" class="note">현재는 GRU가 SNN보다 낫지만 둘 다 파일럿이다.</text>
+  <text x="60" y="718" class="sub">판단: SNN 후보 중 delta-event가 가장 좋았지만 신호처리 기준선을 이기지 못했다. 따라서 “SNN 우월” 결론은 보류한다.</text>
+</svg>

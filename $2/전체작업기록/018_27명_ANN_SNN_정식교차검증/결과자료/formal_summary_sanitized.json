@@ -1,0 +1,69 @@
+{
+  "status": "formal_comparison_complete_and_all27_models_trained",
+  "dataset": {
+    "subjects": 27,
+    "windows": 1082,
+    "rr_windows": 947,
+    "motion_positive_windows": 130
+  },
+  "protocol": {
+    "split": "5-fold subject-level outer test; 3 validation subjects inside each training fold",
+    "model_seeds": [42, 314, 2718],
+    "max_epochs": 120,
+    "min_epochs": 30,
+    "early_stopping_patience": 15,
+    "primary_selection_metric": "mean subject-macro RR MAE across 3 seeds",
+    "data_leakage_rule": "one subject never appears in train, validation and test simultaneously within a fold"
+  },
+  "comparison": {
+    "ANN_direct": {
+      "rr_subject_macro_mae_bpm_mean_over_seeds": 1.528209362712874,
+      "rr_subject_macro_mae_bpm_sd_over_seeds": 0.030612646536221633,
+      "rr_subject_macro_within2_mean_over_seeds": 0.7881384652626483,
+      "motion_subject_macro_balanced_accuracy_mean_over_seeds": 0.9607786276903925,
+      "median_best_epoch": 13,
+      "mean_training_seconds_per_fold_seed": 10.587328320012118,
+      "parameters": 316994
+    },
+    "SNN_direct": {
+      "rr_subject_macro_mae_bpm_mean_over_seeds": 1.5077749139380316,
+      "rr_subject_macro_mae_bpm_sd_over_seeds": 0.035361001824334964,
+      "rr_subject_macro_within2_mean_over_seeds": 0.7985475671750182,
+      "motion_subject_macro_balanced_accuracy_mean_over_seeds": 0.9567603964662789,
+      "median_best_epoch": 59,
+      "mean_training_seconds_per_fold_seed": 16.313938706663127,
+      "parameters": 2306,
+      "mean_hidden_spike_rate": 0.3074766767218157
+    },
+    "SNN_signed_rate": {
+      "rr_subject_macro_mae_bpm_mean_over_seeds": 1.449179513099823,
+      "rr_subject_macro_mae_bpm_sd_over_seeds": 0.037867275030215676,
+      "rr_subject_macro_within2_mean_over_seeds": 0.8119802653571716,
+      "motion_subject_macro_balanced_accuracy_mean_over_seeds": 0.958423711364888,
+      "median_best_epoch": 40,
+      "mean_training_seconds_per_fold_seed": 13.561769726655136,
+      "parameters": 2690,
+      "mean_hidden_spike_rate": 0.30000436616164666
+    },
+    "SNN_delta_event": {
+      "rr_subject_macro_mae_bpm_mean_over_seeds": 1.4255583108505518,
+      "rr_subject_macro_mae_bpm_sd_over_seeds": 0.035239761648377665,
+      "rr_subject_macro_within2_mean_over_seeds": 0.8138349990201842,
+      "motion_subject_macro_balanced_accuracy_mean_over_seeds": 0.9591566113624936,
+      "median_best_epoch": 39,
+      "mean_training_seconds_per_fold_seed": 13.012083306691299,
+      "parameters": 2690,
+      "mean_hidden_spike_rate": 0.30355302511679905
+    }
+  },
+  "selected_snn": "SNN_delta_event",
+  "selected_overall_among_trained_models": "SNN_delta_event",
+  "final_all27_models": {
+    "ANN_direct": {"epochs": 13, "training_seconds": 5.444823900004849},
+    "SNN_direct": {"epochs": 59, "training_seconds": 18.96683970000595},
+    "SNN_signed_rate": {"epochs": 40, "training_seconds": 13.159127499908209},
+    "SNN_delta_event": {"epochs": 39, "training_seconds": 12.89269130001776}
+  },
+  "elapsed_seconds": 858.3552918999922,
+  "interpretation": "Cross-validation scores estimate performance on unseen people. Final all-27 files use every usable subject; expected performance is the out-of-fold cross-validation score, not a re-test on training data."
+}

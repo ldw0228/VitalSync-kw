@@ -1,0 +1,9 @@
+{
+  "source": "../../017_27명_경계확정과_학습창생성/결과자료/all27_training_windows.csv",
+  "evaluable_windows": 947,
+  "subjects": 27,
+  "window_mae_bpm": 0.9916203780992324,
+  "subject_macro_mae_bpm": 0.994459151563899,
+  "subject_macro_within_2_bpm": 0.9046529723000312,
+  "comparison_rule": "Use subject_macro_mae_bpm when comparing with the formal ANN/SNN subject-macro results."
+}

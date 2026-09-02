@@ -1,0 +1,14 @@
+﻿number,subject,status,note
+30,S30_SJE,manual_corrected,BIOPAC RSP 포화/클리핑으로 자동 마커 5개만 검출; 레이더 3대와 결합해 수동 보정
+29,S29_LHS,manual_corrected,약 970/975초 이중 마커를 1개로 병합
+27,S27_HDH,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+25,S25_GEC,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+24,S24_KHJ,review_required,원본 누락: Drive/로컬 모두 UWB datafloat 없음(BIOPAC만 존재) — 싱크 불가
+22,S22_KJH,review_required,RSP 초반 마커와 낙상 4번째 종료 마커가 불명확 — 수동 검토 필요
+13,S13_KTW,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+12,S12_KDH,review_required,RSP 마커 누락 및 자동 offset이 탐색 경계(-12초)에 도달 — 수동 검토 필요
+11,S11_SJE,review_required,후반 마커 다수 누락/과검출 — 수동 검토 필요
+6,S06_LDW,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+5,S05_LHS,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+4,S04_KTW,review_required,"후반부 장시간 마커 공백(약 1,230~1,680초) — 수동 검토 필요"
+1,S01_CMS,review_required,자동 검출 마커 14개로 초기 프로토콜 경계가 부족함 — 수동 검토 필요

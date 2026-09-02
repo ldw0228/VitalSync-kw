@@ -1,0 +1,120 @@
+{
+  "cohort": "development_only",
+  "subjects": [
+    "S07_KDM",
+    "S08_MDO",
+    "S09_HDH",
+    "S17_RJS",
+    "S18_LJH",
+    "S19_CHW",
+    "S21_PSJ",
+    "S23_KDM",
+    "S26_LDW",
+    "S28_KDH"
+  ],
+  "n_subjects": 10,
+  "n_segments_total": 80,
+  "n_rr_evaluable": 70,
+  "consensus_all": {
+    "n": 70,
+    "mae": 0.5007426936632953,
+    "median_ae": 0.0628591682998989,
+    "within_2": 0.9285714285714286
+  },
+  "consensus_accepted": {
+    "n": 69,
+    "mae": 0.32436396238796655,
+    "median_ae": 0.06209712518752042,
+    "within_2": 0.9420289855072463
+  },
+  "coverage": 0.9857142857142858,
+  "oracle_single_radar": {
+    "n": 70,
+    "mae": 0.25672850557591476,
+    "median_ae": 0.041511736094260065,
+    "within_2": 0.9428571428571428
+  },
+  "path_candidate_effect": {
+    "primary": {
+      "n": 210,
+      "mae": 0.7950966125657567,
+      "median_ae": 0.11742785677451106,
+      "within_2": 0.9047619047619048
+    },
+    "primary_plus_auxiliary": {
+      "n": 210,
+      "mae": 0.7840796982818747,
+      "median_ae": 0.0941523835103002,
+      "within_2": 0.9047619047619048
+    },
+    "auxiliary_candidate_ratio": 0.9809523809523809,
+    "terminology": "실험실 기하 확인 전 보조 경로 후보이며 물리적 ghost로 확정하지 않음"
+  },
+  "median_waveform_abs_corr": 0.8275394334476533,
+  "movement_detection": {
+    "squat_detected": 9,
+    "squat_total": 10,
+    "non_squat_motion_false_positive": 0,
+    "note": "S18_LJH 스쿼트 예정 구간은 세 레이더 모두 움직임 임계값 미만이므로 프로토콜 미수행/시간경계 확인 대상으로 기록"
+  },
+  "by_experiment": {
+    "S01": {
+      "n": 30,
+      "mae": 0.5918873655553022,
+      "median_ae": 0.060177521917346155,
+      "within_2": 0.9666666666666667
+    },
+    "S02": {
+      "n": 40,
+      "mae": 0.4323841897442898,
+      "median_ae": 0.07503613792629249,
+      "within_2": 0.9
+    }
+  },
+  "by_state": {
+    "FACE_R1": {
+      "n": 10,
+      "mae": 0.2183708021376777,
+      "median_ae": 0.04071580355198279,
+      "within_2": 1.0
+    },
+    "FACE_R2": {
+      "n": 10,
+      "mae": 1.4457961928164695,
+      "median_ae": 0.19537387554995522,
+      "within_2": 0.9
+    },
+    "FACE_R3": {
+      "n": 10,
+      "mae": 0.11149510171175958,
+      "median_ae": 0.06093956502972464,
+      "within_2": 1.0
+    },
+    "NORMAL": {
+      "n": 10,
+      "mae": 0.14294490975411556,
+      "median_ae": 0.08860192869007832,
+      "within_2": 1.0
+    },
+    "POST_EXERCISE": {
+      "n": 10,
+      "mae": 0.4273609057248208,
+      "median_ae": 0.06659292552275531,
+      "within_2": 0.9
+    },
+    "POST_HOLD": {
+      "n": 10,
+      "mae": 1.107381554216828,
+      "median_ae": 0.07330744264091926,
+      "within_2": 0.7
+    },
+    "SLOW": {
+      "n": 10,
+      "mae": 0.05184938928139493,
+      "median_ae": 0.03665960201129881,
+      "within_2": 1.0
+    }
+  },
+  "leakage_statement": "채널·경로 선택과 confidence 계산에는 BIOPAC을 사용하지 않으며 BIOPAC은 사후 평가에만 사용함.",
+  "validation_statement": "independent_validation 참가자는 본 실행에서 처리하지 않음."
+}

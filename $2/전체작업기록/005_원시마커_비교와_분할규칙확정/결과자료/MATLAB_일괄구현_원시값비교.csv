@@ -1,0 +1,31 @@
+﻿subject,matlab_status,matlab_marker_count,matlab_offset_s,python_marker_count,python_offset_s,max_marker_difference_s,raw_validation,final_status,final_note
+S01_CMS,OK,14,-2.1999999999999993,14,-2.200000000000035,0.0,MATLAB-Python 완전 일치,review_required,자동 검출 마커 14개로 초기 프로토콜 경계가 부족함 — 수동 검토 필요
+S02_RJS,OK,13,6.199999999999999,13,6.199999999999935,0.0,MATLAB-Python 완전 일치,기존값 유지,
+S03_PSJ,OK,22,-1.8999999999999986,22,-1.9000000000000359,0.0,MATLAB-Python 완전 일치,기존값 유지,
+S04_KTW,OK,27,0.5,27,0.4999999999999556,0.0,MATLAB-Python 완전 일치,review_required,"후반부 장시간 마커 공백(약 1,230~1,680초) — 수동 검토 필요"
+S05_LHS,OK,26,3.6999999999999993,26,3.6999999999999442,0.0,MATLAB-Python 완전 일치,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+S06_LDW,OK,24,-10.6,24,-10.600000000000005,0.0,MATLAB-Python 완전 일치,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+S07_KDM,OK,18,-7.7,18,-7.700000000000015,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.5, 후보 24개 중 22개 검증"
+S08_MDO,OK,16,4.8,16,4.79999999999994,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.0, 후보 24개 중 22개 검증"
+S09_HDH,OK,21,-7.3999999999999995,21,-7.400000000000016,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.5, 후보 31개 중 22개 검증"
+S10_JKH,OK,24,11.9,24,11.899999999999913,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 8.0, 후보 26개 중 22개 검증"
+S11_SJE,OK,9,-5.1,9,-5.1000000000000245,0.0,MATLAB-Python 완전 일치,review_required,후반 마커 다수 누락/과검출 — 수동 검토 필요
+S12_KDH,OK,7,-6.8,7,-6.8000000000000185,0.0,MATLAB-Python 완전 일치,review_required,RSP 마커 누락 및 자동 offset이 탐색 경계(-12초)에 도달 — 수동 검토 필요
+S13_KTW,OK,48,-0.5999999999999996,48,-0.6000000000000405,0.0,MATLAB-Python 완전 일치,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+S14_MDO,OK,16,8.1,16,8.09999999999993,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 6.5, 후보 24개 중 22개 검증"
+S15_JKH,OK,25,12,25,11.999999999999915,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 8.0, 후보 29개 중 22개 검증"
+S16_LJH,OK,21,1.8999999999999986,21,1.8999999999999506,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 8.0, 후보 28개 중 22개 검증"
+S17_RJS,OK,15,-3.6999999999999993,15,-3.7000000000000295,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.0, 후보 24개 중 22개 검증"
+S18_LJH,OK,22,-0.1999999999999993,22,-0.20000000000004192,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.0, 후보 24개 중 22개 검증"
+S19_CHW,OK,19,-1.5999999999999996,19,-1.600000000000037,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.0, 후보 25개 중 22개 검증"
+S20_YSE,OK,20,3.799999999999999,20,3.799999999999944,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 6.5, 후보 25개 중 22개 검증"
+S21_PSJ,OK,21,-2.799999999999999,21,-2.8000000000000327,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.5, 후보 25개 중 22개 검증"
+S22_KJH,OK,18,-3.1999999999999993,18,-3.2000000000000313,0.0,MATLAB-Python 완전 일치,review_required,RSP 초반 마커와 낙상 4번째 종료 마커가 불명확 — 수동 검토 필요
+S23_KDM,OK,23,-0.1999999999999993,23,-0.20000000000004192,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 8.0, 후보 32개 중 22개 검증"
+S24_KHJ,FAILED,,,,,,원본 누락,review_required,원본 누락: Drive/로컬 모두 UWB datafloat 없음(BIOPAC만 존재) — 싱크 불가
+S25_GEC,OK,27,-2.5,27,-2.5000000000000338,0.0,MATLAB-Python 완전 일치,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+S26_LDW,OK,22,-0.09999999999999964,22,-0.10000000000004228,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 8.0, 후보 24개 중 22개 검증"
+S27_HDH,OK,22,3.6999999999999993,22,3.6999999999999442,2.842170943040401e-14,MATLAB-Python 완전 일치,manual_corrected,자동 후보를 RSP 돌출·레이더 움직임·실험 순서로 수동 보정
+S28_KDH,OK,18,3.299999999999999,18,3.2999999999999456,0.0,MATLAB-Python 완전 일치,confirmed,"참가자별 임계값 7.0, 후보 25개 중 22개 검증"
+S29_LHS,OK,23,0.6999999999999993,23,0.6999999999999549,0.0,MATLAB-Python 완전 일치,manual_corrected,약 970/975초 이중 마커를 1개로 병합
+S30_SJE,OK,5,11.6,5,11.599999999999916,0.0,MATLAB-Python 완전 일치,manual_corrected,BIOPAC RSP 포화/클리핑으로 자동 마커 5개만 검출; 레이더 3대와 결합해 수동 보정

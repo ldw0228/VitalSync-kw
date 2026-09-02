@@ -1,0 +1,31 @@
+﻿number,subject,cohort,blind_status,usability,m01_s,m02_s,s01_duration_s,m03_s,m04_s,s02_duration_s,s01_duration_qc,s02_duration_qc,decision_basis
+1,S01_CMS,partial_review,not_applicable,partial_review,58.512,245.772,187.26,302.51599999999996,729.192,426.676,pass,review,M01-M02는 개연성 있음; M03-M04 426.7초로 S02 내부 라벨 불확실
+2,S02_RJS,independent_validation,locked_not_evaluated,usable_both,25.0,217.0,192.0,245.0,611.0,366.0,pass,pass,기존 전수검사 M01-M04 유지
+3,S03_PSJ,independent_validation,locked_not_evaluated,usable_both,23.0,210.0,187.0,276.0,646.0,370.0,pass,pass,기존 전수검사 M01-M04 유지
+4,S04_KTW,independent_validation,locked_not_evaluated,usable_both,22.63000000000003,223.48000000000002,200.85,274.189,647.2239999999999,373.035,pass,pass,후반 마커 문제와 무관하게 M01-M04 시간 범위 정상
+5,S05_LHS,independent_validation,locked_not_evaluated,usable_both,15.0,210.0,195.0,241.0,612.0,371.0,pass,pass,기존 전수검사 M01-M04 유지
+6,S06_LDW,independent_validation,locked_not_evaluated,usable_both,22.0,214.0,192.0,264.0,638.0,374.0,pass,pass,기존 전수검사 M01-M04 유지
+7,S07_KDM,development,already_seen,usable_both,16.57200000000004,214.34500000000006,197.773,275.59800000000007,646.7800000000001,371.182,pass,pass,기존 전수검사 M01-M04 유지
+8,S08_MDO,development,already_seen,usable_both,23.796000000000053,220.16400000000004,196.368,260.4440000000001,645.896,385.452,pass,pass,기존 전수검사 M01-M04 유지
+9,S09_HDH,development,already_seen,usable_both,16.915000000000067,209.82400000000007,192.909,272.42800000000005,647.296,374.868,pass,pass,기존 전수검사 M01-M04 유지
+10,S10_JKH,independent_validation,locked_not_evaluated,usable_both,26.144000000000062,212.46800000000005,186.324,244.70000000000005,625.8240000000001,381.124,pass,pass,기존 전수검사 M01-M04 유지
+11,S11_SJE,independent_validation,locked_not_evaluated,usable_both,15.264000000000037,207.4813333333334,192.217,260.616,635.6160000000001,375.0,pass,pass,후반 마커 문제와 무관하게 M01-M04 시간 범위 정상
+12,S12_KDH,independent_validation,locked_not_evaluated,usable_both,24.524,222.644,198.12,270.448,646.804,376.356,pass,pass,자동 추천 M04=764.472 대신 원후보 646.804 채택
+13,S13_KTW,independent_validation,locked_not_evaluated,usable_both,11.5,205.2,193.7,228.3,597.4,369.1,pass,pass,기존 전수검사 M01-M04 유지
+14,S14_MDO,independent_validation,locked_not_evaluated,usable_both,13.64800000000007,208.91200000000006,195.264,233.95200000000006,607.4200000000001,373.468,pass,pass,기존 전수검사 M01-M04 유지
+15,S15_JKH,independent_validation,locked_not_evaluated,usable_both,5.524000000000086,199.3360000000001,193.812,234.2160000000001,599.1800000000001,364.964,pass,pass,기존 전수검사 M01-M04 유지
+16,S16_LJH,independent_validation,locked_not_evaluated,usable_both,12.91600000000005,206.04400000000004,193.128,282.012,654.944,372.932,pass,pass,기존 M04=759.140 대신 원후보 654.944 채택
+17,S17_RJS,development,already_seen,usable_both,15.872500000000063,209.80933300000004,193.937,232.94600000000005,604.3144,371.368,pass,pass,기존 전수검사 M01-M04 유지
+18,S18_LJH,development,already_seen,usable_both,15.296000000000042,211.68000000000004,196.384,231.17600000000004,603.692,372.516,pass,pass,기존 전수검사 M01-M04 유지
+19,S19_CHW,development,already_seen,usable_both,19.82800000000003,215.90000000000003,196.072,272.07200000000006,662.052,389.98,pass,pass,기존 전수검사 M01-M04 유지
+20,S20_YSE,independent_validation,locked_not_evaluated,usable_both,11.204000000000049,207.54800000000006,196.344,229.71200000000005,600.7440000000001,371.032,pass,pass,기존 전수검사 M01-M04 유지
+21,S21_PSJ,development,already_seen,usable_both,19.952000000000034,214.06000000000003,194.108,235.40400000000005,612.2120000000001,376.808,pass,pass,기존 전수검사 M01-M04 유지
+22,S22_KJH,partial_review,not_applicable,partial_review,,222.04,,304.812,681.412,376.6,missing,pass,M01 누락; S02는 M03=304.812 후보 기준 376.6초
+23,S23_KDM,development,already_seen,usable_both,17.03200000000001,212.8,195.768,229.692,603.5240000000001,373.832,pass,pass,기존 전수검사 M01-M04 유지
+24,S24_KHJ,excluded,not_applicable,excluded,,,,,,,missing,missing,UWB 원본 누락
+25,S25_GEC,independent_validation,locked_not_evaluated,usable_both,19.0,216.6,197.6,237.0,611.8,374.8,pass,pass,기존 전수검사 M01-M04 유지
+26,S26_LDW,development,already_seen,usable_both,12.588000000000042,206.84400000000005,194.256,257.132,633.0600000000001,375.928,pass,pass,기존 전수검사 M01-M04 유지
+27,S27_HDH,independent_validation,locked_not_evaluated,usable_both,6.2,198.3,192.1,221.1,596.9,375.8,pass,pass,기존 전수검사 M01-M04 유지
+28,S28_KDH,development,already_seen,usable_both,14.424000000000055,207.58000000000004,193.156,238.92400000000004,616.316,377.392,pass,pass,기존 전수검사 M01-M04 유지
+29,S29_LHS,independent_validation,locked_not_evaluated,usable_both,17.784,209.824,192.04,232.384,606.668,374.284,pass,pass,기존 전수검사 M01-M04 유지
+30,S30_SJE,independent_validation,locked_not_evaluated,usable_both,6.45,192.15,185.7,237.275,620.125,382.85,pass,pass,기존 전수검사 M01-M04 유지

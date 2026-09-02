@@ -1,0 +1,41 @@
+{
+  "subject_count": 27,
+  "subjects": [
+    "S02_RJS",
+    "S03_PSJ",
+    "S04_KTW",
+    "S05_LHS",
+    "S06_LDW",
+    "S07_KDM",
+    "S08_MDO",
+    "S09_HDH",
+    "S10_JKH",
+    "S11_SJE",
+    "S12_KDH",
+    "S13_KTW",
+    "S14_MDO",
+    "S15_JKH",
+    "S16_LJH",
+    "S17_RJS",
+    "S18_LJH",
+    "S19_CHW",
+    "S20_YSE",
+    "S21_PSJ",
+    "S23_KDM",
+    "S25_GEC",
+    "S26_LDW",
+    "S27_HDH",
+    "S28_KDH",
+    "S29_LHS",
+    "S30_SJE"
+  ],
+  "turn_peak_count": 27,
+  "turn_fallback_count": 0,
+  "apnea_rsp_detected_count": 8,
+  "apnea_protocol_fallback_count": 19,
+  "excluded": {
+    "S01_CMS": "ambiguous S01/S02 marker boundary",
+    "S22_KJH": "missing M01",
+    "S24_KHJ": "missing UWB raw data"
+  }
+}

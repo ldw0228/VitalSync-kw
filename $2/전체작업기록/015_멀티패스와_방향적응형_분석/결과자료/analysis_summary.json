@@ -1,0 +1,187 @@
+{
+  "analysis_subjects": [
+    "S07_KDM",
+    "S08_MDO",
+    "S09_HDH",
+    "S17_RJS",
+    "S18_LJH",
+    "S19_CHW",
+    "S21_PSJ",
+    "S23_KDM",
+    "S26_LDW",
+    "S28_KDH"
+  ],
+  "n_subjects": 10,
+  "n_s1_radar_observations": 90,
+  "n_s1_orientation_segments": 30,
+  "s1_primary_rr": {
+    "n": 90,
+    "mae": 4.591497063257186,
+    "median_ae": 0.7244677153253534,
+    "within": 0.5555555555555556
+  },
+  "s1_path_fused_rr": {
+    "n": 90,
+    "mae": 4.442143380678298,
+    "median_ae": 0.4827032917229923,
+    "within": 0.5666666666666667
+  },
+  "s1_primary_hr": {
+    "n": 90,
+    "mae": 39.05237998528846,
+    "median_ae": 38.050959853504835,
+    "within": 0.05555555555555555
+  },
+  "s1_path_fused_hr": {
+    "n": 90,
+    "mae": 39.78493298006801,
+    "median_ae": 39.071828651522296,
+    "within": 0.03333333333333333
+  },
+  "method_metrics": [
+    {
+      "method": "3레이더 중앙값",
+      "n_segments": 30,
+      "rr_mae_bpm": 4.608679863392871,
+      "rr_median_ae_bpm": 0.4468765292171506,
+      "rr_within_2_ratio": 0.5666666666666667,
+      "hr_mae_bpm": 41.340128739902845,
+      "hr_median_ae_bpm": 38.844366398906146,
+      "hr_within_5_ratio": 0.0
+    },
+    {
+      "method": "레이더1 고정",
+      "n_segments": 30,
+      "rr_mae_bpm": 3.9561403606976664,
+      "rr_median_ae_bpm": 0.4278979629860622,
+      "rr_within_2_ratio": 0.6333333333333333,
+      "hr_mae_bpm": 39.374600993886396,
+      "hr_median_ae_bpm": 39.869330219568575,
+      "hr_within_5_ratio": 0.06666666666666667
+    },
+    {
+      "method": "레이더2 고정",
+      "n_segments": 30,
+      "rr_mae_bpm": 3.595623220524241,
+      "rr_median_ae_bpm": 0.17198186968153095,
+      "rr_within_2_ratio": 0.7,
+      "hr_mae_bpm": 39.56253005109008,
+      "hr_median_ae_bpm": 38.68431062734083,
+      "hr_within_5_ratio": 0.03333333333333333
+    },
+    {
+      "method": "레이더3 고정",
+      "n_segments": 30,
+      "rr_mae_bpm": 5.774666560812991,
+      "rr_median_ae_bpm": 5.939787638840349,
+      "rr_within_2_ratio": 0.36666666666666664,
+      "hr_mae_bpm": 40.417667895227545,
+      "hr_median_ae_bpm": 38.34228416578928,
+      "hr_within_5_ratio": 0.0
+    },
+    {
+      "method": "명목상 정면 레이더",
+      "n_segments": 30,
+      "rr_mae_bpm": 3.2990342468158116,
+      "rr_median_ae_bpm": 0.19458433120109664,
+      "rr_within_2_ratio": 0.6666666666666666,
+      "hr_mae_bpm": 42.29580259530103,
+      "hr_median_ae_bpm": 39.869330219568575,
+      "hr_within_5_ratio": 0.0
+    },
+    {
+      "method": "품질 가중 평균",
+      "n_segments": 30,
+      "rr_mae_bpm": 4.12783904263002,
+      "rr_median_ae_bpm": 3.9583377881558466,
+      "rr_within_2_ratio": 0.3333333333333333,
+      "hr_mae_bpm": 38.87910360311238,
+      "hr_median_ae_bpm": 37.68807342772196,
+      "hr_within_5_ratio": 0.0
+    },
+    {
+      "method": "품질 최고 레이더",
+      "n_segments": 30,
+      "rr_mae_bpm": 6.153415508665031,
+      "rr_median_ae_bpm": 5.939787638840349,
+      "rr_within_2_ratio": 0.4,
+      "hr_mae_bpm": 38.14732238919895,
+      "hr_median_ae_bpm": 38.60366385751481,
+      "hr_within_5_ratio": 0.06666666666666667
+    }
+  ],
+  "angle_metrics": [
+    {
+      "relative_angle_deg": -90,
+      "n": 10,
+      "median_quality": 0.013501518017009098,
+      "primary_rr_mae": 7.914280954294556,
+      "path_fused_rr_mae": 7.769124157193502,
+      "primary_hr_mae": 42.29901140641927,
+      "path_fused_hr_mae": 43.204082085873374,
+      "ghost_candidate_ratio": 1.0
+    },
+    {
+      "relative_angle_deg": -45,
+      "n": 20,
+      "median_quality": 0.01620110857416256,
+      "primary_rr_mae": 3.939100652092241,
+      "path_fused_rr_mae": 3.533763110775207,
+      "primary_hr_mae": 35.36810191263122,
+      "path_fused_hr_mae": 35.45927931687708,
+      "ghost_candidate_ratio": 1.0
+    },
+    {
+      "relative_angle_deg": 0,
+      "n": 30,
+      "median_quality": 0.022342163131969482,
+      "primary_rr_mae": 3.4462584682532693,
+      "path_fused_rr_mae": 3.2990342468158116,
+      "primary_hr_mae": 40.109388990173244,
+      "path_fused_hr_mae": 42.29580259530103,
+      "ghost_candidate_ratio": 1.0
+    },
+    {
+      "relative_angle_deg": 45,
+      "n": 20,
+      "median_quality": 0.019354067480778975,
+      "primary_rr_mae": 3.2715496052498096,
+      "path_fused_rr_mae": 3.4394204863008206,
+      "primary_hr_mae": 39.22428796915662,
+      "path_fused_hr_mae": 40.42649842492373,
+      "ghost_candidate_ratio": 1.0
+    },
+    {
+      "relative_angle_deg": 90,
+      "n": 10,
+      "median_quality": 0.016895545978087043,
+      "primary_rr_mae": 8.649116695576213,
+      "path_fused_rr_mae": 8.366696334311701,
+      "primary_hr_mae": 39.65946172708146,
+      "path_fused_hr_mae": 36.20135146523396,
+      "ghost_candidate_ratio": 0.9
+    }
+  ],
+  "s2_duration_issue": {
+    "ppt_title_s": 270,
+    "ppt_detail_sum_s": 360,
+    "actual_marker_interval_median_s": 375.398,
+    "conclusion": "PPT 제목의 4분30초는 세부 절차 및 실제 마커 간격과 불일치"
+  },
+  "s2_internal_marker_like_subjects": [
+    "S08_MDO",
+    "S09_HDH",
+    "S17_RJS",
+    "S18_LJH",
+    "S19_CHW",
+    "S23_KDM"
+  ],
+  "environment_file_available": false,
+  "limitations": [
+    "빈 환경 녹화 파일을 명시적으로 식별할 수 없어 환경 차감은 실행하지 못함",
+    "멀티패스 후보는 주 호흡 주파수와 상관이 높은 분리 거리 bin이며 물리적 반사 경로로 확정한 것이 아님",
+    "심박 추정은 규칙 기반 탐색 결과이고 독립 학습/검증을 거친 최종 모델이 아님",
+    "신뢰 경계가 확보된 10명만 우선 분석했으므로 전체 30명 일반화 결과가 아님",
+    "왕복 구간의 range-bin 변화는 실제 거리 보정 전 예비 지표임"
+  ]
+}

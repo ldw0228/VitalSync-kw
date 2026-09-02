@@ -1,0 +1,63 @@
+{
+  "window_seconds": 30.0,
+  "stride_seconds": 5.0,
+  "source_fs_hz": 40.0,
+  "model_fs_hz": 5.0,
+  "time_steps": 150,
+  "rr_bands_hz": {
+    "S01": [
+      0.15,
+      0.45
+    ],
+    "NORMAL": [
+      0.15,
+      0.5
+    ],
+    "SLOW": [
+      0.07,
+      0.4
+    ],
+    "POST_HOLD": [
+      0.15,
+      0.55
+    ],
+    "SQUAT": [
+      0.15,
+      0.55
+    ],
+    "POST_EXERCISE": [
+      0.15,
+      0.65
+    ]
+  },
+  "scalar_names": [
+    "radar1_log_quality",
+    "radar1_phase_bad",
+    "radar1_spectral_entropy",
+    "radar1_peak_fraction",
+    "radar1_edge_margin_hz",
+    "radar1_motion_index",
+    "radar1_rr_bpm",
+    "radar2_log_quality",
+    "radar2_phase_bad",
+    "radar2_spectral_entropy",
+    "radar2_peak_fraction",
+    "radar2_edge_margin_hz",
+    "radar2_motion_index",
+    "radar2_rr_bpm",
+    "radar3_log_quality",
+    "radar3_phase_bad",
+    "radar3_spectral_entropy",
+    "radar3_peak_fraction",
+    "radar3_edge_margin_hz",
+    "radar3_motion_index",
+    "radar3_rr_bpm",
+    "radar_rr_mad_bpm",
+    "edge_quality",
+    "motion_quality",
+    "max_motion_index",
+    "confidence",
+    "quality_best_radar_scaled"
+  ],
+  "data_cohort": "all27"
+}

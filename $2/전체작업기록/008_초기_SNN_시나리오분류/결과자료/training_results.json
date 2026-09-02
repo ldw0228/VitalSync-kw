@@ -1,0 +1,841 @@
+{
+  "run_date": "2026-08-30",
+  "task": "7-class scenario classification from three UWB radars",
+  "selection_policy": "overall_status == 자동 점검 통과 AND selected_count == 22",
+  "subjects": [
+    "S07_KDM",
+    "S08_MDO",
+    "S09_HDH",
+    "S17_RJS",
+    "S18_LJH",
+    "S19_CHW",
+    "S21_PSJ",
+    "S23_KDM",
+    "S26_LDW",
+    "S28_KDH"
+  ],
+  "n_subjects": 10,
+  "n_segments": 110,
+  "class_names": [
+    "1번 호흡",
+    "2번 호흡",
+    "3번 픽업",
+    "4번 낙상",
+    "5번 코스",
+    "6번 왕복",
+    "7번 자유"
+  ],
+  "class_counts": [
+    10,
+    10,
+    20,
+    40,
+    10,
+    10,
+    10
+  ],
+  "input": {
+    "radars": 3,
+    "range_zones_per_radar": 6,
+    "pooled_time_steps": 32,
+    "encoded_channels": 55,
+    "encoding": "결정적 integrate-and-fire rate encoding: log motion, duration, ON/OFF temporal delta"
+  },
+  "model": {
+    "type": "single-hidden-layer LIF SNN with surrogate-gradient BPTT",
+    "hidden_neurons": 32,
+    "output_classes": 7,
+    "beta": 0.9,
+    "threshold": 1.0,
+    "surrogate_gamma": 0.35,
+    "parameter_count": 2023
+  },
+  "training": {
+    "validation": "10-fold leave-one-subject-out; one additional subject used for early stopping in each fold",
+    "max_epochs": 90,
+    "patience": 16,
+    "batch_size": 16,
+    "learning_rate": 0.004,
+    "weight_decay": 0.0001,
+    "class_weighting": "inverse-frequency",
+    "seed": 20260830
+  },
+  "cross_validation": {
+    "accuracy": 0.9636363636363636,
+    "balanced_accuracy": 0.9642857142857143,
+    "macro_f1": 0.960674246388532,
+    "confusion_matrix": [
+      [
+        8,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        10,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        20,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        2,
+        38,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        10,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        10
+      ]
+    ],
+    "per_class": [
+      {
+        "class_id": 1,
+        "class_name": "1번 호흡",
+        "precision": 1.0,
+        "recall": 0.8,
+        "f1": 0.888888888888889,
+        "support": 10
+      },
+      {
+        "class_id": 2,
+        "class_name": "2번 호흡",
+        "precision": 0.8333333333333334,
+        "recall": 1.0,
+        "f1": 0.9090909090909091,
+        "support": 10
+      },
+      {
+        "class_id": 3,
+        "class_name": "3번 픽업",
+        "precision": 0.9090909090909091,
+        "recall": 1.0,
+        "f1": 0.9523809523809523,
+        "support": 20
+      },
+      {
+        "class_id": 4,
+        "class_name": "4번 낙상",
+        "precision": 1.0,
+        "recall": 0.95,
+        "f1": 0.9743589743589743,
+        "support": 40
+      },
+      {
+        "class_id": 5,
+        "class_name": "5번 코스",
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 10
+      },
+      {
+        "class_id": 6,
+        "class_name": "6번 왕복",
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 10
+      },
+      {
+        "class_id": 7,
+        "class_name": "7번 자유",
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 10
+      }
+    ]
+  },
+  "nearest_centroid_baseline": {
+    "accuracy": 0.9636363636363636,
+    "balanced_accuracy": 0.975,
+    "macro_f1": 0.9614790788376928,
+    "confusion_matrix": [
+      [
+        10,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        1,
+        9,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        20,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        37,
+        0,
+        0,
+        3
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        10,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        10
+      ]
+    ],
+    "per_class": [
+      {
+        "class_id": 1,
+        "class_name": "1번 호흡",
+        "precision": 0.9090909090909091,
+        "recall": 1.0,
+        "f1": 0.9523809523809523,
+        "support": 10
+      },
+      {
+        "class_id": 2,
+        "class_name": "2번 호흡",
+        "precision": 1.0,
+        "recall": 0.9,
+        "f1": 0.9473684210526316,
+        "support": 10
+      },
+      {
+        "class_id": 3,
+        "class_name": "3번 픽업",
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 20
+      },
+      {
+        "class_id": 4,
+        "class_name": "4번 낙상",
+        "precision": 1.0,
+        "recall": 0.925,
+        "f1": 0.961038961038961,
+        "support": 40
+      },
+      {
+        "class_id": 5,
+        "class_name": "5번 코스",
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 10
+      },
+      {
+        "class_id": 6,
+        "class_name": "6번 왕복",
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 10
+      },
+      {
+        "class_id": 7,
+        "class_name": "7번 자유",
+        "precision": 0.7692307692307693,
+        "recall": 1.0,
+        "f1": 0.8695652173913044,
+        "support": 10
+      }
+    ]
+  },
+  "ablations": {
+    "motion_only_snn": {
+      "accuracy": 0.9181818181818182,
+      "balanced_accuracy": 0.9142857142857144,
+      "macro_f1": 0.8985993121331468,
+      "confusion_matrix": [
+        [
+          8,
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          7,
+          0,
+          0,
+          1,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          20,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          2,
+          36,
+          0,
+          2,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          10,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          10,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          10
+        ]
+      ],
+      "per_class": [
+        {
+          "class_id": 1,
+          "class_name": "1번 호흡",
+          "precision": 0.8888888888888888,
+          "recall": 0.8,
+          "f1": 0.8421052631578948,
+          "support": 10
+        },
+        {
+          "class_id": 2,
+          "class_name": "2번 호흡",
+          "precision": 0.875,
+          "recall": 0.7,
+          "f1": 0.7777777777777777,
+          "support": 10
+        },
+        {
+          "class_id": 3,
+          "class_name": "3번 픽업",
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1": 0.9523809523809523,
+          "support": 20
+        },
+        {
+          "class_id": 4,
+          "class_name": "4번 낙상",
+          "precision": 1.0,
+          "recall": 0.9,
+          "f1": 0.9473684210526316,
+          "support": 40
+        },
+        {
+          "class_id": 5,
+          "class_name": "5번 코스",
+          "precision": 0.8333333333333334,
+          "recall": 1.0,
+          "f1": 0.9090909090909091,
+          "support": 10
+        },
+        {
+          "class_id": 6,
+          "class_name": "6번 왕복",
+          "precision": 0.8333333333333334,
+          "recall": 1.0,
+          "f1": 0.9090909090909091,
+          "support": 10
+        },
+        {
+          "class_id": 7,
+          "class_name": "7번 자유",
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1": 0.9523809523809523,
+          "support": 10
+        }
+      ]
+    },
+    "motion_only_nearest_centroid": {
+      "accuracy": 0.9454545454545454,
+      "balanced_accuracy": 0.9571428571428571,
+      "macro_f1": 0.9380594343000359,
+      "confusion_matrix": [
+        [
+          10,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          8,
+          0,
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          20,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          3,
+          0,
+          36,
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          10,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          10,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          10
+        ]
+      ],
+      "per_class": [
+        {
+          "class_id": 1,
+          "class_name": "1번 호흡",
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1": 0.9523809523809523,
+          "support": 10
+        },
+        {
+          "class_id": 2,
+          "class_name": "2번 호흡",
+          "precision": 0.7272727272727273,
+          "recall": 0.8,
+          "f1": 0.761904761904762,
+          "support": 10
+        },
+        {
+          "class_id": 3,
+          "class_name": "3번 픽업",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 20
+        },
+        {
+          "class_id": 4,
+          "class_name": "4번 낙상",
+          "precision": 1.0,
+          "recall": 0.9,
+          "f1": 0.9473684210526316,
+          "support": 40
+        },
+        {
+          "class_id": 5,
+          "class_name": "5번 코스",
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1": 0.9523809523809523,
+          "support": 10
+        },
+        {
+          "class_id": 6,
+          "class_name": "6번 왕복",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 10
+        },
+        {
+          "class_id": 7,
+          "class_name": "7번 자유",
+          "precision": 0.9090909090909091,
+          "recall": 1.0,
+          "f1": 0.9523809523809523,
+          "support": 10
+        }
+      ]
+    },
+    "duration_only_nearest_centroid": {
+      "accuracy": 0.6727272727272727,
+      "balanced_accuracy": 0.7821428571428573,
+      "macro_f1": 0.726737694100123,
+      "confusion_matrix": [
+        [
+          10,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          10,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          7,
+          0,
+          0,
+          2,
+          11
+        ],
+        [
+          0,
+          0,
+          7,
+          21,
+          0,
+          2,
+          10
+        ],
+        [
+          2,
+          0,
+          0,
+          0,
+          8,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1,
+          0,
+          9,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          9
+        ]
+      ],
+      "per_class": [
+        {
+          "class_id": 1,
+          "class_name": "1번 호흡",
+          "precision": 0.8333333333333334,
+          "recall": 1.0,
+          "f1": 0.9090909090909091,
+          "support": 10
+        },
+        {
+          "class_id": 2,
+          "class_name": "2번 호흡",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 10
+        },
+        {
+          "class_id": 3,
+          "class_name": "3번 픽업",
+          "precision": 0.5,
+          "recall": 0.35,
+          "f1": 0.4117647058823529,
+          "support": 20
+        },
+        {
+          "class_id": 4,
+          "class_name": "4번 낙상",
+          "precision": 0.9545454545454546,
+          "recall": 0.525,
+          "f1": 0.6774193548387099,
+          "support": 40
+        },
+        {
+          "class_id": 5,
+          "class_name": "5번 코스",
+          "precision": 1.0,
+          "recall": 0.8,
+          "f1": 0.888888888888889,
+          "support": 10
+        },
+        {
+          "class_id": 6,
+          "class_name": "6번 왕복",
+          "precision": 0.6428571428571429,
+          "recall": 0.9,
+          "f1": 0.75,
+          "support": 10
+        },
+        {
+          "class_id": 7,
+          "class_name": "7번 자유",
+          "precision": 0.3,
+          "recall": 0.9,
+          "f1": 0.45000000000000007,
+          "support": 10
+        }
+      ]
+    }
+  },
+  "folds": [
+    {
+      "fold": 1,
+      "test_subject": "S07_KDM",
+      "validation_subject": "S08_MDO",
+      "epochs": 33,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 2,
+      "test_subject": "S08_MDO",
+      "validation_subject": "S09_HDH",
+      "epochs": 31,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 3,
+      "test_subject": "S09_HDH",
+      "validation_subject": "S17_RJS",
+      "epochs": 30,
+      "accuracy": 0.9090909090909091,
+      "balanced_accuracy": 0.8571428571428571,
+      "macro_f1": 0.8095238095238094,
+      "baseline_accuracy": 0.9090909090909091,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 4,
+      "test_subject": "S17_RJS",
+      "validation_subject": "S18_LJH",
+      "epochs": 33,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 0.8181818181818182,
+      "last_train_accuracy": 1.0,
+      "last_val_accuracy": 0.9090909090909091
+    },
+    {
+      "fold": 5,
+      "test_subject": "S18_LJH",
+      "validation_subject": "S19_CHW",
+      "epochs": 28,
+      "accuracy": 0.8181818181818182,
+      "balanced_accuracy": 0.9285714285714286,
+      "macro_f1": 0.9047619047619048,
+      "baseline_accuracy": 0.9090909090909091,
+      "last_train_accuracy": 1.0,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 6,
+      "test_subject": "S19_CHW",
+      "validation_subject": "S21_PSJ",
+      "epochs": 26,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 7,
+      "test_subject": "S21_PSJ",
+      "validation_subject": "S23_KDM",
+      "epochs": 36,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 8,
+      "test_subject": "S23_KDM",
+      "validation_subject": "S26_LDW",
+      "epochs": 38,
+      "accuracy": 0.9090909090909091,
+      "balanced_accuracy": 0.8571428571428571,
+      "macro_f1": 0.8095238095238094,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 9,
+      "test_subject": "S26_LDW",
+      "validation_subject": "S28_KDH",
+      "epochs": 30,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    },
+    {
+      "fold": 10,
+      "test_subject": "S28_KDH",
+      "validation_subject": "S07_KDM",
+      "epochs": 24,
+      "accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "macro_f1": 1.0,
+      "baseline_accuracy": 1.0,
+      "last_train_accuracy": 0.9886363636363636,
+      "last_val_accuracy": 1.0
+    }
+  ],
+  "final_model": {
+    "trained_on_all_accepted_segments": true,
+    "epochs": 60,
+    "training_accuracy": 1.0,
+    "hidden_spike_rate": 0.41574040055274963,
+    "model_file": "snn_final_model.npz"
+  },
+  "runtime_seconds": 7.495345115661621,
+  "limitations": [
+    "accepted subjects are only 10, so the result is a pilot rather than a deployment-grade estimate",
+    "multiple sub-scenarios from one participant share the same upper-level label",
+    "duration is included as an input and may contribute strongly because protocol durations differ",
+    "no external video ground truth was available for an independent label audit"
+  ]
+}

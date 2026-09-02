@@ -1,0 +1,54 @@
+{
+  "best_screening": {
+    "S01_angle": {
+      "task": "S01_angle",
+      "family": "SNN",
+      "encoder": "direct",
+      "decoder": "mean_current",
+      "epochs": 16,
+      "val_macro_f1": 0.6556747600225861,
+      "test_accuracy": 0.4782608695652174,
+      "test_balanced_accuracy": 0.4827624066754502,
+      "test_macro_f1": 0.4720183291611863,
+      "test_subjects": "S26_LDW,S28_KDH"
+    },
+    "S02_state": {
+      "task": "S02_state",
+      "family": "SNN",
+      "encoder": "rate",
+      "decoder": "last_membrane",
+      "epochs": 26,
+      "val_macro_f1": 0.5763785817357245,
+      "test_accuracy": 0.35,
+      "test_balanced_accuracy": 0.32407407407407407,
+      "test_macro_f1": 0.302298592392932,
+      "test_subjects": "S26_LDW,S28_KDH"
+    }
+  },
+  "loso": {
+    "S01_angle": {
+      "SNN": {
+        "accuracy": 0.4757983193277311,
+        "balanced_accuracy": 0.4837878787878787,
+        "macro_f1": 0.40854130256836985
+      },
+      "ANN": {
+        "accuracy": 0.48697478991596643,
+        "balanced_accuracy": 0.5002913752913754,
+        "macro_f1": 0.4440919465681775
+      }
+    },
+    "S02_state": {
+      "SNN": {
+        "accuracy": 0.3811020408163265,
+        "balanced_accuracy": 0.37222222222222223,
+        "macro_f1": 0.3480815317451647
+      },
+      "ANN": {
+        "accuracy": 0.40506122448979587,
+        "balanced_accuracy": 0.4074999999999999,
+        "macro_f1": 0.36685494935360324
+      }
+    }
+  }
+}

@@ -1,0 +1,167 @@
+{
+  "subjects": 24,
+  "biopac_check": "30/30 MAT files contain RSP+ECG, isi=4 ms (250 Hz)",
+  "analysis_rule": "숨 참기 시작+2초부터 호흡 재개-1초까지; ECG R-peak 기준; Radar 2 정면, R1/R3 보조",
+  "groups": {
+    "development_10": {
+      "subjects": 10,
+      "methods": {
+        "radar1": {
+          "n": 10,
+          "mae_bpm": 10.995957053764457,
+          "median_ae_bpm": 1.0789126397476139,
+          "within_5_bpm": 0.8,
+          "within_10_bpm": 0.8,
+          "correlation": 0.34170832358958075
+        },
+        "radar2_primary": {
+          "n": 10,
+          "mae_bpm": 7.626537901587909,
+          "median_ae_bpm": 2.068721325952282,
+          "within_5_bpm": 0.9,
+          "within_10_bpm": 0.9,
+          "correlation": 0.6833916480369661
+        },
+        "radar3": {
+          "n": 10,
+          "mae_bpm": 17.186964484760907,
+          "median_ae_bpm": 4.156970203115129,
+          "within_5_bpm": 0.6,
+          "within_10_bpm": 0.6,
+          "correlation": 0.09930188009820869
+        },
+        "quality_best_deployable": {
+          "n": 10,
+          "mae_bpm": 10.495297643319892,
+          "median_ae_bpm": 1.9174784699696836,
+          "within_5_bpm": 0.8,
+          "within_10_bpm": 0.8,
+          "correlation": 0.5050538033765365
+        },
+        "median_three": {
+          "n": 10,
+          "mae_bpm": 2.372788507956597,
+          "median_ae_bpm": 1.4740200443364984,
+          "within_5_bpm": 0.9,
+          "within_10_bpm": 0.9,
+          "correlation": 0.9756686226638487
+        },
+        "median_three_harmonic_corrected": {
+          "n": 10,
+          "mae_bpm": 2.372788507956597,
+          "median_ae_bpm": 1.4740200443364984,
+          "within_5_bpm": 0.9,
+          "within_10_bpm": 0.9,
+          "correlation": 0.9756686226638487
+        }
+      }
+    },
+    "provisional_validation": {
+      "subjects": 14,
+      "methods": {
+        "radar1": {
+          "n": 14,
+          "mae_bpm": 22.48886672227474,
+          "median_ae_bpm": 6.786731051245987,
+          "within_5_bpm": 0.5,
+          "within_10_bpm": 0.5,
+          "correlation": 0.357802771118013
+        },
+        "radar2_primary": {
+          "n": 14,
+          "mae_bpm": 16.27505099942817,
+          "median_ae_bpm": 1.65036919962197,
+          "within_5_bpm": 0.6428571428571429,
+          "within_10_bpm": 0.6428571428571429,
+          "correlation": -0.027710066116081476
+        },
+        "radar3": {
+          "n": 14,
+          "mae_bpm": 21.81714122699216,
+          "median_ae_bpm": 7.57935855268645,
+          "within_5_bpm": 0.5,
+          "within_10_bpm": 0.5,
+          "correlation": -0.030505970645809444
+        },
+        "quality_best_deployable": {
+          "n": 14,
+          "mae_bpm": 15.88945138005553,
+          "median_ae_bpm": 3.263298345181674,
+          "within_5_bpm": 0.6428571428571429,
+          "within_10_bpm": 0.6428571428571429,
+          "correlation": 0.28720944686418
+        },
+        "median_three": {
+          "n": 14,
+          "mae_bpm": 16.749958214108364,
+          "median_ae_bpm": 2.7923004151148234,
+          "within_5_bpm": 0.6428571428571429,
+          "within_10_bpm": 0.6428571428571429,
+          "correlation": 0.09028346247764431
+        },
+        "median_three_harmonic_corrected": {
+          "n": 14,
+          "mae_bpm": 2.867733983211437,
+          "median_ae_bpm": 1.1583014940276186,
+          "within_5_bpm": 0.8571428571428571,
+          "within_10_bpm": 0.8571428571428571,
+          "correlation": 0.9273239462550251
+        }
+      }
+    },
+    "all": {
+      "subjects": 24,
+      "methods": {
+        "radar1": {
+          "n": 24,
+          "mae_bpm": 17.700154360395455,
+          "median_ae_bpm": 1.824313585040553,
+          "within_5_bpm": 0.625,
+          "within_10_bpm": 0.625,
+          "correlation": 0.2806520839517137
+        },
+        "radar2_primary": {
+          "n": 24,
+          "mae_bpm": 12.671503875328062,
+          "median_ae_bpm": 1.734152172901112,
+          "within_5_bpm": 0.75,
+          "within_10_bpm": 0.75,
+          "correlation": 0.3049198330237552
+        },
+        "radar3": {
+          "n": 24,
+          "mae_bpm": 19.887900917729137,
+          "median_ae_bpm": 4.206622325076971,
+          "within_5_bpm": 0.5416666666666666,
+          "within_10_bpm": 0.5416666666666666,
+          "correlation": 0.04384184431430979
+        },
+        "quality_best_deployable": {
+          "n": 24,
+          "mae_bpm": 13.641887323082345,
+          "median_ae_bpm": 2.179594535660417,
+          "within_5_bpm": 0.7083333333333334,
+          "within_10_bpm": 0.7083333333333334,
+          "correlation": 0.397384454418372
+        },
+        "median_three": {
+          "n": 24,
+          "mae_bpm": 10.759470836545129,
+          "median_ae_bpm": 1.7552313672507367,
+          "within_5_bpm": 0.75,
+          "within_10_bpm": 0.75,
+          "correlation": 0.3710667215591735
+        },
+        "median_three_harmonic_corrected": {
+          "n": 24,
+          "mae_bpm": 2.6615067018552536,
+          "median_ae_bpm": 1.4019793408957568,
+          "within_5_bpm": 0.875,
+          "within_10_bpm": 0.875,
+          "correlation": 0.9477821334222488
+        }
+      }
+    }
+  },
+  "interpretation": "고전 위상-스펙트럼 기준선의 타당성 평가이며 의료용 결과가 아님"
+}
